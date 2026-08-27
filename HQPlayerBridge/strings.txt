@@ -39,3 +39,18 @@ PLUGIN_HQPLAYER_NONE_DESC
 
 PLUGIN_HQPLAYER_TRANSPORT_ID
 	EN	id
+
+PLUGIN_HQPLAYER_VOLUME
+	EN	Volume range
+
+PLUGIN_HQPLAYER_VOLUME_STEP
+	EN	per slider step
+
+PLUGIN_HQPLAYER_VOLUME_NOW
+	EN	now at
+
+PLUGIN_HQPLAYER_VOLUME_FIXED
+	EN	Fixed
+
+PLUGIN_HQPLAYER_VOLUME_FIXED_DESC
+	EN	HQPlayer is not attenuating, so the volume control for this player is locked at full and left to whatever holds the level downstream. Lyrion's own Volume Control setting, on the player's Audio settings page, overrides this either way.

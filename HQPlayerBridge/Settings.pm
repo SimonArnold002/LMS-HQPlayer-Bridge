@@ -46,6 +46,15 @@ sub handler {
             rate      => $c ? $c->hqRate      : undef,
             bits      => $c ? $c->hqBits      : undef,
             tier      => $c ? $c->hqTier      : undef,
+
+            # The volume range explains the whole feel of the slider - it is
+            # HQPlayer's own setting, and the plugin reads it rather than
+            # assuming one, so it is worth showing what was found.
+            volfixed  => $c ? ( $c->hqVolFixed ? 1 : 0 ) : 0,
+            volmin    => $c ? $c->hqVolMin : undef,
+            volmax    => $c ? $c->hqVolMax : undef,
+            voldb     => $c ? $c->hqVolDb  : undef,
+            volstep   => $c && $c->hqVolMin ? sprintf( '%.2f', $c->_volStep ) : undef,
         };
     }
 

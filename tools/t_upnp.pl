@@ -156,5 +156,39 @@ $playFails = 0;
 $v->playWhenReady( sub { $done++ } );
 is($done, '0', 'nor does one that was cancelled while the daemon was answering');
 
+# The volume range is the one thing only UPnP can answer, and the units are a
+# trap: the AV spec says VolumeDB is in 1/256 dB, and HQPlayer does exactly
+# that - VERIFIED live, a -100...0 instance returns MinValue -25600.  Other
+# renderers report whole dB, so both have to work.
+print "-- the volume range --\n";
+my $rcBody;
+{
+    no warnings 'redefine';
+    *Plugins::HQPlayerBridge::UPnP::_rc = sub { $_[3]->( $rcBody, undef ) };
+}
+
+my @range;
+my $grab = sub { @range = @_ };
+
+$rcBody = '<u:GetVolumeDBRangeResponse><MinValue>-25600</MinValue><MaxValue>0</MaxValue></u:GetVolumeDBRangeResponse>';
+$v->getVolumeDBRange($grab);
+is(join(',', @range), '-100,0', '1/256 dB units are converted');
+
+$rcBody = '<u:GetVolumeDBRangeResponse><MinValue>-60</MinValue><MaxValue>-20</MaxValue></u:GetVolumeDBRangeResponse>';
+$v->getVolumeDBRange($grab);
+is(join(',', @range), '-60,-20', 'whole dB is taken as it stands, and a capped ceiling survives');
+
+$rcBody = '<u:GetVolumeDBRangeResponse></u:GetVolumeDBRangeResponse>';
+@range = ();
+$v->getVolumeDBRange($grab);
+is(join(',', map { defined $_ ? $_ : '(undef)' } @range), '(undef)',
+   'a reply without the values reports nothing rather than a range of zero');
+
+$rcBody = undef;
+@range = ();
+$v->getVolumeDBRange($grab);
+is(join(',', map { defined $_ ? $_ : '(undef)' } @range), '(undef)',
+   'and so does no reply at all');
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

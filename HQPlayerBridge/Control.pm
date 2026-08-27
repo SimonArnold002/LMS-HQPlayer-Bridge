@@ -70,6 +70,14 @@ my %KNOWN = map { $_ => 1 } qw(
     GetTransport SetTransport GetInputs GetRates GetModes GetFilters
 );
 
+# Errors that are not failures.  VERIFIED live 2026-08-27: with an EMPTY
+# playlist, every <Volume> answers result="Error" with an album-gain message -
+# and applies the level anyway (GetVolumeDB confirms it to 1/256 dB).  It is
+# HQPlayer recomputing replaygain for a playlist that has no tracks, not a
+# rejection, so logging it as a failure would cry wolf on every volume change
+# made while the player is idle.
+my %BENIGN = ( Volume => qr/GetAlbumGain/i );
+
 sub new {
     my ($class, %args) = @_;
 
@@ -337,7 +345,11 @@ sub _dispatch {
 
     if ($isErr) {
         my ($msg) = $raw =~ />([^<]*)</;
-        $log->warn("$self->{name}: <$req->{verb}> failed: " . ( $msg || $raw ));
+
+        my $benign = $BENIGN{ $req->{verb} };
+        my $lvl    = ( $benign && defined $msg && $msg =~ $benign ) ? 'debug' : 'warn';
+
+        $log->$lvl("$self->{name}: <$req->{verb}> failed: " . ( $msg || $raw ));
         $req->{cb}->( undef, $raw ) if $req->{cb};
     }
     else {

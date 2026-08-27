@@ -9,7 +9,9 @@ declined.
 
 | Finding | Verdict | Why |
 |---|---|---|
-| The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **DECLINED** 2026-08-27 | No endpoint mutes below that level, and the LMS scale has to match what HQPlayer gives, which is −100. The clamp is the intended mapping, not a rounding bug. **Not to be confused with** the range being configurable at all — that is real, and scoped below. |
+| The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
+| `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` logs it at debug. |
+| The volume curve should be tapered (a knee, or `denonavpcontrol`'s sqrt) rather than linear | **DECLINED** 2026-08-27 | Linear in dB **is** a logarithmic taper on the signal — equal dB per step. A bend would make a fixed skin increment (Material's volume step is 1, 3 or 5) worth a different number of dB depending on slider position, and it only pays off for a listener with one habitual level. It would also break agreement with HQPlayer's own 0-100 scale, which is linear over the range (`GetVolume` 61 at −39 dB on −100…0). |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -141,6 +143,16 @@ answer `Unknown command`; those exist in the binary as UPnP RenderingControl
 actions, and an earlier note here inferred the wrong command name from them.
 There is no *read* command either — but none is needed, because every
 `<Status/>` carries the current level as `volume="-53"`.
+
+Two things that reply `Unknown command` here **do** work as UPnP
+RenderingControl actions, and both matter: `GetVolumeDBRange` (the configured
+range, in 1/256 dB) and `GetVolumeDB` (the current level at the same
+precision). See "The range is the user's, not HQPlayer's".
+
+The value may be **fractional** — `<Volume value="-39.25"/>` is accepted and
+reported back verbatim — and with an **empty playlist** every `<Volume>`
+answers `result="Error"` with an album-gain message while applying the level
+anyway. Both verified live; see the review ledger.
 
 ### `<Status/>` — the shape that matters
 
@@ -478,18 +490,18 @@ hardware attenuator and its own software gain (`Set volume: -53` →
 | LMS → HQPlayer | `volume()` sends `<Volume value="…"/>` on the control socket |
 | HQPlayer → LMS | `_onStatus` reads `volume=""` off the status push, ~1/s, free |
 
-`hqVolDb` is the last level we know HQPlayer is at, and it is what stops the two
-directions chasing each other: neither side re-sends a value already equal to it.
-The inbound direction goes through `execute(['mixer','volume',…])` rather than
-the accessor, so Material and anything else watching the slider is notified.
+`hqVolDb` is where HQPlayer **actually is** — the last level it reported, not the
+last one we sent — and it is what stops the two directions chasing each other:
+neither side moves the other over a difference smaller than one LMS step is
+worth. The inbound direction goes through `execute(['mixer','volume',…])`
+rather than the accessor, so Material and anything else watching the slider is
+notified.
 
-`dB = LMS − 100`, so LMS 100 is 0 dB and **one LMS step is 1 dB** — the same
-mapping HQPlayer's UPnP endpoint was applying to the 0-100 it received, so the
-slider feels unchanged.
-
-**That 1:1 is only correct because this instance's range is set to −100…0.**
-See the scoped section below — HQPlayer's range is user-configurable and
-defaults to −60…0, which the mapping does not currently account for.
+The mapping is linear in dB across HQPlayer's **configured** range, which is
+read from the renderer rather than assumed. On this −100…0 instance that works
+out as `dB = LMS − 100`, one LMS step per dB, so the slider feels unchanged —
+but nothing depends on that. The four sections below cover the range, the
+resolution, the snap, and fixed volume; they are the whole design.
 
 ### TRAP: the second argument to `volume()` is `$temp`, not "force"
 
@@ -521,81 +533,27 @@ HQPlayer's own level, which is *shared*, so `_onStatus` would mirror every step
 back into the slider and an interrupted fade would leave the endpoint turned
 down for good. The timing — which is what the user set — is exact.
 
-### SCOPED, not built: the volume range is configurable
+### The range is the user's, not HQPlayer's
 
-`HQP_VOL_MIN_DB => -100` is not a property of HQPlayer, it is a property of
-**this** instance's configuration. HQPlayer's output volume range is a user
-setting and **defaults to −60…0**; −100…0 is what the development machine
-happens to be set to, which is why a 1:1 dB-per-step mapping has looked right
-throughout. On a default instance the current mapping is wrong in two visible
-ways:
+`HQP_VOL_MIN_DB => -100` was never a property of HQPlayer. Its output range is
+a **setting**: it defaults to −60…0, this development instance is −100…0, and
+**both ends move** — a user may cap the top at −20 as much as lift the floor.
+A hardcoded −100 on a default instance fails twice: the bottom 40% of the
+slider is dead, and worse, HQPlayer reports the *clamped* level back, the
+mirror reads it as an external change, and the slider visibly snaps.
 
-* **The bottom 40% of the slider is dead.** LMS 40 already maps to −60 dB, the
-  floor; LMS 39…0 map to −61…−100, which HQPlayer clamps back to −60.
-* **The slider snaps back.** Worse than the dead zone, and easy to misread as a
-  UI bug. HQPlayer reports the *clamped* level in the next `<Status/>`, the
-  mirror in `_onStatus` sees a level that differs from `hqVolDb`, and pushes it
-  into LMS as an external change — so dragging to 20 bounces the slider to 40.
-
-**The mapping.** Proportional across a known range, with max fixed at 0 dB:
+So the range is read, not assumed:
 
 ```
-dB  = min * (1 - lms/100)          # lms 100 -> 0 dB,  lms 0 -> min
-lms = 100 * (1 - dB/min)
+dB  = max - (max - min) x (100 - lms) / 100
+lms = 100 x (dB - min) / (max - min)
 ```
 
-At `min = -100` this is arithmetically identical to `dB = lms - 100`, so this
-instance's feel and the existing assertions are unchanged — the generalisation
-is free here. `min` becomes a per-player accessor (`hqVolMinDb`), so
-`_lmsToDb` / `_dbToLms` become methods rather than plain functions, and the
-tests that call them directly move with them.
+At −100…0 that is arithmetically `dB = lms - 100`, so this instance's feel is
+unchanged. `min`/`max` are per-player accessors (`hqVolMin`, `hqVolMax`), which
+is why `_lmsToDb` and `_dbToLms` are methods.
 
-**Where `min` comes from**, best first:
-
-1. **UPnP `GetVolumeDBRange`** on RenderingControl (`/control/rendering-control`),
-   at describe time and again whenever the control link comes up. The action is
-   known to exist in the binary — it is what the XML API answers `Unknown
-   command` for. One SOAP call per connect, off the hot path, so its 300-550ms
-   does not matter. **Unverified: whether HQPlayer implements it, and in which
-   units** — the UPnP AV spec says `VolumeDB` is in **1/256 dB**, so −60 dB
-   should arrive as −15360, but implementations often return whole dB. Treat
-   `abs(value) > 200` as 1/256 units and divide.
-2. **Derive it from one `GetVolume` + one `<Status/>`.** RenderingControl's
-   `GetVolume` answers 0-100 on HQPlayer's own scale; the status stream gives
-   the same moment in dB. Assuming a linear map with max 0,
-   `min = D / (1 - V/100)` for `V < 100`. Passive, no volume change, nothing new
-   to configure — a good cross-check on (1) and a fallback if it is missing.
-   Undefined as V approaches 100.
-3. **Learn the floor from the clamp.** Send a level below the floor and
-   HQPlayer reports the clamped one back: that value *is* `min`. Self-correcting
-   and the only option that survives the user reconfiguring HQPlayer without a
-   reconnect, but it only learns once the user drags to the bottom. Keep it as
-   the safety net behind (1)/(2), and discriminate it from a genuine external
-   change by requiring the push to follow our own send closely and to be higher
-   than what we asked for.
-4. **A pref.** One number on the settings page. Cheap and honest, but the page
-   is read-only today and the plugin's premise is zero configuration — so this
-   is an override for when the probes disagree, not the primary route.
-
-**The fallback stays −100 for now.** The asymmetry argues for −60: guessing
-−60 when the truth is −100 costs resolution but leaves every slider position
-working, while guessing −100 when the truth is −60 gives the dead zone and the
-snap-back. But the only instance in the field is configured −100, so flipping
-the fallback before (1) is verified would regress the one real user. Flip it
-once the probe is proven.
-
-**The echo guard has to change with the scale.** At 1:1 every dB has exactly one
-LMS step, so comparing against `hqVolDb` is safe. At −60, one LMS step is 0.6 dB
-and several steps share a dB — so the guard must compare **in dB, against the
-slider's own current position** (`_lmsToDb($self->volume) != $db`), not against
-the last value we sent. Otherwise the mirror fights the user on every drag.
-This is the same round-trip question as the declined finding in the ledger, but
-it becomes real as soon as the mapping is not 1:1.
-
-Whatever is learned should be shown on the status page alongside the transport
-id — it is the one number that explains the whole feel of the slider.
-
-**Verify before building** (needs the live instance; substitute its address):
+**Where they come from.** VERIFIED live 2026-08-27 against hqplayerd 6.0.4:
 
 ```
 curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
@@ -603,23 +561,125 @@ curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
   -H 'SOAPACTION: "urn:schemas-upnp-org:service:RenderingControl:3#GetVolumeDBRange"' \
   --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetVolumeDBRange xmlns:u="urn:schemas-upnp-org:service:RenderingControl:3"><InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolumeDBRange></s:Body></s:Envelope>'
 
-curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
-  -H 'Content-Type: text/xml; charset="utf-8"' \
-  -H 'SOAPACTION: "urn:schemas-upnp-org:service:RenderingControl:3#GetVolume"' \
-  --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:3"><InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolume></s:Body></s:Envelope>'
+-> <MinValue>-25600</MinValue><MaxValue>0</MaxValue>
 ```
 
-and, to find out whether the clamp is observable at all — this one works on a
-−100…0 instance without reconfiguring anything, because −120 is below its floor
-too:
+**HQPlayer does implement `GetVolumeDBRange`**, even though the XML control API
+answers `Unknown command` for the name — it is a UPnP RenderingControl action.
+The units are the AV spec's **1/256 dB** (−25600 = −100.0 dB). Some renderers
+report whole dB and nobody has a range past ±200 dB, so `abs(v) > 200` is a
+safe discriminator. One SOAP call per connect, off the hot path, so its
+300–550 ms costs nothing. `UPnP::getVolumeDBRange`, called from
+`Player::refreshVolumeRange` on every link-up.
 
-```
-{ printf '<?xml version="1.0" encoding="UTF-8"?><Volume value="-120"/>'; sleep 1; printf '<?xml version="1.0" encoding="UTF-8"?><Status/>'; sleep 3; } | nc <hqplayer-ip> 4321
+The **clamp** is the fallback, and the only route that survives the user
+reconfiguring HQPlayer without a reconnect: ask for a level beyond the limit
+and HQPlayer answers with the limit itself. Verified — `<Volume value="-120"/>`
+on this instance reports back `volume="-100"`. `_learnFromClamp` is
+deliberately conservative and only reads a reply as a clamp when we asked for
+the limit we already believe in, or beyond it; anything looser would let a knob
+turn on the endpoint that landed inside the window collapse the range.
+
+Whatever is learned is shown on the status page — it is the one number that
+explains the whole feel of the slider.
+
+### Fractional dB, and why there are no dead steps
+
+**HQPlayer takes and reports fractional dB.** Verified: `<Volume
+value="-39.25"/>` comes back from `<Status/>` as `volume="-39.25"` and from
+UPnP `GetVolumeDB` as `-10048` (= −39.25 × 256) exactly. So the device is not
+the limit on resolution — every one of LMS's 101 slider positions can have a
+level of its own, on any range, however narrow. A range with only 41 whole-dB
+values does not force steps to share a level.
+
+**But it round-trips through a 32-bit float**: `-38.6` comes back as
+`-38.599998474121094`. So `_quantise` snaps every level to a binary fraction of
+a dB, which survives both that and HQPlayer's 1/256 dB units exactly. The
+quantum is at most **half an LMS step**, which is what guarantees two
+consecutive slider positions can never land on the same level.
+
+### The snap, and the tolerance that fixes it
+
+The reported symptom — "LMS changes the volume on the next track to align it",
+seen with SqueezeConnect as well — has a definite cause in LMS itself. At the
+start of every track that begins from stopped:
+
+```perl
+# Slim/Player/StreamingController.pm, "Bug 10310"
+my $vol = ... $prefs->client($player)->get("volume") ...;
+$player->volume($vol);
 ```
 
-Read the `volume=` in the pushed `<Status/>`: **−100 means the clamp is
-observable** and route (3) works; an error reply or the level unchanged means it
-is not, and (1)/(2) carry the whole design. Set the volume back afterwards.
+LMS re-asserts its **stored** volume. So the invariant is: whatever LMS has
+stored must map back to HQPlayer's real level, or the next track yanks the
+device onto LMS's idea of it. A level set on the endpoint's own knob — the
+Eversolo's increments are not LMS's — will not land on the 101-step grid, LMS
+rounds it to the nearest step, and without a tolerance that rounding is written
+back as a real change on the next track.
+
+Hence `_volTol`, **half an LMS step in dB**, used by *both* directions:
+
+| | rule |
+|---|---|
+| outbound (`volume`) | send only if the new level differs from where HQPlayer **actually is** by more than `_volTol`. The track-start re-assert then costs nothing. |
+| inbound (`_followVolume`) | follow only if the reported level differs from what the **slider itself means** by more than `_volTol` — not from the last value we sent. |
+
+Both must use the same tolerance, or they fight: whatever one side declines to
+follow, the other must decline to correct. Anything within half a step is the
+same slider position as far as LMS can express it, so the endpoint's own
+setting is left exactly where the user put it.
+
+`_followVolume` reads the **persisted** volume rather than `$client->volume`:
+`_Resume` parks a temporary 0 before its fade-in, and a status push landing in
+that window would otherwise read as "the endpoint just dropped to the floor".
+A muted player stores its level negated, and mutes to the floor.
+
+### Linear in dB, deliberately
+
+Equal dB per step **is** a logarithmic taper on the signal — that is what a good
+analogue pot approximates. It is also HQPlayer's own convention: its UPnP
+`GetVolume` reported `61` at −39 dB on this −100…0 instance, i.e.
+`100 x (1 - 39/100)`, so matching it means the LMS slider and HQPlayer's own
+0-100 scale read the same number and cannot disagree.
+
+A bent taper — a knee, or the `sqrt` curve `denonavpcontrol` uses — was
+considered and rejected. Skins do not agree on the increment (Material's volume
+step is configurable 1/3/5, others differ), so a bend makes one press worth a
+different number of dB depending on where the slider happens to be; and it only
+pays off for a listener with a single habitual level, which is not the case
+here. See the review ledger.
+
+### Fixed volume
+
+Many HQPlayer setups do not attenuate at all — the DAC or the amplifier holds
+the level — and for those the LMS slider must sit at the top and stay there.
+
+LMS already has the concept, and it is worth using rather than inventing. The
+status query emits
+
+```perl
+# Slim/Control/Queries.pm
+my $useVolumeControl = ($digitalVolumeControl || !$hasDigitalOut) ? 1 : 0;
+$request->addResult('use_volume_control', $useVolumeControl);
+```
+
+and the skins disable the slider on `use_volume_control: 0`. LMS only allows
+`digitalVolumeControl` to go to 0 on a player whose `hasDigitalOut` is true —
+which this one is — and the same gate puts LMS's own **Volume Control:
+fixed / variable** radio on the player's Audio settings page, so the user gets a
+manual override for free.
+
+So `_setFixed(1)` writes the pref to 0, parks the slider at 100, and stops
+`volume()` sending. A manual 0 counts as fixed too and is **never** written back
+to 1 — only a 0 the plugin set is the plugin's to clear.
+
+Detection, in order: a zero-width range from `GetVolumeDBRange`; failing that,
+`_watchForFixed` — three sends that ask for a genuinely different level and
+change nothing, one strike per send, cleared the moment any level change is
+seen so the state can never stick. **Unverified:** how HQPlayer actually
+presents fixed mode, which needs the setting flipped on a live instance. The
+passive rule does not depend on knowing.
+
 
 ### TRAP: never send ReadyToStream while a track is playing
 
@@ -717,6 +777,13 @@ HTTP played correctly:
 * Volume works over the XML channel: `<Volume value="-54"/>` → `result="OK"`,
   the level moves, and hqplayerd logs the hardware/software split to the NAA.
   `SetVolume`/`SetVolumeDB`/`GetVolume` all answer `Unknown command`.
+* **The volume range, resolution and clamp** — 2026-08-27, probed directly from
+  the Mac (the instance answers discovery on the LAN, so no shell on the box is
+  needed): `GetVolumeDBRange` → −25600/0 (1/256 dB); `<Volume value="-39.25"/>`
+  → `<Status/>` reports `-39.25` and `GetVolumeDB` reports −10048;
+  `<Volume value="-120"/>` clamps and reports back `-100`; `GetVolume` reports
+  61 at −39 dB, i.e. HQPlayer's own 0-100 scale is linear over the range. The
+  level was restored to −39 dB afterwards.
 * End of track is detectable: `state` goes 2 → 0 on its own.
 
 **Watch for a silent output-format mismatch.** When HQPlayer's output format
@@ -733,6 +800,13 @@ Never conclude "playback works" from `state` alone.
 
 ## Still unverified
 
+* **How HQPlayer presents fixed volume.** Needs the setting flipped on a live
+  instance, then a `<Status/>` and a `GetVolumeDBRange`. Detection currently
+  assumes a zero-width range, and falls back to `_watchForFixed` (three sends
+  that change nothing), which does not depend on knowing.
+* The volume work as a whole is verified at the protocol level and unit-tested,
+  but has not yet run on the live LMS — the bridge was not loaded there when
+  0.2.9 was built.
 * Seek initiated from LMS, and tier 2 (`/stream.mp3?player=`) Content-Type
   matching the format actually streamed.
 * `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS

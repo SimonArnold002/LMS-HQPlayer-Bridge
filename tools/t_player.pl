@@ -315,14 +315,52 @@ is(scalar(@{$ctl->{calls}}), '0',
 # what stops the two directions chasing each other round.
 # ---------------------------------------------------------------------------
 print "-- volume mapping --\n";
-is(Plugins::HQPlayerBridge::Player::_lmsToDb(100), '0',    'LMS 100 is 0dB');
-is(Plugins::HQPlayerBridge::Player::_lmsToDb(50),  '-50',  'one LMS step is 1dB');
-is(Plugins::HQPlayerBridge::Player::_lmsToDb(0),   '-100', 'LMS 0 is the floor');
-is(Plugins::HQPlayerBridge::Player::_lmsToDb(150), '0',    'over-range clamps to 0dB');
-is(Plugins::HQPlayerBridge::Player::_dbToLms(-53), '47',   'and back again');
+is($c->_lmsToDb(100), '0',    'LMS 100 is 0dB');
+is($c->_lmsToDb(50),  '-50',  'on a -100..0 instance one LMS step is 1dB');
+is($c->_lmsToDb(0),   '-100', 'LMS 0 is the floor');
+is($c->_lmsToDb(150), '0',    'over-range clamps to the ceiling');
+is($c->_lmsToDb(-47), '-100', 'mute arrives as a negative level and goes to the floor');
+is($c->_dbToLms(-53), '47',   'and back again');
 # int() truncates towards zero, and every dB figure here is negative
-is(Plugins::HQPlayerBridge::Player::_dbToLms(-53.4), '47',  'a fractional dB rounds towards the nearer step, not towards zero');
-is(Plugins::HQPlayerBridge::Player::_dbToLms(-999),'0',    'under-range clamps to 0');
+is($c->_dbToLms(-53.4), '47',  'a fractional dB rounds towards the nearer step, not towards zero');
+is($c->_dbToLms(-999),'0',    'under-range clamps to 0');
+
+# THE RANGE IS A SETTING, NOT A CONSTANT.  HQPlayer defaults to -60..0, this
+# instance is -100..0, and a user may cap the top as well as the floor.
+print "-- volume mapping on other ranges --\n";
+$c->hqVolMin(-60); $c->hqVolMax(0);
+is($c->_lmsToDb(100), '0',   'a -60..0 instance still tops out at 0dB');
+is($c->_lmsToDb(0),   '-60', 'and bottoms out at ITS floor, not at -100');
+is($c->_lmsToDb(50),  '-30', 'the slider spans the whole range');
+is($c->_dbToLms(-30), '50',  'and inverts');
+
+$c->hqVolMin(-60); $c->hqVolMax(-20);
+is($c->_lmsToDb(100), '-20', 'a -60..-20 instance tops out at -20dB');
+is($c->_lmsToDb(0),   '-60', 'and bottoms out at -60dB');
+is($c->_lmsToDb(50),  '-40', 'mid-slider is mid-range');
+is($c->_dbToLms(-40), '50',  'and inverts');
+
+# NO DEAD INCREMENTS.  HQPlayer takes fractional dB (verified live: -39.25 is
+# reported back verbatim), so every one of the 101 positions gets a level of
+# its own - on any range, however narrow.
+for my $range ([-100,0], [-60,0], [-60,-20], [-30,-20]) {
+    $c->hqVolMin($range->[0]); $c->hqVolMax($range->[1]);
+    my ($mono, $prev) = (1, undef);
+    for my $v (0..100) {
+        my $db = $c->_lmsToDb($v);
+        $mono = 0 if defined $prev && $db <= $prev;
+        $prev = $db;
+    }
+    ok($mono, "every slider step changes the level on a $range->[0]..$range->[1] instance");
+}
+
+# It round-trips through a 32-bit float on the wire, so stay on a binary grid.
+$c->hqVolMin(-60); $c->hqVolMax(0);
+is(Plugins::HQPlayerBridge::Player::_fmtDb($c->_lmsToDb(37)), '-37.75',
+   'a fractional level is quantised to a binary fraction of a dB');
+$c->hqVolMin(-100); $c->hqVolMax(0);
+is(Plugins::HQPlayerBridge::Player::_fmtDb($c->_lmsToDb(47)), '-53',
+   'and a whole dB is still sent as a whole number');
 
 print "-- volume both ways --\n";
 my @ex;
@@ -344,19 +382,97 @@ is(scalar(@sent), '1', 'the same level again is not re-sent');
 $c->volume(30, 1); $c->volume(20, 1); $c->volume(0, 1);
 is(scalar(@sent), '0', 'temporary volumes (the pause fade) are never forwarded');
 
-# HQPlayer's own UI, or the endpoint's remote, moved it
+# HQPlayer's own UI, or the endpoint's remote, moved it.  Note the temporary 0
+# still parked by the ramp above: the inbound guard has to read the PERSISTED
+# level, or a push landing inside _Resume's fade window reads as "the endpoint
+# just dropped to the floor".
 @sent = (); @ex = ();
-$c->hqVolDb(-40);   # somewhere else, so -53 below is a genuine change
-$c->_onStatus({ state => 2, position => 5, volume => -53 }, '');
-is(join(',', @ex), 'mixer volume 47', 'a change at HQPlayer is mirrored into LMS');
+$c->_onStatus({ state => 2, position => 5, volume => -40 }, '');
+is(join(',', @ex), 'mixer volume 60', 'a change at HQPlayer is mirrored into LMS');
 is(scalar(@sent), '0', 'and is NOT sent straight back out');
-is($c->hqVolDb, '-53', 'hqVolDb tracks it');
-$c->volume(47);
+is($c->hqVolDb, '-40', 'hqVolDb tracks where HQPlayer actually is');
+$c->volume(60);
 is(scalar(@sent), '0', 'the mixer command it triggers does not echo either');
 
 @ex = ();
-$c->_onStatus({ state => 2, position => 6, volume => -53 }, '');
+$c->_onStatus({ state => 2, position => 6, volume => -40 }, '');
 is(scalar(@ex), '0', 'an unchanged volume in the status stream does nothing');
+
+# THE SNAP.  LMS re-asserts its STORED volume at the start of every track that
+# begins from stopped (StreamingController, "Bug 10310").  A level set on the
+# endpoint's own knob will not land on LMS's 101-step grid, so without a
+# tolerance that re-assert drags the endpoint back onto the rounded value -
+# which is exactly the reported "LMS changes the volume on the next track".
+print "-- a level set on the endpoint survives a track change --\n";
+@sent = (); @ex = ();
+$c->_onStatus({ state => 2, position => 7, volume => -39.6 }, '');
+is(scalar(@ex), '0', 'an off-grid level within half a step does not move the slider');
+is($c->hqVolDb, '-39.6', 'but it is recorded as where HQPlayer actually is');
+$c->volume(60);   # the track-start re-assert, with LMS's stored 60
+is(scalar(@sent), '0', 'and the track-start re-assert does not drag it back');
+
+@sent = ();
+$c->volume(58);
+is(join(',', @sent), '<Volume value="-42"/>', 'a real slider move is still sent');
+
+# Some HQPlayer setups do not attenuate at all - the DAC or the amp holds the
+# volume - and the LMS slider must sit at the top rather than pretend.
+print "-- fixed volume --\n";
+my $sp = Slim::Utils::Prefs::preferences('server');
+@sent = (); @ex = ();
+$c->_setFixed(1);
+is($c->hqVolFixed, '1', 'a zero-width range locks the volume');
+is(join(',', @ex), 'mixer volume 100', 'and parks the LMS slider at the top');
+is($sp->client($c)->get('digitalVolumeControl'), '0',
+   'via the pref LMS turns into use_volume_control:0, which the skins disable the slider on');
+@sent = ();
+$c->volume(40);
+is(scalar(@sent), '0', 'nothing is sent to HQPlayer while it is not attenuating');
+$c->_setFixed(0);
+is($sp->client($c)->get('digitalVolumeControl'), '1', 'and it unlocks again');
+
+# LMS's own "Volume Control: fixed" radio means the same thing, and is the
+# user's, not ours: honour it, and never write it back to variable.
+$sp->client($c)->set('digitalVolumeControl', 0);
+@sent = ();
+$c->volume(35);
+is(scalar(@sent), '0', "a user's own fixed-volume setting stops us sending too");
+$c->_setFixed(1); $c->_setFixed(0);
+is($sp->client($c)->get('digitalVolumeControl'), '0',
+   'and a 0 we did not set is never written back to 1');
+$sp->client($c)->set('digitalVolumeControl', 1);
+
+# The range is READ, not assumed.  VERIFIED live: HQPlayer does implement UPnP
+# GetVolumeDBRange even though the XML control API calls it an unknown command.
+print "-- learning the range --\n";
+@ex = ();
+$c->hqVolDb(-30);
+$c->_setRange(-60, 0);
+is($c->_volStep, '0.6', 'the size of a slider step follows the range');
+is(join(',', @ex), 'mixer volume 50',
+   'and the slider is re-derived from where HQPlayer is, not left reading the old scale');
+
+# The fallback, and the only route that survives a mid-session reconfigure:
+# ask for a level below the floor and HQPlayer answers with the floor itself.
+@sent = (); @ex = ();
+$c->hqVolMin(-100); $c->hqVolMax(0);
+$c->volume(0);                                   # asks for the floor we believe in
+$c->_onStatus({ state => 0, position => 0, volume => -60 }, '');
+is($c->hqVolMin, '-60', 'a clamped reply teaches us the real floor');
+is($c->hqVolMax, '0',   'and leaves the ceiling alone');
+
+# The other fixed-volume tell: it accepts the command and does not move.
+$c->hqVolMin(-100); $c->hqVolMax(0);
+$c->hqVolDb(-50); $c->hqVolMissed(0); $c->hqVolFixed(0);
+for ( 1 .. 3 ) {
+    $c->hqVolSent(-70);
+    $c->hqVolSentAt( Time::HiRes::time() - 5 );
+    $c->_followVolume(-50);
+}
+is($c->hqVolFixed, '1', 'three sends that change nothing mark the volume fixed');
+$c->_setFixed(0);
+$sp->client($c)->set('digitalVolumeControl', 1);
+$c->hqVolDb(undef);
 
 print "-- fade_volume --\n";
 my $fired = 0;

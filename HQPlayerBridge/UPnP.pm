@@ -339,6 +339,49 @@ sub seek {
     return;
 }
 
+# The one thing only UPnP can answer: how far HQPlayer's volume actually goes.
+#
+# VERIFIED live against hqplayerd 6.0.4 - the XML control API answers "Unknown
+# command" for GetVolumeDBRange, but the RenderingControl action IS implemented
+# and returns MinValue -25600, MaxValue 0 on a -100...0 instance.  Those are
+# the AV spec's 1/256 dB units.  Some renderers report whole dB instead, and
+# nobody has a range past +-200 dB, so that is a safe discriminator.
+#
+# Calls back with ( $min, $max ) in dB, or ( undef ) if it could not be read.
+use constant DB_FIXED_POINT => 256;
+use constant DB_PLAUSIBLE   => 200;
+
+sub getVolumeDBRange {
+    my ( $self, $cb ) = @_;
+
+    $self->_rc(
+        'GetVolumeDBRange',
+        '<InstanceID>0</InstanceID><Channel>Master</Channel>',
+        sub {
+            my $body = shift;
+
+            return $cb->(undef) unless $cb && defined $body;
+
+            my ($min) = $body =~ m{<MinValue>\s*(-?[\d.]+)\s*</MinValue>};
+            my ($max) = $body =~ m{<MaxValue>\s*(-?[\d.]+)\s*</MaxValue>};
+
+            return $cb->(undef) unless defined $min && defined $max;
+
+            for my $v ( $min, $max ) {
+                $v += 0;
+                $v /= DB_FIXED_POINT if abs($v) > DB_PLAUSIBLE;
+            }
+
+            main::INFOLOG && $log->is_info && $log->info(
+                "$self->{name}: volume range ${min}dB to ${max}dB" );
+
+            return $cb->( $min, $max );
+        },
+    );
+
+    return;
+}
+
 # RenderingControl speaks 0-100, the same scale LMS uses, so the player's
 # volume passes straight through with no conversion.
 sub setVolume {
