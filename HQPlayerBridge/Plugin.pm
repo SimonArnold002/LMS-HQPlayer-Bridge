@@ -26,6 +26,7 @@ use Digest::MD5 qw(md5_hex);
 use Socket qw(pack_sockaddr_in INADDR_LOOPBACK);
 
 use Slim::Utils::Log;
+use Slim::Utils::PluginManager;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 use Slim::Control::Request;
@@ -36,7 +37,21 @@ use Plugins::HQPlayerBridge::Discovery;
 use Plugins::HQPlayerBridge::Player;
 use Plugins::HQPlayerBridge::UPnP;
 
-use constant PLUGIN_VERSION => '0.2.3';
+# The version is READ from install.xml, never restated here.  A second copy is
+# a copy that goes stale: this was a hand-maintained constant sitting at 0.2.3
+# while install.xml and repo.xml were at 0.2.7, so the startup log and the
+# settings page both reported a build that had not been running for months.
+my $VERSION;
+
+sub version {
+    return $VERSION if defined $VERSION;
+
+    $VERSION = eval {
+        Slim::Utils::PluginManager->dataForPlugin(__PACKAGE__)->{version};
+    } || 'unknown';
+
+    return $VERSION;
+}
 
 my $log = Slim::Utils::Log->addLogCategory({
     'category'     => 'plugin.hqplayerbridge',
@@ -54,7 +69,7 @@ sub initPlugin {
 
     $class->SUPER::initPlugin(@_);
 
-    main::INFOLOG && $log->is_info && $log->info( 'HQPlayer Bridge v' . PLUGIN_VERSION . ' starting' );
+    main::INFOLOG && $log->is_info && $log->info( 'HQPlayer Bridge v' . $class->version . ' starting' );
 
     if (main::WEBUI) {
         require Plugins::HQPlayerBridge::Settings;
@@ -78,7 +93,6 @@ sub shutdownPlugin {
 
 # Exposed to the settings page.
 sub bridges { return \%bridges }
-sub version { PLUGIN_VERSION }
 
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
@@ -88,8 +102,12 @@ sub _onInstances {
 
     my %seen;
 
+    my $ids = _idsFor($instances);
+
     for my $inst (@$instances) {
-        my $id = _idFor($inst);
+        my $id   = $ids->{ $inst->{ip} }->{id};
+        my $name = $ids->{ $inst->{ip} }->{name};
+
         $seen{$id} = 1;
 
         # One bad instance must not abort the whole round - this ran inside a
@@ -104,14 +122,14 @@ sub _onInstances {
             if ( $b->{instance}->{ip} ne $inst->{ip} ) {
                 $log->info("$inst->{name}: address changed $b->{instance}->{ip} -> $inst->{ip}, reconnecting");
                 _teardown($id);
-                _create( $id, $inst );
+                _create( $id, $inst, $name );
             }
             else {
                 $b->{instance} = $inst;
             }
         }
         else {
-            _create( $id, $inst );
+            _create( $id, $inst, $name );
         }
 
         1 } or do {
@@ -131,25 +149,91 @@ sub _onInstances {
     return;
 }
 
-# A stable synthetic MAC, derived from the instance name rather than its
-# address so that a DHCP move does not orphan the player's prefs, playlist
-# and sync group.  The 0x02 prefix marks it locally administered, so it can
-# never collide with real Squeezebox hardware.
+# A stable synthetic MAC.  The 0x02 prefix marks it locally administered, so it
+# can never collide with real Squeezebox hardware.
 sub _idFor {
-    my $inst = shift;
+    my $key = shift;
 
-    my $key = $inst->{name} || $inst->{ip};
-    my @o   = unpack( '(A2)5', substr( md5_hex($key), 0, 10 ) );
+    my @o = unpack( '(A2)5', substr( md5_hex($key), 0, 10 ) );
 
     return lc( '02:' . join( ':', @o ) );
 }
 
-sub _create {
-    my ( $id, $inst ) = @_;
+# The player's display name.  Two instances answering to the same product name
+# are told apart by address here too - otherwise LMS shows two identical
+# players and there is no way to know which is which.
+sub _nameFor {
+    my ( $inst, $duplicated ) = @_;
 
     my $name = $inst->{name} && $inst->{name} ne 'HQPlayer'
              ? "HQPlayer ($inst->{name})"
              : 'HQPlayer';
+
+    $name .= " $inst->{ip}" if $duplicated;
+
+    return $name;
+}
+
+# Player id for every discovered instance, keyed by ip.
+#
+# The id is derived from the instance NAME rather than its address, so that a
+# DHCP move does not orphan the player's prefs, playlist and sync group - the
+# address-changed branch above follows the instance instead.
+#
+# TRAP: the discovery name is a PRODUCT string, not an identity.  Every
+# HQPlayer Embedded instance answers "HQPlayerEmbedded", so on the name alone
+# two instances are one player: each discovery round would see the id it
+# already has arrive with the other one's address, tear the player down and
+# build it again 60 seconds later, killing playback every time.  (A DHCP move
+# is the same shape - the old address lingers in the discovery table for
+# INSTANCE_TTL, so for that window the instance appears twice under one name.)
+#
+# So a name that more than one live instance answers to is not usable on its
+# own, and those instances are told apart by address.  A name only one instance
+# answers to - the ordinary case, and the only one where the prefs actually
+# matter - keeps the plain name-derived id and its DHCP immunity.
+sub _idsFor {
+    my $instances = shift || [];
+
+    my %byName;
+
+    for my $inst (@$instances) {
+        push @{ $byName{ $inst->{name} || $inst->{ip} } }, $inst;
+    }
+
+    my %id;
+
+    for my $name ( keys %byName ) {
+        my $group = $byName{$name};
+
+        if ( @$group == 1 ) {
+            my $inst = $group->[0];
+            $id{ $inst->{ip} } = {
+                id   => _idFor($name),
+                name => _nameFor( $inst, 0 ),
+            };
+            next;
+        }
+
+        $log->warn( scalar(@$group) . " instances answer to '$name' ("
+            . join( ', ', map { $_->{ip} } @$group )
+            . ') - identifying them by address instead' );
+
+        for my $inst (@$group) {
+            $id{ $inst->{ip} } = {
+                id   => _idFor( $name . '@' . $inst->{ip} ),
+                name => _nameFor( $inst, 1 ),
+            };
+        }
+    }
+
+    return \%id;
+}
+
+sub _create {
+    my ( $id, $inst, $name ) = @_;
+
+    $name ||= _nameFor( $inst, 0 );
 
     main::INFOLOG && $log->is_info && $log->info("creating player '$name' [$id] for $inst->{ip}");
 
@@ -270,6 +354,13 @@ sub _teardown {
     if ( my $client = $b->{client} ) {
         eval {
             $client->_stopPolling;
+
+            # The renderer owns timers of its own - a describe retry, and the
+            # Play retry loop - which would otherwise keep firing at an
+            # instance that has gone away.
+            my $upnp = $client->hqUPnP;
+            $upnp->close if $upnp;
+
             $client->controller->stop if $client->controller;
         };
         eval { Slim::Player::Client::forgetClient($client) };

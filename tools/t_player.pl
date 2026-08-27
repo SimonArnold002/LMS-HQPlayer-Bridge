@@ -14,7 +14,14 @@ my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
   if ($got eq $want){$pass++; printf "  ok   %s\n",$name}
   else {$fail++; printf "  FAIL %s\n        got: %s\n       want: %s\n",$name,$got,$want} }
-sub ok { my($c,$n)=@_; $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
+# TRAP: ok($src =~ /re/, 'name') evaluates the match in LIST context, where a
+# FAILED match returns the empty list - so @_ collapses to just the name, the
+# name lands in $c as a true value, and a broken assertion prints "ok" with a
+# blank label and counts as a pass.  Two assertions in this file had been dead
+# that way.  Take the name off the END and treat everything left as the
+# condition, so an empty list reads as false.
+sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
+  $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
 
 print "-- player construction --\n";
 my $c = eval { Plugins::HQPlayerBridge::Player->new('02:ab:88:42:4c:69', 'paddr', 1.0, undef, 12, undef) };
@@ -159,13 +166,20 @@ ok($stopSub && $stopSub =~ /bufferReady\(\s*0\s*\)/, 'stop() clears bufferReady'
 ok($src =~ /playerEndOfStream[^;]*;\s*\$controller->playerReadyToStream/s,
    'ReadyToStream is signalled only after EndOfStream, never alongside TrackStarted');
 
-print "-- volume debounce --\n";
-ok($src =~ /sub _flushVolume/, '_flushVolume exists');
+# Volume used to go over UPnP RenderingControl, which took 300-550ms per call,
+# so it needed a debounce timer (_flushVolume) to survive LMS's 6-step pause
+# ramp.  It goes over the XML control link now - ~9ms - and the ramp steps are
+# dropped at source instead, so there is no debounce left to test.  These two
+# assertions still named _flushVolume, and passed anyway: see the note on ok().
+print "-- volume channel --\n";
 my ($volSub) = $src =~ /\nsub volume \{(.*?)\n\}/s;
+ok($volSub, 'volume() is overridden');
 ok($volSub && $volSub !~ /setVolume/,
-   'volume() does not push straight to UPnP - LMS fades it 6 times per pause');
-ok($volSub && $volSub =~ /killTimers\([^)]*_flushVolume/,
-   'volume() kills the pending flush before scheduling a new one');
+   'volume() does not push to UPnP - the XML channel answers in ~9ms, UPnP in 300-550ms');
+ok($volSub && $volSub =~ /return \$vol if \$temp/,
+   'volume() drops LMS temporary levels rather than forwarding the pause ramp');
+ok($volSub && $volSub =~ /hqVolDb/,
+   'volume() checks the level HQPlayer is already at, so the two directions cannot chase each other');
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +365,168 @@ $c->fade_volume(-0.3125, sub { $fired++ });
 is($fired, '1', 'the callback fires immediately - it is what actually pauses');
 is($c->_tempVolume, '(undef)',
    'and the ramp temporary volume is cleared, or the slider reads zero after a resume');
+
+
+# ---------------------------------------------------------------------------
+# Track changes.  Loading a track is several async round trips, and HQPlayer
+# pushes status ~1/s throughout, so a track change always straddles a push or
+# two.  Two ways that used to go wrong, both of which skip a track:
+#
+#   * play() cleared hqExpectStop immediately, so the stop WE sent to end the
+#     previous track arrived as an unexplained stop - i.e. end-of-track - and
+#     LMS advanced past the track it had just started.
+#   * the load's completion callback was never cancelled, so a stop or a skip
+#     during the load window still re-asserted bufferReady and applied the OLD
+#     track's seek offset to the new one.
+# ---------------------------------------------------------------------------
+print "-- track changes --\n";
+{
+    package LoadUPnP;
+    sub new   { bless { ready => 1, cancels => 0, uris => [] }, shift }
+    sub ready { $_[0]->{ready} }
+    sub cancelPlay { $_[0]->{cancels}++ }
+    sub setURI {
+        my ( $s, $url, $didl, $cb ) = @_;
+        push @{ $s->{uris} }, $url;
+        $s->{uriCb} = $cb;
+    }
+    sub playWhenReady { $_[1] and $_[0]->{playCb} = $_[1] }
+    # the daemon answering, whenever the test says it does
+    sub finishURI  { my $cb = delete $_[0]->{uriCb};  $cb->( 'ok', undef ) if $cb }
+    sub finishPlay { my $cb = delete $_[0]->{playCb}; $cb->( 'ok', undef ) if $cb }
+
+    package LoadController;
+    sub new { bless { song => $_[1], calls => [] }, $_[0] }
+    sub song { $_[0]->{song} }
+    sub isPaused { 0 }
+    sub AUTOLOAD {
+        our $AUTOLOAD;
+        my $m = $AUTOLOAD; $m =~ s/.*:://;
+        return if $m eq 'DESTROY';
+        push @{ $_[0]->{calls} }, $m;
+        return;
+    }
+}
+
+my $up  = LoadUPnP->new;
+my $one = FakeSong->new( FakeTrack->new({ title=>'One', id=>101, ct=>'flc', secs=>200, url=>'file:///one.flac' }) );
+my $two = FakeSong->new( FakeTrack->new({ title=>'Two', id=>202, ct=>'flc', secs=>200, url=>'file:///two.flac' }) );
+
+my $p = Plugins::HQPlayerBridge::Player->new('02:11:22:33:44:55', 'paddr', 1.0, undef, 12, undef);
+$p->hqUPnP($up);
+my $lc = LoadController->new($one);
+$p->controller($lc);
+
+# helper: one pushed <Status/>, with the metadata child HQPlayer really sends
+sub status {
+    my ( $player, $state, $uri, $pos ) = @_;
+    my $raw = qq{<Status state="$state" position="} . ( $pos // 0 ) . q{">}
+            . ( $uri ? qq{<metadata bits="24" samplerate="96000" uri="$uri"/>} : '' )
+            . q{</Status>};
+    $player->_onStatus( { state => $state, position => $pos // 0 }, $raw );
+    return;
+}
+
+@sent = ();
+$p->play({ controller => $lc });
+my $url1 = $up->{uris}->[0];
+ok($url1 && $url1 =~ m{/music/101/download\.flac}, 'play() hands HQPlayer the tier-1 URL');
+is($p->hqExpectStop, '1',
+   'play() leaves the stop guard ARMED - the stop that ended the previous track is still in flight');
+is($p->hqPlayAck, '0', 'and the track is not acknowledged until HQPlayer accepts Play');
+
+# a push describing the PREVIOUS track, arriving after play() has set up this one
+$p->hqPrevURL('http://127.0.0.1:9000/music/999/download.flac');
+status($p, 2, 'http://127.0.0.1:9000/music/999/download.flac', 197);
+is($p->hqStarted, '0', 'a PLAYING push for the previous track does not start this one');
+is($p->hqPosition, '0',
+   "and its position (197s into the previous track) is not adopted as ours");
+$p->hqPrevURL(undef);
+
+# ... and even with no way to tell the tracks apart (tier 2 - every track comes
+# off the same /stream.mp3 URL), an unacknowledged PLAYING is not a start
+status($p, 2, undef, 0);
+is($p->hqStarted, '0', 'an unacknowledged PLAYING push is never taken as a start');
+
+# the stop we sent to end the previous track finally lands
+$lc->{calls} = [];
+status($p, 0, undef, 0);
+is(scalar(@{$lc->{calls}}), '0',
+   'our own stop, arriving during the load, is NOT reported as end-of-track');
+
+# HQPlayer accepts the track and starts playing it
+$up->finishURI;
+$up->finishPlay;
+is($p->hqPlayAck, '1', 'Play accepted -> the track is acknowledged');
+is($p->bufferReady, '1', 'and the buffer is asserted for the controller');
+
+$lc->{calls} = [];
+status($p, 2, $url1, 1);
+is($p->hqStarted, '1', 'now a PLAYING push starts the track');
+is(join(',', @{$lc->{calls}}), 'playerTrackStarted,playerStatusHeartbeat',
+   'and Started is signalled, exactly once, ahead of the heartbeat');
+is($p->hqExpectStop, '0', 'the stop guard is disarmed only now');
+
+# genuine end of track
+$lc->{calls} = [];
+status($p, 0, $url1, 200);
+is(join(',', @{$lc->{calls}}), 'playerEndOfStream,playerReadyToStream,playerStopped',
+   'HQPlayer stopping on its own IS end-of-track');
+
+print "-- a load superseded mid-flight --\n";
+# skip: play track two, then stop before HQPlayer has answered
+$p->play({ controller => LoadController->new($two) });
+my $gen = $p->hqGen;
+$p->stop;
+ok($p->hqGen != $gen, 'stop() supersedes the load that was in flight');
+is($up->{cancels}, '3', 'and the UPnP Play retry loop is cancelled each time');
+
+$p->bufferReady(0);
+$lc->{calls} = [];
+$up->finishURI;
+$up->finishPlay;
+is($p->bufferReady, '0',
+   'the superseded load does not re-assert bufferReady after the stop');
+is($p->hqPlayAck, '0', 'nor acknowledge a track that is no longer wanted');
+
+# skip mid-load: the old track's seek must not be applied to the new one
+@sent = ();
+$p->play({ controller => LoadController->new($one), seekdata => { timeOffset => 90 } });
+$p->play({ controller => LoadController->new($two) });   # skipped before it loaded
+$up->finishURI;
+$up->finishPlay;
+is(join(',', grep { /Seek/ } @sent), '',
+   "the skipped track's seek is not sent to the track that replaced it");
+is($p->hqSeekOffset, '0', 'and no phantom seek offset is left on the elapsed time');
+
+
+# ---------------------------------------------------------------------------
+# fade_volume's DURATION.  It is not only the pause ramp: the sleep timer calls
+# it with the whole fade-out time and stops the player from the completion
+# callback.  Firing that immediately ended playback a full fade early.
+# ---------------------------------------------------------------------------
+print "-- fade duration --\n";
+Slim::Utils::Timers::_reset();
+
+my $stopped = 0;
+$c->fade_volume(-0.3125, sub { $stopped++ });
+is($stopped, '1', 'a pause ramp still completes immediately - it is what pauses');
+is(Slim::Utils::Timers::_pending(), '0', 'and schedules nothing');
+
+$stopped = 0;
+$c->fade_volume(-60, sub { $stopped++ });
+is($stopped, '0', 'a 60s sleep fade does NOT stop the player straight away');
+is(Slim::Utils::Timers::_pending(), '1', 'it is deferred to a timer');
+Slim::Utils::Timers::_fireAll();
+is($stopped, '1', 'and completes when the fade would have ended');
+
+# a cancelled sleep timer must not still stop the player later
+$stopped = 0;
+$c->fade_volume(-60, sub { $stopped++ });
+$c->fade_volume(-0.3125, sub { });
+is(Slim::Utils::Timers::_pending(), '0', 'a new fade cancels the pending one');
+Slim::Utils::Timers::_fireAll();
+is($stopped, '0', 'so the superseded fade never fires');
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

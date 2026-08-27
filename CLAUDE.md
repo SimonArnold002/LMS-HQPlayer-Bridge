@@ -1,5 +1,16 @@
 # LMS-HQPlayer-Bridge
 
+## Review Ledger
+
+Verdicts already reached on review findings. **Read this before reporting one** —
+a finding listed here has been considered and settled, and raising it again
+costs a review round. Record every declined verdict in the same session it is
+declined.
+
+| Finding | Verdict | Why |
+|---|---|---|
+| The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **DECLINED** 2026-08-27 | No endpoint mutes below that level, and the LMS scale has to match what HQPlayer gives, which is −100. The clamp is the intended mapping, not a rounding bug. **Not to be confused with** the range being configurable at all — that is real, and scoped below. |
+
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
 bridge path.
@@ -204,6 +215,27 @@ then fetches and probes the media before the transport actually holds anything.
 `GetMediaInfo` reflects it (`NrTracks` already reads 1), so
 `UPnP::playWhenReady` simply retries (8 × 0.4s).
 
+The retry is deliberately **blind to which error came back**: a UPnP fault is an
+HTTP 500 whose `errorCode` is in the body, not in the status line the async
+client hands us, so "is this the transient 702" is not reliably answerable from
+`$err` — and guessing wrong breaks the ordinary case, where a failed first Play
+is normal. What is bounded instead is the **wait**: `PLAY_TIMEOUT` (5s) per
+attempt and a `PLAY_DEADLINE` (12s) across the loop. Eight attempts at the
+general 15s SOAP timeout was ~2 minutes of a player that looks like it is
+buffering before it admits the track failed.
+
+### TRAP: describe() must retry itself
+
+Without a device description there is no control path, and `_queueTrack` fails
+every track with `PROBLEM_OPENING` — the player exists but can never play
+anything. `describe` runs when the player is created and again when the control
+link comes **up**, and *neither of those recurs*: LMS and hqplayerd starting
+together (a server reboot) is exactly the case where the first fetch fails and
+the control link then stays up, so no further attempt would ever be made. It now
+retries itself with backoff (5s → 60s) until it succeeds, and `UPnP::close` —
+called from `_teardown` — stops that and the Play retry loop when the player
+goes away.
+
 Note `SetAVTransportURI` is logged by hqplayerd as `Playlist clear` +
 `Playlist add URI` — it lands on the same playlist the XML API uses.
 
@@ -291,10 +323,47 @@ pushed message and maps it onto the controller callbacks:
 
 | HQPlayer | LMS |
 |---|---|
-| `state` → 2, first time | `playerTrackStarted` **only** |
+| `state` → 2, first time **for an acknowledged track** | `playerTrackStarted` **only** |
 | position advancing | `playerStatusHeartbeat` |
 | `state` 2 → 0, not ours | `playerEndOfStream` + `playerReadyToStream` + `playerStopped` |
 | command rejected | `playerStreamingFailed('PROBLEM_OPENING')` |
+
+### TRAP: a track change straddles the status stream
+
+HQPlayer pushes status ~1/s and a track change is several async round trips
+(`<Stop/>`, then `SetAVTransportURI`, then `Play` with retries), so **a push
+describing the previous track routinely arrives after the next one has been set
+up**. Read as current, that push starts a track HQPlayer has not begun, and the
+stop that follows it then reads as end-of-track — LMS advances, and the track it
+has just started is *skipped*. Three things stop it, and all three are needed:
+
+* **`hqExpectStop` is ARMED by `play()`, not cleared by it.** Between `play()`
+  and HQPlayer confirming the new track, any stop it reports is the one we sent
+  to end the previous track. It is disarmed only when the new track is
+  confirmed playing.
+* **`hqPlayAck`** — set when `Play` is accepted for *this* track. Until then a
+  PLAYING push is not evidence that this track is running, so it neither starts
+  the track nor disarms the guard.
+* **The `<metadata uri="">` child** is the only per-track identity in the status
+  stream. `_isStale` uses it *one-sidedly*: a push counts as stale only when its
+  uri is exactly `hqPrevURL` and not `hqURL`. Anything unrecognised — a
+  normalised uri, no metadata child, or tier 2, where every track comes off the
+  same `/stream.mp3` URL — is treated as current, so this can only ever suppress
+  a push positively identified as the previous track's. It can never wedge
+  playback. Volume is still followed from a stale push; it belongs to the
+  instance, not the track.
+
+### TRAP: an async load outlives the track that started it
+
+A stop or a skip during the load window used to leave the *previous* track's
+completion callback to fire anyway — re-asserting `bufferReady`, restarting the
+poll, and applying that track's `<Seek>` and `hqSeekOffset` to whatever is
+playing now, so elapsed time was wrong for the whole track.
+
+`play()` and `stop()` both call `_newGeneration`: it bumps `hqGen`, which every
+in-flight callback compares itself against (`_superseded`), and calls
+`UPnP::cancelPlay`, which bumps an epoch the Play retry loop checks — the retry
+is a timer, so it needs cancelling separately from the callback.
 
 ### Two-way transport: `hqWanted`, and why not the controller's state
 
@@ -418,6 +487,10 @@ the accessor, so Material and anything else watching the slider is notified.
 mapping HQPlayer's UPnP endpoint was applying to the 0-100 it received, so the
 slider feels unchanged.
 
+**That 1:1 is only correct because this instance's range is set to −100…0.**
+See the scoped section below — HQPlayer's range is user-configurable and
+defaults to −60…0, which the mapping does not currently account for.
+
 ### TRAP: the second argument to `volume()` is `$temp`, not "force"
 
 `Client::volume($vol, $temp)` stores a *temporary* level that is not persisted,
@@ -430,12 +503,123 @@ each pause, and races to land out of order (which can strand it at zero).
 So only a persisted change is forwarded. Mute goes through the persisted path,
 so it still reaches HQPlayer.
 
-`fade_volume` is then overridden to fire its callback immediately instead of
-ramping. The ramp is inaudible here anyway now that its steps are dropped, and
-`_Pause` fires the actual pause **from that callback** — so the ramp was pure
-latency, delaying every pause by 300ms. The override must also clear the
-temporary volume, because `_Resume` parks a temporary 0 before its fade-in and
-the slider would otherwise read zero after every resume.
+`fade_volume` is then overridden to skip the ramp. The ramp is inaudible here
+anyway now that its steps are dropped, and `_Pause` fires the actual pause
+**from that callback** — so for a pause it was pure latency, delaying every
+pause by 300ms. The override must also clear the temporary volume, because
+`_Resume` parks a temporary 0 before its fade-in and the slider would otherwise
+read zero after every resume.
+
+**But the DURATION still matters.** `fade_volume` is not only the pause ramp:
+the sleep timer calls it with the whole fade-out time (up to a minute) and
+**stops the player from the same completion callback**. Firing that immediately
+ended playback a full fade early — the sleep timer appearing to fire at the
+wrong time. So short ramps (≤ `FADE_IMMEDIATE`, 1s) complete immediately and
+anything longer is deferred to a timer, which a subsequent `fade_volume`
+cancels. The audio genuinely does not fade: a real ramp would have to move
+HQPlayer's own level, which is *shared*, so `_onStatus` would mirror every step
+back into the slider and an interrupted fade would leave the endpoint turned
+down for good. The timing — which is what the user set — is exact.
+
+### SCOPED, not built: the volume range is configurable
+
+`HQP_VOL_MIN_DB => -100` is not a property of HQPlayer, it is a property of
+**this** instance's configuration. HQPlayer's output volume range is a user
+setting and **defaults to −60…0**; −100…0 is what the development machine
+happens to be set to, which is why a 1:1 dB-per-step mapping has looked right
+throughout. On a default instance the current mapping is wrong in two visible
+ways:
+
+* **The bottom 40% of the slider is dead.** LMS 40 already maps to −60 dB, the
+  floor; LMS 39…0 map to −61…−100, which HQPlayer clamps back to −60.
+* **The slider snaps back.** Worse than the dead zone, and easy to misread as a
+  UI bug. HQPlayer reports the *clamped* level in the next `<Status/>`, the
+  mirror in `_onStatus` sees a level that differs from `hqVolDb`, and pushes it
+  into LMS as an external change — so dragging to 20 bounces the slider to 40.
+
+**The mapping.** Proportional across a known range, with max fixed at 0 dB:
+
+```
+dB  = min * (1 - lms/100)          # lms 100 -> 0 dB,  lms 0 -> min
+lms = 100 * (1 - dB/min)
+```
+
+At `min = -100` this is arithmetically identical to `dB = lms - 100`, so this
+instance's feel and the existing assertions are unchanged — the generalisation
+is free here. `min` becomes a per-player accessor (`hqVolMinDb`), so
+`_lmsToDb` / `_dbToLms` become methods rather than plain functions, and the
+tests that call them directly move with them.
+
+**Where `min` comes from**, best first:
+
+1. **UPnP `GetVolumeDBRange`** on RenderingControl (`/control/rendering-control`),
+   at describe time and again whenever the control link comes up. The action is
+   known to exist in the binary — it is what the XML API answers `Unknown
+   command` for. One SOAP call per connect, off the hot path, so its 300-550ms
+   does not matter. **Unverified: whether HQPlayer implements it, and in which
+   units** — the UPnP AV spec says `VolumeDB` is in **1/256 dB**, so −60 dB
+   should arrive as −15360, but implementations often return whole dB. Treat
+   `abs(value) > 200` as 1/256 units and divide.
+2. **Derive it from one `GetVolume` + one `<Status/>`.** RenderingControl's
+   `GetVolume` answers 0-100 on HQPlayer's own scale; the status stream gives
+   the same moment in dB. Assuming a linear map with max 0,
+   `min = D / (1 - V/100)` for `V < 100`. Passive, no volume change, nothing new
+   to configure — a good cross-check on (1) and a fallback if it is missing.
+   Undefined as V approaches 100.
+3. **Learn the floor from the clamp.** Send a level below the floor and
+   HQPlayer reports the clamped one back: that value *is* `min`. Self-correcting
+   and the only option that survives the user reconfiguring HQPlayer without a
+   reconnect, but it only learns once the user drags to the bottom. Keep it as
+   the safety net behind (1)/(2), and discriminate it from a genuine external
+   change by requiring the push to follow our own send closely and to be higher
+   than what we asked for.
+4. **A pref.** One number on the settings page. Cheap and honest, but the page
+   is read-only today and the plugin's premise is zero configuration — so this
+   is an override for when the probes disagree, not the primary route.
+
+**The fallback stays −100 for now.** The asymmetry argues for −60: guessing
+−60 when the truth is −100 costs resolution but leaves every slider position
+working, while guessing −100 when the truth is −60 gives the dead zone and the
+snap-back. But the only instance in the field is configured −100, so flipping
+the fallback before (1) is verified would regress the one real user. Flip it
+once the probe is proven.
+
+**The echo guard has to change with the scale.** At 1:1 every dB has exactly one
+LMS step, so comparing against `hqVolDb` is safe. At −60, one LMS step is 0.6 dB
+and several steps share a dB — so the guard must compare **in dB, against the
+slider's own current position** (`_lmsToDb($self->volume) != $db`), not against
+the last value we sent. Otherwise the mirror fights the user on every drag.
+This is the same round-trip question as the declined finding in the ledger, but
+it becomes real as soon as the mapping is not 1:1.
+
+Whatever is learned should be shown on the status page alongside the transport
+id — it is the one number that explains the whole feel of the slider.
+
+**Verify before building** (needs the live instance; substitute its address):
+
+```
+curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
+  -H 'Content-Type: text/xml; charset="utf-8"' \
+  -H 'SOAPACTION: "urn:schemas-upnp-org:service:RenderingControl:3#GetVolumeDBRange"' \
+  --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetVolumeDBRange xmlns:u="urn:schemas-upnp-org:service:RenderingControl:3"><InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolumeDBRange></s:Body></s:Envelope>'
+
+curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
+  -H 'Content-Type: text/xml; charset="utf-8"' \
+  -H 'SOAPACTION: "urn:schemas-upnp-org:service:RenderingControl:3#GetVolume"' \
+  --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetVolume xmlns:u="urn:schemas-upnp-org:service:RenderingControl:3"><InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolume></s:Body></s:Envelope>'
+```
+
+and, to find out whether the clamp is observable at all — this one works on a
+−100…0 instance without reconfiguring anything, because −120 is below its floor
+too:
+
+```
+{ printf '<?xml version="1.0" encoding="UTF-8"?><Volume value="-120"/>'; sleep 1; printf '<?xml version="1.0" encoding="UTF-8"?><Status/>'; sleep 3; } | nc <hqplayer-ip> 4321
+```
+
+Read the `volume=` in the pushed `<Status/>`: **−100 means the clamp is
+observable** and route (3) works; an error reply or the level unchanged means it
+is not, and (1)/(2) carry the whole design. Set the volume back afterwards.
 
 ### TRAP: never send ReadyToStream while a track is playing
 
@@ -454,7 +638,8 @@ exactly like a playing one: `stop` and `play` work, `pause` does nothing, and no
 `playingState`/`streamingState` alongside our own, because LMS will not write
 `player.source` debug into `log.txt` even with the category set to DEBUG.
 
-`stop()` sets `_hqpExpectStop` so a *user* stop is not misread as end-of-track.
+`stop()` sets `hqExpectStop` so a *user* stop is not misread as end-of-track —
+and `play()` leaves it armed, see the track-change trap above.
 End-of-track detection is confirmed working: `state` goes 2 → 0 on its own when
 a track finishes.
 
@@ -465,15 +650,54 @@ move does not orphan the player's prefs, playlist and sync group. The `02:`
 prefix marks it locally administered, so it can never collide with real
 hardware.
 
+**TRAP: the discovery name is a PRODUCT string, not an identity.** Every
+HQPlayer Embedded instance answers `HQPlayerEmbedded`, so on the name alone two
+instances are one player: every discovery round found the id it already had
+arriving with the other one's address, took that for a DHCP move, tore the
+player down and rebuilt it — killing playback every 60 seconds. (A real DHCP
+move has the same shape, because the old address lingers in the discovery table
+for `INSTANCE_TTL`.)
+
+So `_idsFor` assigns ids across the **whole discovered list** at once: a name
+only one instance answers to keeps the plain name-derived id and its DHCP
+immunity, and a name more than one instance answers to is qualified by address
+for all of them — id *and* display name, since two identically named players
+are unusable anyway. Re-keying when a second instance appears costs that
+player's prefs once; the thrash cost them every round.
+
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs 133 assertions (XML framing, attribute parsing, escaping, **real
-captured hqplayerd payloads**, and real player-object construction), and sweeps
-called-vs-defined subs.
+tree, runs 189 assertions across four files, and sweeps called-vs-defined subs.
+
+| file | covers |
+|---|---|
+| `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads** |
+| `t_player.pl` | player construction, DIDL, artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
+| `t_upnp.pl` | the describe retry, the bounded Play loop, cancellation |
+| `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
 one, so hash-slot mistakes fail here rather than on the server.
+`Slim::Utils::Timers` is a real enough scheduler (`_pending` / `_fireAll`),
+mirroring LMS's `setTimer($obj, $when, $cb, @args)` → `$cb->($obj, @args)`, so
+timer-driven behaviour is testable offline.
+
+**TRAP: `ok($src =~ /re/, 'name')` evaluates the match in LIST context.** A
+*failed* match returns the empty list, so `@_` collapses to just the name, the
+name lands in the condition slot as a true value, and the broken assertion
+prints `ok` with a blank label and counts as a pass. Two assertions in
+`t_player.pl` had been dead that way — naming a `_flushVolume` debounce that no
+longer exists — while the suite reported 83/83. `ok()` now takes the name off
+the *end* and treats what is left as the condition, so an empty list reads as
+false. A blank assertion label is the tell.
+
+**The version is not written down twice.** `PLUGIN_VERSION` was a hand-maintained
+constant sitting at 0.2.3 while `install.xml` and `repo.xml` were at 0.2.7, so
+the startup log and the settings page both named a build that had not run for
+months. `Plugin::version` reads what LMS parsed out of `install.xml`, and
+`t_plugin.pl` asserts `install.xml` and `repo.xml` agree and that no module
+keeps a copy.
 
 The stub tree is not a simulator and proves nothing about runtime behaviour.
 And remember `perl -c` will not catch a call to a sub that does not exist —

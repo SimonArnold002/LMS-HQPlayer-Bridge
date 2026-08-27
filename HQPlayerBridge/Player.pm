@@ -39,6 +39,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqTier hqRate hqBits hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb
+    hqGen hqPlayAck hqURL hqPrevURL
 ) );
 
 my $log        = logger('plugin.hqplayerbridge');
@@ -105,6 +106,8 @@ sub new {
         hqLastStatus => 0,
         hqSeekOffset => 0,
         hqWanted     => 'stop',
+        hqGen        => 0,
+        hqPlayAck    => 0,
     );
 
     return $client;
@@ -309,6 +312,35 @@ sub _coverURL {
 # ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
+
+# Everything that loads a track is asynchronous, so a transport command has to
+# invalidate whatever the previous one left in flight.  Bumping the generation
+# makes every outstanding callback recognise itself as superseded, and
+# cancelPlay stops the UPnP Play retry loop from firing after the fact.
+sub _newGeneration {
+    my $self = shift;
+
+    my $gen = ( $self->hqGen || 0 ) + 1;
+    $self->hqGen($gen);
+
+    my $upnp = $self->hqUPnP;
+    $upnp->cancelPlay if $upnp;
+
+    return $gen;
+}
+
+# True when a callback belongs to a track that has since been superseded.
+sub _superseded {
+    my ( $self, $gen, $what ) = @_;
+
+    return 0 if ( $self->hqGen || 0 ) == $gen;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ": $what completed for a superseded track - dropping" );
+
+    return 1;
+}
+
 sub play {
     my ( $self, $params ) = @_;
 
@@ -320,8 +352,29 @@ sub play {
 
     my $url = $self->_resolveURL($song);
 
+    # A new track generation.  Loading a track is several async round trips
+    # (SetAVTransportURI, then Play with retries), and a stop or a skip during
+    # that window must not let the PREVIOUS track's completion callback land on
+    # this one - it would re-assert bufferReady and apply the old track's seek.
+    # Every callback below is stamped with the generation it started in.
+    $self->_newGeneration;
+
+    # What we have asked HQPlayer to play, and what it was playing before.  A
+    # status push carries the uri on its <metadata/> child, which is how a
+    # push describing the OLD track is recognised in _onStatus.
+    $self->hqPrevURL( $self->hqURL );
+    $self->hqURL( $url );
+
     $self->hqStarted( 0 );
-    $self->hqExpectStop( 0 );
+    $self->hqPlayAck( 0 );
+
+    # ARMED, not cleared.  Between here and HQPlayer confirming the new track,
+    # any stop it reports is the one WE sent to end the previous track - and
+    # reading that as end-of-track makes LMS advance past the track it has just
+    # started.  _onStatus clears this only when the new track is confirmed
+    # playing.
+    $self->hqExpectStop( 1 );
+
     $self->hqPosition( 0 );
     $self->hqSeekOffset( 0 );
     $self->hqWanted( 'play' );
@@ -360,8 +413,13 @@ sub _queueTrack {
 
     my $didl = $self->_didl( $song, $url, $mime );
 
+    # The generation this load belongs to - see _newGeneration.
+    my $gen = $self->hqGen || 0;
+
     $upnp->setURI( $url, $didl, sub {
         my ( $res, $err ) = @_;
+
+        return if $self->_superseded( $gen, 'SetAVTransportURI' );
 
         if ($err) {
             $log->error( $self->name . ": HQPlayer would not accept the track URI: $err" );
@@ -374,6 +432,12 @@ sub _queueTrack {
         # media after accepting the URI - see playWhenReady in UPnP.pm.
         $upnp->playWhenReady( sub {
             my ( $r2, $e2 ) = @_;
+
+            # A stop or a skip during the load window supersedes this track.
+            # Without this the old track's completion still re-asserts
+            # bufferReady, restarts polling and applies ITS seek offset to
+            # whatever is playing now.
+            return if $self->_superseded( $gen, 'Play' );
 
             if ($e2) {
                 my $c = $self->controller;
@@ -397,6 +461,12 @@ sub _queueTrack {
                 $self->_send( '<Seek position="' . int($seek) . '"/>' );
                 $self->hqSeekOffset( int($seek) );
             }
+
+            # HQPlayer has accepted Play for THIS track, so any PLAYING it
+            # reports from here on is the new track rather than a push left
+            # over from the previous one.  _onStatus will not latch a start
+            # until this is set.
+            $self->hqPlayAck( 1 );
 
             # TRAP: playerBufferReady alone is not enough.  It routes to
             # _WaitToSync -> _StartIfReady, which polls *every* player's
@@ -452,10 +522,14 @@ sub resume {
 sub stop {
     my $self = shift;
 
+    # Anything still loading belongs to a track we are no longer playing.
+    $self->_newGeneration;
+
     # Mark this as our own stop so the poll does not read it as end-of-track
     # and advance the playlist underneath us.
     $self->hqExpectStop( 1 );
     $self->hqStarted( 0 );
+    $self->hqPlayAck( 0 );
     $self->bufferReady( 0 );
     $self->hqWanted('stop');
 
@@ -504,6 +578,22 @@ sub _dbToLms { my $v = _round( $_[0] ) - HQP_VOL_MIN_DB;
 # Since those steps are temporary volumes we never forward (see volume()), the
 # ramp is silent here - all it does is delay the pause by 300ms.  Skip it and
 # call the callback straight away.
+#
+# TRAP: the DURATION still matters.  fade_volume is not only the pause ramp -
+# the sleep timer calls it with the full fade-out time (fadeInSecs, up to a
+# minute) and STOPS the player from the same completion callback.  Firing that
+# immediately ends playback a whole fade early, which reads as the sleep timer
+# firing at the wrong time.  So: run short ramps immediately, and give a long
+# fade its time back before calling the caller.
+#
+# The audio does not actually fade.  A real ramp would have to move HQPlayer's
+# own level, which is SHARED with LMS (see volume()) - the mirror in _onStatus
+# would follow every step straight back into the slider, and a fade interrupted
+# by a restart would leave the endpoint turned down for good.  Playing to the
+# end of the fade at the set level and then stopping is the honest behaviour
+# here; the timing, which is what the user set, is exact.
+use constant FADE_IMMEDIATE => 1;   # seconds; at or under this, do not wait
+
 sub fade_volume {
     my ( $self, $fade, $cb, $cbargs ) = @_;
 
@@ -511,6 +601,28 @@ sub fade_volume {
     # Client::volume reports a temporary level in preference to the real one -
     # so leaving it set would show the slider at zero after every resume.
     $self->_tempVolume(undef);
+
+    # A fade already running is superseded by this one - a cancelled sleep
+    # timer must not still stop the player when its fade would have ended.
+    Slim::Utils::Timers::killTimers( $self, \&_fadeDone );
+
+    return unless $cb;
+
+    my $secs = abs( $fade || 0 );
+
+    return $cb->( @{ $cbargs || [] } ) if $secs <= FADE_IMMEDIATE;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . sprintf( ': %.0fs fade - deferring its completion', $secs ) );
+
+    Slim::Utils::Timers::setTimer(
+        $self, Time::HiRes::time() + $secs, \&_fadeDone, $cb, $cbargs );
+
+    return;
+}
+
+sub _fadeDone {
+    my ( $self, $cb, $cbargs ) = @_;
 
     $cb->( @{ $cbargs || [] } ) if $cb;
 
@@ -608,6 +720,38 @@ sub _ctlState {
         defined $s ? ( $STREAM_STATE[$s]  || $s ) : '?' );
 }
 
+# Does this status push describe the track we have MOVED ON FROM?
+#
+# HQPlayer pushes status ~1/s, so a track change (stop, then set the next URI
+# and play) always straddles one or two of them, and a push describing the old
+# track can arrive after we have set up the new one.  Read as current, a stale
+# PLAYING latches the start of a track HQPlayer has not begun, and the stop
+# that follows it then reads as end-of-track - LMS advances, and the track it
+# has just started is skipped.
+#
+# The test is deliberately one-sided: a push counts as stale only when its uri
+# is EXACTLY the one we were playing before and is not the current one.
+# Anything unrecognised - a uri HQPlayer has normalised, a missing metadata
+# child, or tier 2, where every track comes off the same /stream.mp3 URL - is
+# treated as current, so this can only ever suppress a push we can positively
+# identify as belonging to the previous track.  It can never wedge playback.
+sub _isStale {
+    my ( $self, $uri ) = @_;
+
+    return 0 unless defined $uri && $uri ne '';
+
+    my $prev = $self->hqPrevURL;
+    return 0 unless defined $prev && $prev ne '' && $uri eq $prev;
+
+    my $cur = $self->hqURL;
+    return 0 if defined $cur && $uri eq $cur;
+
+    main::DEBUGLOG && $log->is_debug && $log->debug(
+        $self->name . ': ignoring a status push for the previous track' );
+
+    return 1;
+}
+
 sub _onStatus {
     my ( $self, $attrs, $raw ) = @_;
 
@@ -629,13 +773,20 @@ sub _onStatus {
     }
 
     # The real stream format lives on a <metadata/> child of <Status/>, not on
-    # the root element.
+    # the root element.  The same child carries the uri HQPlayer is playing,
+    # which is the only per-track identity in the status stream.
+    my $stale = 0;
+
     if ( $raw && $raw =~ /<metadata\b/ ) {
         my ($m) = Plugins::HQPlayerBridge::Control::parseChildren( $raw, 'metadata' );
 
         if ($m) {
-            $self->hqRate( $m->{samplerate} );
-            $self->hqBits( $m->{bits} );
+            $stale = $self->_isStale( $m->{uri} );
+
+            if ( !$stale ) {
+                $self->hqRate( $m->{samplerate} );
+                $self->hqBits( $m->{bits} );
+            }
         }
     }
 
@@ -665,6 +816,11 @@ sub _onStatus {
         }
     }
 
+    # Volume is a property of the instance, not of the track, so it is followed
+    # even from a stale push.  Position and transport state are not: they
+    # describe a track we have already moved on from.
+    return if $stale;
+
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );
         # Store the stream-relative value, so anything reading the plain
@@ -675,7 +831,14 @@ sub _onStatus {
 
     if ( $state == HQP_PLAYING ) {
 
-        $self->hqExpectStop( 0 );
+        # Only once HQPlayer has accepted Play for the CURRENT track is a
+        # PLAYING push evidence that THIS track is running.  Before that it is
+        # the previous one still winding down, and treating it as a start both
+        # disarms the end-of-track guard and reports a track as started that
+        # HQPlayer has not begun.
+        my $ack = $self->hqPlayAck;
+
+        $self->hqExpectStop( 0 ) if $ack;
 
         # Resumed at HQPlayer itself, or on the endpoint's own remote.
         if ( ( $self->hqWanted || '' ) eq 'pause' ) {
@@ -691,7 +854,7 @@ sub _onStatus {
             $controller->resume if $controller->isPaused;
         }
 
-        if ( !$self->hqStarted ) {
+        if ( $ack && !$self->hqStarted ) {
             $self->hqStarted( 1 );
 
             main::INFOLOG && $log->is_info && $log->info(

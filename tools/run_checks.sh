@@ -20,6 +20,8 @@ echo
 echo "== unit tests =="
 perl -I. t_control.pl
 perl -I. t_player.pl
+perl -I. t_upnp.pl
+perl -I. t_plugin.pl
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="

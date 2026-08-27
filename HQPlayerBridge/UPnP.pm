@@ -45,12 +45,15 @@ sub new {
     my ( $class, %args ) = @_;
 
     my $self = bless {
-        ip    => $args{ip},
-        port  => $args{port} || UPNP_PORT,
-        name  => $args{name} || $args{ip},
-        av    => undef,      # AVTransport control path
-        rc    => undef,      # RenderingControl control path
-        ready => 0,
+        ip      => $args{ip},
+        port    => $args{port} || UPNP_PORT,
+        name    => $args{name} || $args{ip},
+        av      => undef,    # AVTransport control path
+        rc      => undef,    # RenderingControl control path
+        ready   => 0,
+        backoff => 0,        # current describe retry interval
+        epoch   => 0,        # bumped to abandon an in-flight Play retry loop
+        closed  => 0,
     }, $class;
 
     return $self;
@@ -59,12 +62,40 @@ sub new {
 sub ready { $_[0]->{ready} }
 sub base  { 'http://' . $_[0]->{ip} . ':' . $_[0]->{port} }
 
+# The player is going away: drop every timer this object owns, and make sure
+# nothing already scheduled comes back to life.
+sub close {
+    my $self = shift;
+
+    $self->{closed} = 1;
+    $self->{epoch}++;
+
+    Slim::Utils::Timers::killTimers( $self, \&_describeRetry );
+
+    return;
+}
+
 # ---------------------------------------------------------------------------
 # Read the device description to learn the control paths.  They are stable in
 # practice, but reading them keeps us correct if HQPlayer ever moves them.
+#
+# This MUST keep retrying on its own.  Without a description there is no
+# control path, and _queueTrack fails every track with PROBLEM_OPENING - the
+# player exists but can never play anything.  The description is fetched when
+# the player is created and again whenever the control link comes up, and
+# neither of those recurs: LMS and hqplayerd starting together (a server
+# reboot) is exactly the case where the first fetch fails and the control link
+# then stays up, so no further attempt would ever be made.
 # ---------------------------------------------------------------------------
+use constant DESCRIBE_RETRY_MIN => 5;
+use constant DESCRIBE_RETRY_MAX => 60;
+
 sub describe {
     my ( $self, $cb ) = @_;
+
+    return if $self->{closed};
+
+    Slim::Utils::Timers::killTimers( $self, \&_describeRetry );
 
     my $url = $self->base . '/root.xml';
 
@@ -83,13 +114,17 @@ sub describe {
             }
 
             if ( $self->{av} ) {
-                $self->{ready} = 1;
+                $self->{ready}   = 1;
+                $self->{backoff} = 0;
                 main::INFOLOG && $log->is_info && $log->info(
                     "$self->{name}: UPnP renderer ready (av=$self->{av}"
                     . ( $self->{rc} ? ", rc=$self->{rc}" : '' ) . ')' );
             }
             else {
+                # A reply that is not a MediaRenderer description is no more
+                # usable than no reply at all - keep trying.
                 $log->warn("$self->{name}: no AVTransport service in $url");
+                $self->_scheduleDescribe;
             }
 
             $cb->( $self->{ready} ) if $cb;
@@ -97,6 +132,7 @@ sub describe {
         sub {
             my ( $http, $err ) = @_;
             $log->warn("$self->{name}: cannot read $url: $err");
+            $self->_scheduleDescribe;
             $cb->(0) if $cb;
         },
         { timeout => 10 },
@@ -105,11 +141,41 @@ sub describe {
     return;
 }
 
+sub _scheduleDescribe {
+    my $self = shift;
+
+    return if $self->{closed} || $self->{ready};
+
+    my $wait = $self->{backoff} ? $self->{backoff} * 2 : DESCRIBE_RETRY_MIN;
+    $wait = DESCRIBE_RETRY_MAX if $wait > DESCRIBE_RETRY_MAX;
+    $self->{backoff} = $wait;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        "$self->{name}: renderer not described yet, retrying in ${wait}s" );
+
+    Slim::Utils::Timers::killTimers( $self, \&_describeRetry );
+    Slim::Utils::Timers::setTimer( $self, Time::HiRes::time() + $wait, \&_describeRetry );
+
+    return;
+}
+
+# setTimer($obj, $when, $cb, @args) calls $cb->($obj, @args), so the object
+# arrives as the first argument here.
+sub _describeRetry {
+    my $self = shift;
+
+    $self->describe;
+
+    return;
+}
+
 # ---------------------------------------------------------------------------
 # SOAP
 # ---------------------------------------------------------------------------
+use constant SOAP_TIMEOUT => 15;
+
 sub _soap {
-    my ( $self, $service, $path, $action, $body, $cb ) = @_;
+    my ( $self, $service, $path, $action, $body, $cb, $timeout ) = @_;
 
     if ( !$path ) {
         $log->warn("$self->{name}: $action requested before the renderer was described");
@@ -142,7 +208,7 @@ sub _soap {
             $log->$lvl("$self->{name}: UPnP $action failed: $err");
             $cb->( undef, $err ) if $cb;
         },
-        { timeout => 15 },
+        { timeout => $timeout || SOAP_TIMEOUT },
     )->post(
         $url,
         'Content-Type' => 'text/xml; charset="utf-8"',
@@ -175,7 +241,7 @@ sub setURI {
     return;
 }
 
-sub play  { $_[0]->_av( 'Play',  '<InstanceID>0</InstanceID><Speed>1</Speed>', $_[1] ) }
+sub play  { $_[0]->_av( 'Play',  '<InstanceID>0</InstanceID><Speed>1</Speed>', $_[1], $_[2] ) }
 
 # SetAVTransportURI returns as soon as it has accepted the URI, but HQPlayer
 # then has to FETCH and probe the media before the transport actually holds
@@ -183,22 +249,57 @@ sub play  { $_[0]->_av( 'Play',  '<InstanceID>0</InstanceID><Speed>1</Speed>', $
 # ~0.5s after SetAVTransportURI it fails, ~1s later the identical call
 # succeeds.  Nothing in GetMediaInfo reflects this (NrTracks already reads 1),
 # so the only reliable approach is to retry.
-use constant PLAY_RETRIES => 8;
-use constant PLAY_BACKOFF => 0.4;
+# The retry is deliberately blind to WHICH error came back.  A UPnP fault is
+# an HTTP 500 whose errorCode is in the body, not in the status line the async
+# client hands us, so "is this the transient 702" is not reliably answerable
+# from $err - and guessing wrong here would break the ordinary case, since a
+# failed first Play is normal.
+#
+# What is bounded instead is the WAIT.  Retrying 8 times on a daemon that has
+# stopped answering meant 8 x the 15s SOAP timeout - about two minutes of a
+# player that looks like it is buffering before it admits the track failed.
+# So: a short timeout per attempt, and a hard deadline across all of them.
+# A healthy daemon answers Play in milliseconds and succeeds on attempt 2 or 3.
+use constant PLAY_RETRIES  => 8;
+use constant PLAY_BACKOFF  => 0.4;
+use constant PLAY_TIMEOUT  => 5;    # per attempt
+use constant PLAY_DEADLINE => 12;   # across all attempts
+
+# Abandon an in-flight Play retry loop - the track it belongs to is no longer
+# the one we want playing.
+sub cancelPlay {
+    my $self = shift;
+
+    $self->{epoch}++;
+
+    return;
+}
 
 sub playWhenReady {
-    my ( $self, $cb, $attempt ) = @_;
+    my ( $self, $cb, $attempt, $deadline, $epoch ) = @_;
 
-    $attempt ||= 1;
+    $attempt  ||= 1;
+    $deadline ||= Time::HiRes::time() + PLAY_DEADLINE;
+    $epoch      = $self->{epoch} unless defined $epoch;
 
     $self->play( sub {
         my ( $res, $err ) = @_;
 
+        # A stop or a skip happened while this Play was in flight.
+        if ( $epoch != $self->{epoch} ) {
+            main::DEBUGLOG && $log->is_debug && $log->debug(
+                "$self->{name}: Play answered for a cancelled track - dropping" );
+            return;
+        }
+
         return $cb->( $res, undef ) if $cb && !$err;
         return                      if !$err;
 
-        if ( $attempt >= PLAY_RETRIES ) {
-            $log->error("$self->{name}: Play still failing after $attempt attempts: $err");
+        my $out = Time::HiRes::time() + PLAY_BACKOFF >= $deadline;
+
+        if ( $attempt >= PLAY_RETRIES || $out ) {
+            $log->error( "$self->{name}: Play still failing after $attempt attempt(s)"
+                . ( $out ? ' (gave up on time)' : '' ) . ": $err" );
             $cb->( undef, $err ) if $cb;
             return;
         }
@@ -208,9 +309,20 @@ sub playWhenReady {
 
         Slim::Utils::Timers::setTimer(
             $self, Time::HiRes::time() + PLAY_BACKOFF,
-            sub { $_[0]->playWhenReady( $cb, $attempt + 1 ) },
+            \&_playRetry, $cb, $attempt + 1, $deadline, $epoch,
         );
-    } );
+    }, PLAY_TIMEOUT );
+
+    return;
+}
+
+sub _playRetry {
+    my ( $self, $cb, $attempt, $deadline, $epoch ) = @_;
+
+    # Cancelled while the backoff timer was pending.
+    return if $epoch != $self->{epoch};
+
+    $self->playWhenReady( $cb, $attempt, $deadline, $epoch );
 
     return;
 }
