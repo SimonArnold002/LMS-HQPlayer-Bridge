@@ -27,6 +27,34 @@ then plays it.
 | `HQPlayerBridge/Settings.pm` | Read-only status page |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 
+## Branches and releasing
+
+Work happens on **`dev`**. `main` is the release branch, and the two differ only
+in `repo.xml`'s `<url>`: `dev` points at the branch's raw zip on
+`raw.githubusercontent.com`, `main` at the GitHub Pages URL. Reconcile that line
+on every merge.
+
+**`CHANGELOG.md` is written at the merge to main, never on a dev build.** A dev
+build updates `CLAUDE.md`, `docs/*.md` and the memory notes only — a CHANGELOG
+whose newest entry is several versions behind `install.xml` is CORRECT on `dev`,
+not a defect.
+
+**What the merge writes.** One new CHANGELOG entry, headed with the version being
+released, listing **every change since the last commit on `main`** — not just
+those from the final dev build. A release usually spans many dev versions, and
+all of them ship at once, so the entry is compiled from the whole `main..dev`
+range:
+
+```
+git -C /Users/simona/Documents/GitHub/LMS-HQPlayer-Bridge log main..dev --oneline
+```
+
+Group the result by what a user would notice (new features, fixes, behaviour
+changes), not commit by commit — intermediate dead ends and their reverts cancel
+out and belong in the per-version notes in this file instead. `README.md` is
+refreshed in the same pass, and `README.html` / `index.html` regenerated from it
+with `python3 tools/make_readme_html.py`.
+
 ## HQPlayer control protocol — all verified live
 
 **Discovery** — UDP to `239.192.0.199:4321`, payload
