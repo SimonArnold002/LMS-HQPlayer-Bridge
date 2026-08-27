@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HQPlayer Bridge — LMS Plugin</title>
+<style>
+  :root {
+    --lb-purple: #353070;
+    --lb-purple-dark: #211d4d;
+    --lb-orange: #eb743b;
+    --ink: #1c1c28;
+    --muted: #5b5b6b;
+    --line: #e4e4ec;
+    --bg: #f7f7fa;
+    --card: #ffffff;
+    --code-bg: #f0f0f5;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--lb-orange); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header.hero {
+    background: linear-gradient(135deg, var(--lb-purple) 0%, var(--lb-purple-dark) 100%);
+    color: #fff;
+    padding: 56px 24px 48px;
+    text-align: center;
+  }
+  header.hero h1 { margin: 0 0 10px; font-size: 2.1rem; letter-spacing: -0.01em; }
+  header.hero p.tagline { margin: 0 auto; max-width: 660px; color: #d6d4ea; font-size: 1.08rem; }
+  header.hero p.tagline a { color: #ffb58c; }
+  .badges { margin-top: 22px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  .badge {
+    display: inline-block; padding: 5px 13px; border-radius: 999px;
+    font-size: 0.82rem; font-weight: 600;
+    background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.22);
+  }
+  .badge.accent { background: var(--lb-orange); border-color: var(--lb-orange); }
+  .hero-actions { margin-top: 26px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-block; padding: 11px 22px; border-radius: 8px; font-weight: 600; font-size: 0.95rem; }
+  .btn-primary { background: var(--lb-orange); color: #fff; }
+  .btn-primary:hover { text-decoration: none; filter: brightness(1.06); }
+  .btn-ghost { background: rgba(255,255,255,0.12); color: #fff; border: 1px solid rgba(255,255,255,0.30); }
+  .btn-ghost:hover { text-decoration: none; background: rgba(255,255,255,0.20); }
+
+  main { max-width: 880px; margin: 0 auto; padding: 8px 24px 64px; }
+  section { margin-top: 44px; }
+  h2 {
+    font-size: 1.45rem; margin: 0 0 6px; padding-bottom: 8px;
+    border-bottom: 3px solid var(--lb-orange); display: inline-block;
+  }
+  h3 { font-size: 1.12rem; margin: 26px 0 6px; color: var(--lb-purple); }
+  p { margin: 10px 0; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 5px 0; }
+  li > ul { margin-top: 5px; }
+
+  table {
+    width: 100%; border-collapse: collapse; margin: 14px 0;
+    background: var(--card); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06); font-size: 0.95rem;
+  }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--lb-purple); color: #fff; font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: #fafafc; }
+  td strong { color: var(--lb-purple); }
+
+  code {
+    background: var(--code-bg); padding: 2px 6px; border-radius: 5px;
+    font-family: "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em;
+  }
+  pre {
+    background: var(--lb-purple-dark); color: #f3f1ff; padding: 16px 18px;
+    border-radius: 10px; overflow-x: auto; font-size: 0.9rem;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+
+  blockquote {
+    margin: 14px 0; padding: 12px 18px; background: #fff7f1;
+    border-left: 4px solid var(--lb-orange); border-radius: 0 8px 8px 0; color: var(--muted);
+  }
+  blockquote p { margin: 0; }
+
+  .feature-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; margin-top: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .card h4 { margin: 0 0 6px; font-size: 1rem; color: var(--lb-purple); }
+  .card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+  .card .needs { display: block; margin-top: 8px; font-size: 0.78rem; font-weight: 600; color: var(--lb-orange); }
+
+  footer {
+    text-align: center; color: var(--muted); font-size: 0.88rem;
+    padding: 32px 24px 48px; border-top: 1px solid var(--line); margin-top: 48px;
+  }
+  @media (max-width: 600px) {
+    header.hero h1 { font-size: 1.6rem; }
+    main { padding: 8px 16px 48px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>HQPlayer Bridge — LMS Plugin</h1>
+  <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
+  <div class="badges">
+    <span class="badge accent">v0.2.7</span>
+    <span class="badge">LMS 8.0.0+</span>
+    <span class="badge">HQPlayer Embedded 6</span>
+    <span class="badge">No audio through the plugin</span>
+  </div>
+  <div class="hero-actions">
+    <a class="btn btn-primary" href="HQPlayerBridge.zip">Download latest</a>
+    <a class="btn btn-ghost" href="#installation">Installation</a>
+  </div>
+</header>
+
+<main>
+<section id="features-at-a-glance">
+<h2>Features at a glance</h2>
+<div class="feature-cards">
+<div class="card"><h4>Appears as a real player</h4><p>Each HQPlayer instance shows up in LMS's player list, ready to select</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Found automatically</h4><p>Instances are discovered on the network; nothing to type in</p><span class="needs">Needs: HQPlayer reachable from the server</span></div>
+<div class="card"><h4>No audio through the plugin</h4><p>HQPlayer fetches the music from LMS itself — the bridge only moves control messages</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Your library, bit-perfect</h4><p>FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg are handed over as the original file</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Everything else too</h4><p>Streaming services, radio and formats HQPlayer can't read are transcoded by LMS on the fly</p><span class="needs">Needs: The matching service plugin</span></div>
+<div class="card"><h4>Artwork on the endpoint</h4><p>Cover art reaches HQPlayer and its display, for library <em>and</em> streaming tracks</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Volume, both ways</h4><p>The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Pause from either end</h4><p>Pausing at HQPlayer, or on the endpoint's remote, pauses LMS too</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Stable player identity</h4><p>Prefs, playlist and sync group survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Status page</h4><p>What was discovered, whether the control link is up, and what HQPlayer is doing</p><span class="needs">Needs: nothing</span></div>
+</div>
+</section>
+<section id="requirements">
+<h2>Requirements</h2>
+<ul>
+<li><strong>Lyrion Music Server 8.0.0+</strong>.
+</li>
+<li><strong>HQPlayer</strong> with its control API enabled, reachable from the LMS server. Verified against HQPlayer Embedded 6; the same control API is present in HQPlayer Desktop but hasn't been tested here.
+</li>
+<li><strong>HQPlayer must be able to reach the LMS server over HTTP</strong>, because it fetches the audio itself. Both on the same LAN is the normal case.
+</li>
+<li>For streaming, the matching service plugin installed and signed in (<strong>Qobuz</strong>, <strong>Tidal</strong>, <strong>Deezer</strong>, and so on). Library playback needs nothing extra.
+</li></ul>
+<p>Nothing has to be configured on either side beyond that — no shared filesystem, no matching library paths, no audio device setup in LMS.</p>
+</section>
+<section id="installation">
+<h2>Installation</h2>
+<p><strong>Via repository (recommended).</strong> In LMS go to <strong>Settings → Plugins → Additional Repositories</strong> and add:</p>
+<pre><code>https://simonarnold002.github.io/LMS-HQPlayer-Bridge/repo.xml</code></pre>
+<p>Then install <strong>HQPlayer Bridge</strong> from the plugin list and restart.</p>
+<p><strong>Manual.</strong> Download <code>HQPlayerBridge.zip</code> from the <a href="https://github.com/SimonArnold002/LMS-HQPlayer-Bridge">repository</a>, unzip it into your LMS <code>Plugins/</code> directory so it sits as <code>Plugins/HQPlayerBridge/</code>, and restart:</p>
+<pre><code>sudo rm -rf /var/lib/squeezeboxserver/Plugins/HQPlayerBridge
+sudo unzip HQPlayerBridge.zip -d /var/lib/squeezeboxserver/Plugins/
+sudo chown -R squeezeboxserver:nogroup /var/lib/squeezeboxserver/Plugins/HQPlayerBridge
+sudo systemctl restart lyrionmusicserver</code></pre>
+</section>
+<section id="quick-start">
+<h2>Quick start</h2>
+<ol>
+<li>Start HQPlayer and make sure its output is going somewhere that works — the same setup you'd use to play from HQPlayer's own interface.
+</li>
+<li>Install the plugin and restart LMS.
+</li>
+<li>Open the player menu in Material (or any control point). The HQPlayer instance is listed by name. Select it.
+</li>
+<li>Play an album. HQPlayer fetches it from LMS and renders it through your usual pipeline.
+</li></ol>
+</section>
+<section id="using-it">
+<h2>Using it</h2>
+<h3>What actually moves where</h3>
+<p>LMS and HQPlayer are both <em>pull</em> engines: each is used to being handed a URL and fetching the bytes itself. So the bridge hands HQPlayer a URL pointing back at LMS's own HTTP server and then stays out of the audio path entirely. What crosses the bridge is control messages — play, pause, seek, volume, and a status stream coming back the other way.</p>
+<p>That's the whole reason there's no buffer to tune, no transcoder to configure and no helper process to keep alive.</p>
+<p>Two connections are used, because each does something the other can't:</p>
+<ul>
+<li><strong>HQPlayer's XML control API</strong> carries transport and state. It pushes a status message about once a second, which is what drives the progress bar, the play/pause state and the volume slider.
+</li>
+<li><strong>HQPlayer's UPnP renderer</strong> carries the track — its URL, title, artist, album and <strong>cover art</strong>. Over the control API, HQPlayer labels anything arriving over HTTP as <em>"HTTP stream"</em> and ignores track details, so artwork would never reach the endpoint's display. Over UPnP it accepts all of it, and re-serves the cover from its own web server, which is where an endpoint's screen looks for it.
+</li></ul>
+<h3>Playing your library</h3>
+<p>A library track HQPlayer can decode is handed over as <strong>the original file</strong>, byte for byte — FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg, including native DSD. Nothing is re-encoded, and nothing about your files needs to match between the two machines: everything is addressed by URL, never by filesystem path.</p>
+<p>HQPlayer has no decoder for <strong>ALAC, AAC or anything else in an MP4/M4A container</strong>, so those don't go over as files — LMS transcodes them instead, the same way it would for any other player. You don't have to do anything; the plugin checks the format and picks the route.</p>
+<h3>Streaming services and radio</h3>
+<p>Qobuz, Tidal, Deezer, internet radio and everything else remote is streamed through LMS, which transcodes as needed (FLAC first, so usually there's no transcoding at all). The service plugin handles its own authentication as usual — the HQPlayer player looks like any other player to it.</p>
+<p>Artwork works here too: the cover comes from the service via LMS's image proxy and is passed on to HQPlayer.</p>
+<h3>Volume</h3>
+<p>HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.</p>
+<p><strong>One LMS step is one dB</strong>, with LMS 100 being 0 dB. That's the same mapping HQPlayer's UPnP endpoint applied to the 0–100 it received, so if you're coming from the UPnP bridge the slider behaves as it did before.</p>
+<h3>Pause from either end</h3>
+<p>Pause and play work from LMS, and also <em>at</em> HQPlayer — if you pause on the endpoint's remote or in HQPlayer's own interface, LMS follows within a second rather than carrying on counting time against silent audio. Stop, seek and end-of-track are likewise reported back, so the LMS progress bar tracks what's really happening.</p>
+<h3>The status page</h3>
+<p><strong>Settings → Advanced → HQPlayer Bridge</strong> is a read-only status page: which instances were discovered and at what address, whether the control link is currently up, and what HQPlayer last reported — state, sample rate, bit depth and output mode.</p>
+<p>It reports HQPlayer's <strong>transport id</strong> rather than your endpoint's name. HQPlayer doesn't expose the NAA name over any control command — it only appears in HQPlayer's own log — so the page says so plainly instead of guessing.</p>
+</section>
+<section id="notes-limitations">
+<h2>Notes &amp; limitations</h2>
+<ul>
+<li><strong>The player shows as present even when HQPlayer isn't reachable.</strong> An HQPlayer instance that's discovered but currently off is a normal state, and tying the LMS player's presence to the control link would have LMS churning prefs and sync groups every time it went away.
+</li>
+<li><strong>A silent output-format mismatch is HQPlayer's to report, not the plugin's.</strong> If HQPlayer's output format is set to something your endpoint can't accept, it reports itself as playing and answers every command normally while rendering nothing at all. There's no way to detect that from the control API — the evidence is only in HQPlayer's own log (<code>NAA output requested format not available!</code>). If a track looks like it's playing but you hear nothing, check the output format there first.
+</li>
+<li><strong>Not gapless.</strong> The next track is handed over when the current one ends, so there's a brief gap between tracks. Pre-queuing isn't implemented.
+</li>
+<li><strong>HQPlayer's DSP settings aren't exposed.</strong> Filter, shaper, modulator, output mode and rate are set in HQPlayer, as before — the plugin doesn't change them and can't select them.
+</li>
+<li><strong>HQPlayer's own library isn't browsed.</strong> Music comes from LMS; this plugin makes HQPlayer a destination, not a source.
+</li>
+<li><strong>Multi-room sync with hardware players is untested.</strong> The player registers as a normal LMS player, so nothing blocks it, but it hasn't been verified and a bridged player can't be sample-accurate with a Squeezebox.
+</li>
+<li><strong>No HTTP authentication.</strong> If your LMS server is password-protected, HQPlayer can't fetch the audio URLs it's given.
+</li>
+<li><strong>The settings page is read-only</strong> — there's nothing to configure yet.
+</li></ul>
+</section>
+</main>
+
+<footer>
+  <p>HQPlayer Bridge — LMS Plugin — a plugin for Lyrion Music Server ·
+  <a href="https://github.com/SimonArnold002/LMS-HQPlayer-Bridge">View on GitHub</a></p>
+</footer>
+
+</body>
+</html>
