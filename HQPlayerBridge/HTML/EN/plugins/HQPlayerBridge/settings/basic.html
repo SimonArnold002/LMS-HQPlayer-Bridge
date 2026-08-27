@@ -1,0 +1,76 @@
+[% PROCESS settings/header.html %]
+
+<div class="prefBlock">
+
+    <div class="prefDesc">
+        <h2>[% "PLUGIN_HQPLAYER_BRIDGE" | string %]</h2>
+        <p>[% "PLUGIN_HQPLAYER_BRIDGE_DESC" | string %]</p>
+    </div>
+
+    [% IF hqp_bridges.size %]
+
+        [% FOREACH b IN hqp_bridges %]
+        <table class="prefTable" border="0" cellspacing="0" cellpadding="0">
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_INSTANCE" | string %]</td>
+                <td class="prefBody">
+                    <span style="font-weight:bold">[% b.name | html %]</span>
+                    [% IF b.version %]<br /><span class="prefDesc">[% b.version | html %]</span>[% END %]
+                </td>
+            </tr>
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_STATUS" | string %]</td>
+                <td class="prefBody">
+                    [% IF b.connected %]
+                        <span style="font-weight:bold; color:#2e7d32">[% "PLUGIN_HQPLAYER_CONNECTED" | string %]</span>
+                    [% ELSE %]
+                        <span style="font-weight:bold; color:#c62828">[% "PLUGIN_HQPLAYER_DISCONNECTED" | string %]</span>
+                    [% END %]
+                    <span class="prefDesc">&nbsp;[% b.ip | html %]:4321</span>
+                </td>
+            </tr>
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_OUTPUT" | string %]</td>
+                <td class="prefBody">
+                    [% IF b.transport %][% "PLUGIN_HQPLAYER_TRANSPORT_ID" | string %] [% b.transport | html %][% ELSE %]&mdash;[% END %]
+                    <span class="prefDesc">[% "PLUGIN_HQPLAYER_OUTPUT_DESC" | string %]</span>
+                </td>
+            </tr>
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_STREAM" | string %]</td>
+                <td class="prefBody">
+                    [% IF b.rate %][% b.rate | html %] Hz[% IF b.bits %] / [% b.bits | html %] bit[% END %][% ELSE %]&mdash;[% END %]
+                    [% IF b.tier %]
+                        <span class="prefDesc">
+                        [% IF b.tier == 1 %][% "PLUGIN_HQPLAYER_TIER1" | string %]
+                        [% ELSE %][% "PLUGIN_HQPLAYER_TIER2" | string %][% END %]
+                        </span>
+                    [% END %]
+                </td>
+            </tr>
+
+        </table>
+        [% END %]
+
+    [% ELSE %]
+
+        <table class="prefTable" border="0" cellspacing="0" cellpadding="0">
+            <tr>
+                <td class="prefBody">
+                    <span style="font-weight:bold">[% "PLUGIN_HQPLAYER_NONE" | string %]</span>
+                    <br /><span class="prefDesc">[% "PLUGIN_HQPLAYER_NONE_DESC" | string %]</span>
+                </td>
+            </tr>
+        </table>
+
+    [% END %]
+
+    <p class="prefDesc">[% "PLUGIN_HQPLAYER_BRIDGE" | string %] v[% hqp_version | html %]</p>
+
+</div>
+
+[% PROCESS settings/footer.html %]

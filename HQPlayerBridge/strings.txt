@@ -1,0 +1,41 @@
+PLUGIN_HQPLAYER_BRIDGE
+	EN	HQPlayer Bridge
+
+PLUGIN_HQPLAYER_BRIDGE_DESC
+	EN	Presents each HQPlayer instance on your network as an ordinary Lyrion player, driven directly over HQPlayer's own control API. No UPnP bridge and no external helper binary: no audio passes through this plugin at all, because HQPlayer fetches the stream straight from Lyrion. There is nothing to configure - instances are discovered automatically.
+
+PLUGIN_HQPLAYER_INSTANCE
+	EN	Instance
+
+PLUGIN_HQPLAYER_STATUS
+	EN	Control link
+
+PLUGIN_HQPLAYER_CONNECTED
+	EN	Connected
+
+PLUGIN_HQPLAYER_DISCONNECTED
+	EN	Not connected
+
+PLUGIN_HQPLAYER_OUTPUT
+	EN	Output transport
+
+PLUGIN_HQPLAYER_OUTPUT_DESC
+	EN	The transport HQPlayer has selected, as its own numeric id. HQPlayer's control API does not report the output device or NAA by name, so the name of the endpoint it is feeding can only be seen in HQPlayer itself.
+
+PLUGIN_HQPLAYER_STREAM
+	EN	Current stream
+
+PLUGIN_HQPLAYER_TIER1
+	EN	Playing the original file straight from Lyrion, untranscoded - tags and cover art come from the file itself.
+
+PLUGIN_HQPLAYER_TIER2
+	EN	Playing through the Lyrion player stream, used for streaming services and radio.
+
+PLUGIN_HQPLAYER_NONE
+	EN	No HQPlayer instances found
+
+PLUGIN_HQPLAYER_NONE_DESC
+	EN	Nothing answered the discovery probe on 239.192.0.199:4321. Check that HQPlayer is running, that it is on the same network segment as this server, and that its control API is enabled.
+
+PLUGIN_HQPLAYER_TRANSPORT_ID
+	EN	id
