@@ -30,9 +30,29 @@ then plays it.
 ## Branches and releasing
 
 Work happens on **`dev`**. `main` is the release branch, and the two differ only
-in `repo.xml`'s `<url>`: `dev` points at the branch's raw zip on
-`raw.githubusercontent.com`, `main` at the GitHub Pages URL. Reconcile that line
-on every merge.
+in `repo.xml`'s `<url>` — **different hosts, not a different branch segment**:
+
+| branch | `repo.xml` `<url>` |
+|---|---|
+| `dev` | `https://raw.githubusercontent.com/SimonArnold002/LMS-HQPlayer-Bridge/dev/HQPlayerBridge.zip` |
+| `main` | `https://simonarnold002.github.io/LMS-HQPlayer-Bridge/HQPlayerBridge.zip` |
+
+`<sha>` is the same on both — the zip is identical, only where users fetch it
+from differs. **Reconcile that one line on every merge**, and never let the dev
+URL land on main: it points the production plugin repository at the dev zip, so
+every user's next update installs a dev build. That has happened before on
+LMS-ListenBrainz-New-Releases (2026-06-18), from exactly this cause — a
+fast-forward merge silently carrying dev's `<url>` across. The first
+`dev` → `main` merge here is the most exposed, because `main` doesn't exist yet
+and will fast-forward by definition.
+
+The **`plugin-ship` agent** does this reconciliation as part of a release; invoke
+it by name once `plugin-build` has produced the zip. It verifies the URL on both
+branches before pushing. Check the line by hand anyway — it is one grep:
+
+```
+git -C /Users/simona/Documents/GitHub/LMS-HQPlayer-Bridge show main:repo.xml | grep '<url>'
+```
 
 **`CHANGELOG.md` is written at the merge to main, never on a dev build.** A dev
 build updates `CLAUDE.md`, `docs/*.md` and the memory notes only — a CHANGELOG
