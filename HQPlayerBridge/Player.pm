@@ -41,7 +41,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
     hqVolSent hqVolSentAt hqVolMissed
     hqGen hqPlayAck hqURL hqPrevURL
-    hqNext hqArmNext hqTrackNo hqStaleRun
+    hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt
 ) );
 
 my $log        = logger('plugin.hqplayerbridge');
@@ -51,6 +51,20 @@ my $serverPrefs = preferences('server');
 # streams status at roughly 1/s on its own.  So we never poll - we only keep a
 # slow watchdog to re-subscribe if the stream ever dries up.
 use constant STATUS_WATCHDOG => 10;
+
+# How long a stop is held before it is reported as the end of the playlist, and
+# ONLY while a hand-over is queued.  A gapless track boundary shows up as a
+# transient state 0 that is byte-identical to a real one - see the end-of-track
+# branch in _onStatus.  Observed at ~2s on engine 6.0.4; 3 gives it room.
+use constant END_GRACE => 3;
+
+# How long after a track is confirmed playing a state 0 is treated as start-up
+# noise rather than the end.  A tier 2 stream goes through LMS's transcoder, so
+# HQPlayer reports PLAYING and then briefly STOPPED while the first bytes are
+# still coming: measured at 0.33s live, which read as end-of-playlist and
+# skipped the track outright.  A track cannot meaningfully end this fast, and
+# one that did would simply be reported a push or two later.
+use constant START_GRACE => 2;
 
 # HQPlayer reports state as an INTEGER, not a word - verified live 2026-08-26
 # by driving a real track through Play/Pause/Stop and watching <Status/>.
@@ -108,6 +122,7 @@ sub new {
         hqArmNext    => 0,
         hqTrackNo    => undef,
         hqStaleRun   => 0,
+        hqStartedAt  => 0,
     );
 
     return $client;
@@ -239,35 +254,79 @@ sub _resolveURL {
         my $id = eval { $track->id };
         my $ct = eval { $track->content_type } || '';
 
-        if ( $id && !$HQP_PLAYS{$ct} ) {
-            main::INFOLOG && $log->is_info && $log->info(
-                $self->name . ": '$ct' is not in HQPlayer's mime table - using tier 2 so LMS transcodes" );
-        }
+        if ($id) {
+            if ( $HQP_PLAYS{$ct} ) {
+                my $ext = $EXT_FOR_TYPE{$ct} || $ct;
 
-        if ( $id && $HQP_PLAYS{$ct} ) {
-            my $ext = $EXT_FOR_TYPE{$ct} || $ct;
+                # Tier 1 - original file bytes straight from LMS, tags and
+                # embedded artwork intact, range-seekable, native DSD included.
+                # The extension resolves back to the track's own type, so LMS
+                # compares equal and streams it through without transcoding.
+                $self->hqTier( 1 );
 
-            # Tier 1 - original file bytes straight from LMS, tags and embedded
-            # artwork intact, range-seekable, native DSD included.  The
-            # extension resolves back to the track's own type, so LMS compares
-            # equal and streams it through without transcoding.
-            $self->hqTier( 1 );
+                my $url = $base . '/music/' . $id . '/download' . ( $ext ? ".$ext" : '' );
 
-            my $url = $base . '/music/' . $id . '/download' . ( $ext ? ".$ext" : '' );
+                main::INFOLOG && $log->is_info && $log->info(
+                    $self->name . ": tier 1 (native passthrough) $url" );
 
-            main::INFOLOG && $log->is_info && $log->info( $self->name . ": tier 1 (native passthrough) $url" );
+                return $url;
+            }
+
+            # TIER 3 - a local file in a format HQPlayer cannot decode, asked
+            # for AS FLAC so LMS transcodes it on the way out.  This used to go
+            # to tier 2, and tier 2 DOES NOT WORK AT ALL (see below).
+            #
+            # `download` transcodes whenever the requested extension differs
+            # from the track's own, and the URL stays PATH-ONLY, which is the
+            # part that matters.  Verified live 2026-08-28: an m4a asked for as
+            # .flac answers `Content-Type: audio/x-flac` with a body opening
+            # `fLaC`, and HQPlayer renders it (process_speed 3.3, input_fill
+            # 0.73).
+            #
+            # NOT SEEKABLE.  A transcode has no known length, so LMS answers
+            # `Accept-Ranges: none` and a plain 200 where a native download
+            # gives 206 - so no <Seek> is sent for this tier (see _queueTrack).
+            # It IS gapless-able: every track has its own url.
+            $self->hqTier( 3 );
+
+            my $url = $base . '/music/' . $id . '/download.flac';
+
+            main::INFOLOG && $log->is_info && $log->info( $self->name
+                . ": tier 3 ('$ct' is not in HQPlayer's mime table - LMS transcodes to FLAC) $url" );
 
             return $url;
         }
     }
 
-    # Tier 2 - anything remote (Qobuz, Tidal, radio) comes back through LMS's
-    # own player stream, transcoded per formats() above.
+    # TIER 2 - anything genuinely remote (Qobuz, Tidal, Deezer, radio), which
+    # has no local file to serve.
+    #
+    # THIS TIER IS KNOWN BROKEN, AND THE REASON IS NOT WHAT IT LOOKS LIKE.
+    # HQPlayer CANNOT FETCH A URL CONTAINING A QUERY STRING.  Isolated live
+    # 2026-08-28 against engine 6.0.4:
+    #
+    #   /music/458773/download.flac                -> plays (state 2, proc 3.27)
+    #   /music/458773/download.flac?x=1            -> silent, state 0
+    #   /stream.mp3?player=02:ab:88:42:4c:69       -> silent, state 0
+    #
+    # `PlaylistAdd` answers result="OK" either way and then simply never
+    # fetches it, which is why this looked like a transcoding or single-
+    # consumer problem for so long.  It is the `?`.
+    #
+    # A redirect does not rescue it: HQPlayer issues a HEAD first and DOES NOT
+    # FOLLOW the 302 - verified by pointing it at a local server that answered
+    # one; the HEAD arrived and no GET ever came.
+    #
+    # The fix is a path-only endpoint the plugin serves itself, proxying what
+    # LMS would have put on /stream.mp3 - not yet built.  Until then a remote
+    # track will not play, and tier 3 above at least keeps every LOCAL format
+    # working.
     $self->hqTier( 2 );
 
     my $url = $base . '/stream.mp3?player=' . $self->id;
 
-    main::INFOLOG && $log->is_info && $log->info( $self->name . ": tier 2 (LMS stream) $url" );
+    main::INFOLOG && $log->is_info && $log->info( $self->name
+        . ": tier 2 (LMS stream) $url - NOTE: HQPlayer cannot fetch a URL with a query string, so this will not play" );
 
     return $url;
 }
@@ -402,6 +461,9 @@ sub _newGeneration {
     # the index we last saw means nothing across a load - and leaving it set
     # would make the first status of the new track look like an advance.
     $self->hqTrackNo( undef );
+
+    # ...and a pending end-of-stream belongs to the run that is ending.
+    $self->_cancelEndOfStream;
 
     my $gen = ( $self->hqGen || 0 ) + 1;
     $self->hqGen($gen);
@@ -562,8 +624,10 @@ sub _handOver {
     my $tier = $self->hqTier;
     my $url  = $self->_resolveURL($song);
 
+    my $newTier = $self->hqTier || 0;
+
     return $self->_appendTrack( $url, $song )
-        if ( $self->hqTier || 0 ) == 1;
+        if $newTier == 1 || $newTier == 3;
 
     # TIER 2 CANNOT RIDE HQPLAYER'S PLAYLIST.  Every tier 2 track is the SAME
     # /stream.mp3?player= URL, that endpoint serves one consumer at a time, and
@@ -676,10 +740,12 @@ sub _armNextTrack {
 
     return unless $self->hqControl;
 
-    # Gapless is a tier 1 property - see _handOver.  Arming on tier 2 would
-    # still be safe, because the track would simply be held, but it would have
+    # Tiers 1 and 3 both hand HQPlayer a url of its own per track, so both can
+    # be pre-queued.  Only tier 2 cannot - see _handOver.  Arming on tier 2
+    # would still be safe (the track would simply be held) but it would have
     # LMS open a source stream minutes before it is played for no gain.
-    return unless ( $self->hqTier || 0 ) == 1;
+    my $tier = $self->hqTier || 0;
+    return unless $tier == 1 || $tier == 3;
 
     my $c = $self->controller or return;
 
@@ -716,7 +782,21 @@ sub flush {
     my $next = $self->hqNext;
 
     $self->hqNext( undef );
-    $self->hqArmNext( 0 );
+
+    # RE-ARM, DO NOT CLEAR.  _FlushGetNext drops the streaming song, calls
+    # this, and then immediately asks for a REPLACEMENT - so the very next
+    # play() is another hand-over, not a play-now.
+    #
+    # Clearing the flag here made that play() run the full four-command load
+    # over the top of a track that was still playing: observed live, deleting
+    # the pre-queued track six seconds into a twelve-second one cut it off and
+    # jumped forward.  Editing the queue is not supposed to touch what is
+    # playing.
+    #
+    # Safe if no replacement arrives (the end of the playlist): _canHandOver
+    # still requires a track to be playing and acknowledged, and stop() clears
+    # the flag through _newGeneration.
+    $self->hqArmNext( 1 );
 
     return 1 unless $next && $next->{mode} eq 'queue';
 
@@ -1583,9 +1663,16 @@ sub _handedOver {
     # On tier 1 every track has its own url, so a push naming a url that is not
     # the one we queued is positive evidence the hand-over has NOT happened,
     # whatever the index says.  Require the match; never merely prefer it.
+    # ...UNLESS THE TWO TRACKS SHARE A URL, in which case the uri cannot tell
+    # them apart and "HQPlayer is playing $want" is true before the advance as
+    # well as after.  That fires instantly: observed live with the same track
+    # twice in a row, two advances 0.2s apart, and LMS skipped an entry.
+    # A duplicate in the queue and repeat-one both produce it.
+    my $ambiguous = ( $want ne '' && $want eq ( $self->hqURL || '' ) );
+
     my $moved;
 
-    if ( defined $uri && $uri ne '' ) {
+    if ( !$ambiguous && defined $uri && $uri ne '' ) {
         $moved = ( $uri eq $want );
     }
     else {
@@ -1598,9 +1685,11 @@ sub _handedOver {
     }
 
     main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
-        . sprintf( ': hand-over check - track=%s seen=%s uri=%s want=%s -> %s',
+        . sprintf( ': hand-over check - track=%s seen=%s uri=%s want=%s%s -> %s',
             defined $track ? $track : '?', defined $seen ? $seen : '?',
-            defined $uri ? $uri : '(none)', $want, $moved ? 'ADVANCED' : 'not yet' ) );
+            defined $uri ? $uri : '(none)', $want,
+            $ambiguous ? ' (same url - index only)' : '',
+            $moved ? 'ADVANCED' : 'not yet' ) );
 
     return 0 unless $moved;
 
@@ -1623,6 +1712,7 @@ sub _handedOver {
     # seeked (see _canHandOver), so the new one starts at zero.
     $self->hqPosition( 0 );
     $self->hqSeekOffset( 0 );
+    $self->hqStartedAt( Time::HiRes::time() );
 
     # Started in the PLAYING row of the state table is _Playing: it retires the
     # song that finished and promotes the one that was streaming.  It is the
@@ -1709,6 +1799,9 @@ sub _onStatus {
 
     if ( $state == HQP_PLAYING ) {
 
+        # Playing again, so any stop we were holding was a track boundary.
+        $self->_cancelEndOfStream;
+
         # Only once HQPlayer has accepted Play for the CURRENT track is a
         # PLAYING push evidence that THIS track is running.  Before that it is
         # the previous one still winding down, and treating it as a start both
@@ -1734,6 +1827,7 @@ sub _onStatus {
 
         if ( $ack && !$self->hqStarted ) {
             $self->hqStarted( 1 );
+            $self->hqStartedAt( Time::HiRes::time() );
 
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ': HQPlayer is playing' . _ctlState($controller) );
@@ -1776,6 +1870,22 @@ sub _onStatus {
 
         if ( $self->hqStarted && !$self->hqExpectStop ) {
 
+            # START-UP NOISE, NOT THE END.  HQPlayer reports PLAYING as soon as
+            # it accepts the stream and can then drop back to STOPPED for a
+            # moment while the first bytes arrive - measured at 0.33s live on a
+            # tier 2 track, where LMS has to spin up a transcode.  Read as the
+            # end it skipped the track outright, 0.33s in.
+            #
+            # hqExpectStop already covers the window before the new track is
+            # confirmed; this covers the window just after it.
+            my $age = Time::HiRes::time() - ( $self->hqStartedAt || 0 );
+
+            if ( $age < START_GRACE ) {
+                main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
+                    . sprintf( ': ignoring a stop %.2fs into the track - too early to be the end', $age ) );
+                return;
+            }
+
             # A track LMS handed over early that could NOT ride HQPlayer's own
             # playlist - tier 2, see _handOver.  Load it now, the ordinary way.
             # There is nothing to report to LMS: it has been streaming this
@@ -1799,26 +1909,91 @@ sub _onStatus {
                 return;
             }
 
-            # Otherwise HQPlayer ran off the end of its playlist under its own
-            # steam, so this is end-of-stream: report it and let LMS advance.
-            # Verified live: state goes 2 -> 0 when the last track finishes.
+            # A GAPLESS BOUNDARY LOOKS EXACTLY LIKE THE END OF THE PLAYLIST.
             #
-            # With a pre-queued track this is end of PLAYLIST rather than end
-            # of track - the hand-over between tracks never reaches state 0 at
-            # all, and is picked up by _handedOver instead.
-            $self->hqStarted( 0 );
+            # Observed live 2026-08-28, 200ms after a correct hand-over into
+            # the pre-queued track:
+            #
+            #   state="2" track="2/3" uri=".../437344.flac"   <- handed over
+            #   state="0" track="0"   tracks_total="0"        <- 200ms later
+            #   state="2" track="3/4" uri=".../437344.flac"   <- 2s later
+            #
+            # That middle push is byte-identical to the one a genuine end of
+            # playlist produces - everything zeroed, no metadata child - so
+            # there is nothing in it to tell the two apart.  Read as the end,
+            # it reported EndOfStream/Stopped mid-album: LMS advanced an extra
+            # track, stopped, and every later push arrived at a controller in
+            # STOPPED/IDLE where TrackStarted is _Invalid.
+            #
+            # THE ONLY DISCRIMINATOR IS TIME, so the report is debounced - but
+            # only in the one state where the transient is possible: a
+            # hand-over we have queued and HQPlayer has acknowledged, which is
+            # exactly when it has another item to move into.  Anything else
+            # (nothing queued, or a held tier 2 track) is reported at once, as
+            # before, because there is nothing for HQPlayer to move into and
+            # the stop can only be real.
+            #
+            # A genuine stop is still reported, just END_GRACE later - which
+            # matters for a stop made at HQPlayer's own UI while a hand-over
+            # happens to be queued.
+            if ( $next && $next->{mode} eq 'queue' && $next->{acked} ) {
 
-            main::INFOLOG && $log->is_info && $log->info(
-                $self->name . ': end of track' . _ctlState($controller) );
+                main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
+                    . ': stopped with a hand-over queued - waiting '
+                    . END_GRACE . 's to see if this is a track boundary' );
 
-            # Now, and only now, is it safe to say we can take another stream.
-            $controller->playerEndOfStream($self);
-            $controller->playerReadyToStream($self);
-            $controller->playerStopped($self);
+                Slim::Utils::Timers::killTimers( $self, \&_endOfStream );
+                Slim::Utils::Timers::setTimer(
+                    $self, Time::HiRes::time() + END_GRACE, \&_endOfStream );
 
-            $self->_stopPolling;
+                return;
+            }
+
+            $self->_endOfStream;
         }
     }
+
+    return;
+}
+
+
+# Cancel a pending end-of-stream: HQPlayer is playing again, so the stop that
+# armed it was a track boundary after all.
+sub _cancelEndOfStream {
+    Slim::Utils::Timers::killTimers( $_[0], \&_endOfStream );
+    return;
+}
+
+sub _endOfStream {
+    my $self = shift;
+
+    Slim::Utils::Timers::killTimers( $self, \&_endOfStream );
+
+    my $controller = $self->controller or return;
+
+    return unless $self->hqStarted;
+
+    # HQPlayer ran off the end of its playlist under its own steam, so this is
+    # end-of-stream: report it and let LMS advance.  Verified live: state goes
+    # 2 -> 0 when the last track finishes.
+    $self->hqStarted( 0 );
+
+    # Whatever was queued belongs to the run that has just ended.  Leaving it
+    # set let a hand-over fire AFTER the end of the playlist, against a
+    # controller already in STOPPED/IDLE where TrackStarted is _Invalid -
+    # observed live at the tail of a skip test.
+    $self->hqNext( undef );
+    $self->hqArmNext( 0 );
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': end of playlist' . _ctlState($controller) );
+
+    # Now, and only now, is it safe to say we can take another stream.
+    $controller->playerEndOfStream($self);
+    $controller->playerReadyToStream($self);
+    $controller->playerStopped($self);
+
+    $self->_stopPolling;
 
     return;
 }
