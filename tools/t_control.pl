@@ -108,5 +108,63 @@ $buf = join '', map { $D."<Status state=\"2\" position=\"$_\"/>" } 1..6;
 my $count = 0; $count++ while defined $ex->(\$buf);
 is($count, '6', 'all six concatenated messages drained');
 
+
+# ---------------------------------------------------------------------------
+# THE SOCKET CARRIES OCTETS.
+#
+# LIVE FAILURE 2026-08-28.  LMS hands out track titles as CHARACTER strings,
+# so an album with a track called "Lush 3-1" - U+2012 FIGURE DASH - put a wide
+# character into the <metadata song=""/> of a PlaylistAdd, and syswrite DIED
+# with "Wide character in syswrite".
+#
+# The die threw out of the status handler that was pumping the queue, so the
+# command stayed `inflight` forever - and since exactly one command may be in
+# flight, EVERY subsequent command was queued behind it and never sent.  Skip,
+# stop and pause all silently did nothing, LMS's position froze while HQPlayer
+# played on, and 30s later the reply timeout tore the link down.
+#
+# Invisible for an ASCII-only library, which is why every test up to here
+# passed.  Same family as the LMS characters-vs-octets trap: anything reaching
+# a socket, a DB or a digest needs BYTES.
+# ---------------------------------------------------------------------------
+print "-- the write buffer is octets, not characters --\n";
+{
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Control.pm'); <> };
+    ( my $code = $src ) =~ s/^\s*#.*$//mg;
+
+    is( ($code =~ /wbuf\}\s*\.=\s*Encode::encode\(\s*'UTF-8'/ ? 'yes' : 'no'),
+        'yes', 'the write buffer is encoded to UTF-8 octets before it reaches syswrite' );
+
+    is( ($code =~ /Encode::decode\(\s*'UTF-8'/ ? 'yes' : 'no'),
+        'yes', 'and complete messages are decoded back to characters on the way in' );
+
+    is( ($code =~ /^\s*use Encode/m ? 'yes' : 'no'), 'yes', 'Encode is loaded' );
+
+    # The real thing: a wide character must survive the round trip through the
+    # escape/encode path as valid UTF-8 bytes rather than dying.
+    my $e = $C->can('escape');
+    my $title = "Lush 3\x{2012}1";                 # U+2012 FIGURE DASH, the live case
+    my $cmd   = '<PlaylistAdd uri="http://h/x.flac" queued="1"><metadata song="'
+              . $e->($title) . '"/></PlaylistAdd>';
+
+    my $bytes = eval { require Encode; Encode::encode( 'UTF-8', $cmd ) };
+    is( ($@ ? "died: $@" : 'ok'), 'ok', 'a figure-dash track title encodes without dying' );
+    is( (defined $bytes && !utf8::is_utf8($bytes) ? 'octets' : 'characters'),
+        'octets', 'and what comes out is a byte string, which is what syswrite needs' );
+    is( (defined $bytes && $bytes =~ /\xe2\x80\x92/ ? 'yes' : 'no'),
+        'yes', 'U+2012 went out as its three UTF-8 bytes' );
+
+    # ...and decodes back to the same characters, or the uri comparisons that
+    # drive the gapless hand-over would never match.
+    is( Encode::decode( 'UTF-8', $bytes ) eq $cmd ? 'yes' : 'no',
+        'yes', 'and decodes back to exactly what went in' );
+
+    # A partial write must not cut mid-character.  substr() on the buffer counts
+    # in whatever units the buffer holds, so this only works if it holds bytes.
+    my $half = substr( $bytes, 0, 10 );
+    is( (length($half) == 10 ? 'yes' : 'no'), 'yes',
+        'a partial write cuts by BYTE, so the remainder resumes on a byte boundary' );
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

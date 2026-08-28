@@ -37,6 +37,10 @@ use IO::Socket::INET;
 use Socket qw(SOL_SOCKET SO_ERROR inet_aton pack_sockaddr_in);
 use Errno  qw(EINPROGRESS EWOULDBLOCK EAGAIN EINTR);
 
+# The socket carries OCTETS.  See _pump and _dispatch - a wide character
+# reaching syswrite is fatal, and it takes the whole command queue with it.
+use Encode ();
+
 use Time::HiRes ();
 
 use Slim::Networking::Select;
@@ -64,9 +68,55 @@ use constant BACKOFF_MAX     => 60;
 # current level comes back on every <Status/> as volume="-53".  Probed against
 # the live daemon 2026-08-27: SetVolume, SetVolumeDB and GetVolume are all
 # "Unknown command" - an earlier guess from the binary's strings was wrong.
+#
+# THE COMMAND SET IS NO LONGER GUESSWORK.  Signalyst ship the source of their
+# own `hqp-control` client (hqp-control-601-src.zip in the repo root), and
+# ControlInterface.cpp writes every command this API has.  The full list, from
+# its writeStartElement/writeEmptyElement calls:
+#
+#   Backward Forward Next Previous Play Pause Stop Seek SelectTrack
+#   Status State GetInfo GetLicense Reset LoadRemovable
+#   PlayNextURI
+#   PlaylistAdd PlaylistClear PlaylistDelete PlaylistGet PlaylistGetAll
+#   PlaylistGetList PlaylistGetSingle PlaylistLoad PlaylistMoveDown
+#   PlaylistMoveUp PlaylistRemove PlaylistSave PlaylistUpload
+#   Volume VolumeRange VolumeUp VolumeDown VolumeMute SetAdaptiveVolume
+#   SetConvolution SetDisplay GetDisplay SetFilter GetFilters SetInvert
+#   SetJunkFilter GetJunkFilters SetMode GetModes SetRandom SetRate GetRates
+#   SetRepeat SetShaping GetShapers SetTransport SetTransportPath
+#   SetTransportRate GetTransport GetInputs
+#   ConfigurationGet ConfigurationList ConfigurationLoad
+#   LibraryFavoriteGet LibraryFavoriteSet LibraryFavoriteSetCurrent
+#   LibraryGet LibraryGetHash LibraryLoad LibraryPicture
+#   MatrixGetProfile MatrixListProfiles MatrixSetProfile
+#   SessionAuthentication
+#
+# TRAP WHEN EXTRACTING THAT LIST: one command - and it is the one that matters
+# most here - is written as writeEmptyElement("VolumeRange") with a PLAIN
+# string literal, while every other command uses QStringLiteral(...).  A grep
+# for QStringLiteral misses it, and missing it is what kept UPnP.pm alive.
+# Match both forms.
+#
+# <VolumeRange/> IS A CONTROL COMMAND, AND IT REPLACES UPnP ENTIRELY.  Verified
+# live 2026-08-28 against engine 6.0.4:
+#
+#   <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
+#
+# Same range UPnP GetVolumeDBRange reports, in plain dB rather than 1/256, on
+# the socket that is already open and answers in ~9ms instead of 300-550ms.
+# `enabled` is very likely the fixed-volume flag the plugin currently infers
+# from three sends that change nothing.  GetVolumeDBRange/GetVolumeDB really
+# are absent - those are the UPnP action names, and the earlier note inferring
+# "so there is no way to ask" from their absence stopped one command short.
+#
+# PlayNextURI IS IN THE LIST BUT MUST NOT BE SENT.  It answers result="OK" and
+# then TAKES HQPLAYERD DOWN - see CLAUDE.md.  It is whitelisted only so that
+# tools/probe_gapless.py can re-test it deliberately on a future engine.
+#
+# Only what the plugin actually sends is whitelisted here.
 my %KNOWN = map { $_ => 1 } qw(
     Play Pause Stop Seek SelectTrack Status State GetInfo Volume SetRepeat
-    PlaylistAdd PlaylistClear PlaylistGet
+    PlaylistAdd PlaylistClear PlaylistGet PlayNextURI VolumeRange
     GetTransport SetTransport GetInputs GetRates GetModes GetFilters
 );
 
@@ -233,7 +283,32 @@ sub _pump {
     my $next = shift @{ $self->{queue} } or return;
 
     $self->{inflight} = $next;
-    $self->{wbuf}    .= XML_DECL . $next->{cmd};
+
+    # ENCODE TO OCTETS HERE, AND NOWHERE ELSE.  `wbuf` is a BYTE buffer from
+    # this line on.
+    #
+    # LMS hands out track titles as Perl CHARACTER strings, so the moment an
+    # album has a track called "Lush 3-1" with a U+2012 figure dash in it, the
+    # <metadata song="..."/> on a PlaylistAdd carries a wide character - and
+    # `syswrite` on a raw socket DIES with "Wide character in syswrite".
+    #
+    # THAT DIE IS CATASTROPHIC, NOT COSMETIC.  It throws out of the status
+    # handler that was pumping the queue, the command stays `inflight`
+    # forever, and because exactly one command may be in flight at a time
+    # EVERY SUBSEQUENT COMMAND IS QUEUED BEHIND IT AND NEVER SENT.  The player
+    # goes deaf: skip, stop and pause all do nothing, LMS's position freezes
+    # while HQPlayer plays on, and 30s later the reply timeout tears the link
+    # down.  Observed live 2026-08-28 on Orbital 2.
+    #
+    # It is invisible for ASCII-only libraries, which is why it survived every
+    # test up to here.  Same family as the LMS characters-vs-octets trap:
+    # anything that reaches a socket, a DB or a digest needs BYTES.
+    #
+    # The second, quieter half: `substr($wbuf, 0, $wrote, '')` in _flush cuts
+    # by CHARACTER while syswrite counts BYTES, so a partial write of a
+    # non-ASCII command would resume mid-character and corrupt the stream.
+    # Encoding once, here, makes both operations agree.
+    $self->{wbuf} .= Encode::encode( 'UTF-8', XML_DECL . $next->{cmd} );
 
     main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: -> $next->{cmd}");
 
@@ -297,8 +372,13 @@ sub _readable {
 
     # Drain every complete message the read produced.  Because <Status/> is a
     # subscribe, a single read routinely contains several.
+    # DECODE HERE, not before: `rbuf` is octets off the wire, and framing a
+    # message has to count the same units the socket delivered.  Each COMPLETE
+    # message is turned back into characters on the way out, so callers - and
+    # anything that ends up in a log line or a track title - see text rather
+    # than mojibake.  The counterpart of the encode in _pump.
     while ( defined( my $raw = _extractMessage( \$self->{rbuf} ) ) ) {
-        $self->_dispatch($raw);
+        $self->_dispatch( Encode::decode( 'UTF-8', $raw ) );
     }
 
     return;
