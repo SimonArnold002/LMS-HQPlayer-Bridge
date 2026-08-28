@@ -10,6 +10,7 @@ declined.
 | Finding | Verdict | Why |
 |---|---|---|
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
+| Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayer-verify-playback-not-state]]. |
 | A bare `<Status/>` is not a subscribe - the vendor's client always writes the attribute, so a missing one reads as `subscribe="0"`, no pushes ever arrive, the clock freezes and LMS is stranded in `play` (`Player.pm` `_startPolling` / `_statusWatchdog`) | **DECLINED** 2026-08-28 | Measured A/B against engine 6.0.4 on one connection each, 6s: bare `<Status/>` -> **2** pushes, `subscribe="1"` -> **2**, `subscribe="0"` -> **1**. Bare is equivalent to `subscribe="1"`; the "missing attribute reads as 0" step was flagged as unproven by the reporter and is the step that is false. The log pattern has a different cause: **HQPlayer stops pushing when it is not playing**. Watchdog firings during the healthy sweep 16:21-16:27 = **0**; continuous from 16:29:36, right after a pause at 16:29:06. Sending `subscribe="1"` explicitly is harmless and slightly clearer, but fixes nothing. THE REPORT'S SYMPTOM IS REAL WITH ANOTHER CAUSE - see the row below. |
 | LMS can be stranded in `mode=play` with a frozen clock, leaving the Eversolo screen on for ever | **ACCEPTED, not yet fixed** 2026-08-28 | `_endOfStream` opens `return unless $self->hqStarted`, and `hqStarted` is only set when HQPlayer REPORTS playing. So a `Play` that is acked but never becomes playback tells LMS nothing, for ever. That is the state every tier 4 bug fixed in 0.2.27 produced; the causes are gone but the gap is not. Fix: a start timeout - if HQPlayer has not reported playing ~10s after the Play ack, report the load as failed. Would have surfaced the 0.2.24-0.2.27 bugs in seconds. Note the screen plugin already has its own net (`_reconcile` spots a non-advancing clock and asks the device); it failed here only because the Eversolo was unreachable at that moment. |
 | `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` logs it at debug. |
@@ -298,6 +299,40 @@ attribute and `<picture>` as a child, concluded "everything is ruled out", and
 wrote that conclusion down as fact. It never tested the field HQPlayer's own
 `library.xml` uses for exactly this, which is `cover`.
 
+### TRAP: a remote track's metadata is the HANDLER's, not the track row's
+
+`artistName` and `albumname` are populated for a library track and **empty for
+a streaming one** - Tidal/Qobuz/Deezer keep that with the protocol handler,
+which is where LMS's own displays read it. A Tidal track reached HQPlayer as
+`song` + `cover` + `length` and nothing else, 2026-08-28. The artwork was right
+the whole time, because `_coverURL` was the only thing asking the handler; that
+asymmetry made it look like a display fault rather than a send fault.
+
+**And the handler WINS - it is not a fallback.** On radio the row's title is
+populated and it is the wrong one: it is the STATION.
+
+| | track row | handler |
+|---|---|---|
+| Tidal | `ONLY THING LEFT` | `ONLY THING LEFT` |
+| Radio Paradise | `Main Mix - FLAC Interactive` | `Road to Joy` |
+
+Preferring the row is wrong for every remote track; it just takes a stream
+whose row title is filled in to reveal it. `_handlerMeta` returns `{}` for a
+local url, so the library path never reaches the handler at all.
+
+A handler may return artist/album as a plain string, a hash, or an object -
+unwrap all three, or a reference gets stringified into what the endpoint shows.
+
+**Radio metadata goes stale, and cannot be fixed from here.** The metadata is
+sent once, with `PlaylistAdd`, so when the station moves to the next song
+HQPlayer still shows the one that was playing when the stream started. There is
+no update path: the vendor's complete command vocabulary (see
+`hqp-control-601-src/`) has `PlaylistAdd`, `PlaylistDelete`, `PlaylistRemove`,
+`PlaylistGetSingle` and the moves, and **nothing that rewrites an existing
+item's metadata**. Re-adding the item would restart the stream. The one
+untested avenue is ICY metadata in the stream itself - our tier 4 endpoint
+sends no `icy-metaint`, and whether HQPlayer would even ask for it is unknown.
+
 ### TRAP: artwork comes from two different places
 
 **Local track** -> the **direct** `/music/<coverid>/cover.jpg`.
@@ -560,21 +595,13 @@ the URL we hand it has to be fetchable as-is.
    single time — the query string, and nothing else. Its number is left unused
    rather than recycled, so an old log line still means what it said.
 
-3. **Local track in a format HQPlayer cannot decode** →
-   `/music/<trackid>/download.flac` — *the same download route, asked for as
-   FLAC*, which makes LMS transcode on the way out while the URL stays
-   **path-only**. Verified live 2026-08-28: an m4a asked for as `.flac` answers
-   `Content-Type: audio/x-flac` with a body opening `fLaC`, and HQPlayer renders
-   it (`proc=3.298 in_fill=0.73`).
+3. **Local track in a format HQPlayer cannot decode** → the plugin's own
+   endpoint, `/hqp/<token>/<seq>.<ext>`, exactly as tier 4. LMS still does the
+   transcoding; the plugin only changes how the bytes are framed.
 
-   This is what tier 2 was supposed to do and never could. It means **every
-   local format now plays**, whatever HQPlayer's mime table says.
-
-   * It **is** gapless-able — every track has its own URL, so it appends like
-     tier 1.
-   * It is **not seekable**. A transcode has no known length, so LMS answers
-     `Accept-Ranges: none` and a plain 200 where a native download gives 206.
-     `_queueTrack` therefore sends no `<Seek>` on tier 3.
+   **It must NOT use `/music/<id>/download.flac`, and the reason is HTTP, not
+   audio** — see the chunked-transcode trap below. Like tier 4 it is neither
+   pre-queued nor seekable.
 
 4. **Anything genuinely remote** (Qobuz, Tidal, Deezer, radio) →
    `/hqp/<token>/<seq>.<ext>`, served by `Stream.pm`. This is the same audio
@@ -584,6 +611,46 @@ Range support matters for tiers 1 and 3: HQPlayer logs
 `clStreamReaderHTTP::Skip(): not seekable!` against servers that lack it
 (Python's `http.server` does). LMS's download route supports ranges on a native
 passthrough, which is why seek is a tier 1 capability only.
+
+### TRAP: a transcode is served CHUNKED, and HQPlayer does not de-chunk
+
+`/music/<id>/download.<ext>` is a fine URL for a **native** file and a trap for
+a **transcoded** one. A transcode has no known length, so LMS cannot send a
+`Content-Length` and falls back to `Transfer-Encoding: chunked`:
+
+| | tier 1, native file | tier 3, transcoded |
+|---|---|---|
+| framing | `Content-Length: 24851636` | `Transfer-Encoding: chunked` |
+
+**HQPlayer does not de-chunk.** It reads the chunk-size lines as audio, and its
+decoder tears itself apart on them:
+
+```
+ReadFLACErrorCB(): lost sync
+ReadFLACErrorCB(): unparseable stream
+ReadFLACErrorCB(): CRC error
+```
+
+Reported 2026-08-28 as garbled mp4 playback, and it had been shipping since
+tier 3 was written.
+
+**Two things make this genuinely hard to catch, and both fooled this repo once
+already:**
+
+* **The file is perfect.** Fetched with `curl` — which de-chunks silently — the
+  transcode is a valid FLAC: right rate, right duration, and a **0.9998**
+  loudness-envelope correlation against the original m4a. Analysing the
+  downloaded file proves nothing about what HQPlayer receives off the socket.
+* **`state`, `process_speed` and `input_fill` all look healthy** while every
+  frame fails to decode. Tier 3 was called "verified" on exactly those three
+  numbers (`proc=3.298 in_fill=0.73`). They do not mean the audio is right.
+  **Only hqplayerd's own log says so** — see `:8088/log`, and the standing rule
+  under "Verified working": never conclude playback works from `state` alone.
+
+So a transcode goes out on the plugin's endpoint, which writes raw bytes with
+`Connection: close` and no chunking. The cost is gapless — the endpoint is the
+player stream and there is one per player — so tier 3 hands over like tier 4
+instead of being pre-queued. Correct audio beats a seamless join.
 
 ### Tier 4: the plugin's own audio endpoint (`Stream.pm`)
 
@@ -792,7 +859,7 @@ The tiers put the offset in different places:
 |---|---|---|
 | tier 1 (`/music/<id>/download.ext`) | us, via `<Seek>` — LMS is not in the byte path | absolute in the file |
 | tier 4 (`/hqp/<token>/<seq>.<ext>`) | LMS, when it opens the source (`canDirectStream` is 0) | relative, starts at 0 |
-| tier 3 (`/music/<id>/download.flac`) | nobody — **not seekable**, `Accept-Ranges: none` | absolute, always from 0 |
+| tier 3 (`/hqp/…`, a transcode) | LMS, as tier 4 — same endpoint, same rules | relative, starts at 0 |
 
 So `<Seek>` goes out on tier 1 only — sending it on tier 4 skips a second time
 and lands at twice the offset, and tier 3 cannot honour it at all — and `songElapsedSeconds` subtracts
@@ -947,6 +1014,40 @@ a dB, which survives both that and HQPlayer's 1/256 dB units exactly. The
 quantum is at most **half an LMS step**, which is what guarantees two
 consecutive slider positions can never land on the same level.
 
+### TRAP: an endpoint re-registering announces its own level, LOUDLY
+
+**This one is a hearing-safety guard, not a cosmetic one.**
+
+When a network endpoint drops and comes back, HQPlayer re-splits the level
+between the endpoint's hardware volume and its own software attenuator, and the
+endpoint announces whatever level it had stored. That arrives on exactly the
+same channel as the endpoint's own remote, so `_followVolume` reads it as the
+user's intent and moves the slider to match.
+
+LIVE 2026-08-28, an Eversolo NAA re-registering, two pushes 600ms apart:
+
+```
+volume changed outside LMS to -39dB - following
+volume changed outside LMS to -18dB - following      <- +21dB
+```
+
+and at the same moment hqplayerd's own log shows the split going from
+`hardware: 0  software: -27` to `hardware: -43  software: -4`. Nothing had
+asked for any of it. It was very loud.
+
+So inside a settling window (`VOL_SETTLE`, 10s) an **increase** beyond
+`VOL_JUMP_LIMIT` (3dB) is refused, and LMS's own level is re-asserted to pull
+the endpoint back down. The asymmetry is the point: **a decrease always follows
+immediately**, so the guard can only ever make things quieter, and outside the
+window the endpoint's remote behaves exactly as before.
+
+**Two things open the window, and the second is not optional.** `refreshInfo`
+stamps it on a control link-up — but the NAA can drop and return while our link
+to HQPlayer never bounces, and then nothing in `refreshInfo` runs. `<Status/>`
+carries `transport_serial`, which HQPlayer increments when the output transport
+is rebuilt; `_onStatus` watches it and arms the same guard. Without that half,
+the case that actually happened is only covered by luck.
+
 ### The snap, and the tolerance that fixes it
 
 The reported symptom — "LMS changes the volume on the next track to align it",
@@ -1077,7 +1178,7 @@ player's prefs once; the thrash cost them every round.
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all seven modules against the stub Slim
-tree, runs 386 assertions across five files, and sweeps called-vs-defined subs.
+tree, runs 407 assertions across five files, and sweeps called-vs-defined subs.
 
 | file | covers |
 |---|---|
@@ -1172,12 +1273,21 @@ HTTP played correctly:
   | | play | seek | skip | pause/resume | track change |
   |---|---|---|---|---|---|
   | tier 1 (local FLAC) | ok | **ok** | ok | ok | ok, gapless |
-  | tier 3 (local ALAC/MP4) | ok | n/a | ok | ok | ok |
+  | tier 3 (local ALAC/MP4) | see below | n/a | ok | ok | ok |
   | tier 4 (Qobuz) | ok | **ok** | ok | ok | ok, with a gap |
 
   Qobuz arrives as 24/96 FLAC (`process_speed` 3.1-3.2, `input_fill` 0.8-0.94)
   and is upsampled to DSD256. Tier 1 seek had been unverified since the player
   was written; it works.
+
+  **CORRECTION, and the reason this table is dangerous.** The tier 3 row above
+  was `ok` for TRANSPORT and the audio was GARBLED the entire time - the
+  chunked-transcode trap. Every number this sweep looked at (`state`,
+  `process_speed`, `input_fill`, position advancing) was healthy while
+  HQPlayer's FLAC decoder failed on every frame. Nothing in LMS or in the
+  control API said a word. **A transport sweep is not a playback test.** Read
+  hqplayerd's log at `:8088/log` for `ReadFLACErrorCB` before writing `ok` in a
+  table like this one.
 * **Gapless END TO END through the plugin** — 2026-08-28, driven from a real
   LMS queue on 0.2.20-0.2.21. Three album boundaries seamless; skip x3 clean;
   a playlist edit mid-hand-over (`flush()` -> `<PlaylistClear/>` -> re-arm)
@@ -1667,10 +1777,10 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Still unverified
 
-* **Tier 3 gapless across a boundary.** The ARMING half is confirmed live
-  (2026-08-28): a tier 3 track pre-queues the next one and `_handedOver` polls
-  with the right `want=` url. The boundary itself has not been watched — the
-  one attempt collided with the player being used by hand.
+* **Whether an mp4/ALAC track sounds right on 0.2.31.** The chunked-transcode
+  fix is reasoned from the framing and from hqplayerd's decoder errors; the
+  build has not been listened to. Check `:8088/log` for `ReadFLACErrorCB`
+  lines, not `state`.
 * **How HQPlayer presents fixed volume.** Now has an obvious answer to test:
   `enabled` on `<VolumeRange/>`. Flip the setting on a live instance and read
   it back. Detection currently assumes a zero-width range, and falls back to

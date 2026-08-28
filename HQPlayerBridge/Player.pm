@@ -41,7 +41,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqTier hqRate hqBits hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
-    hqVolSent hqVolSentAt hqVolMissed
+    hqVolSent hqVolSentAt hqVolMissed hqLinkAt hqTransSerial
     hqGen hqPlayAck hqURL hqPrevURL
     hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt
 ) );
@@ -67,6 +67,23 @@ use constant END_GRACE => 3;
 # skipped the track outright.  A track cannot meaningfully end this fast, and
 # one that did would simply be reported a push or two later.
 use constant START_GRACE => 2;
+
+# How long after a control link-up an external volume change is treated as the
+# endpoint describing itself rather than as somebody turning a knob, and how
+# big an INCREASE has to be before it is refused inside that window.  See
+# _followVolume: this is a hearing-protection guard, not a cosmetic one.
+#
+# The window is generous because the endpoint re-registration that triggers
+# this is not instant - the live case took HQPlayer about 4s from the NAA
+# reconnecting to re-enabling hardware volume.  The limit is a couple of
+# slider steps, comfortably above the tolerance that stops ordinary rounding
+# from counting as a change.
+#
+# DECLARED AT THE TOP ON PURPOSE.  `use constant` runs at compile time in file
+# order, so a constant declared below its first use is a bareword error - this
+# file has been bitten by exactly that before.
+use constant VOL_SETTLE     => 10;
+use constant VOL_JUMP_LIMIT => 3;
 
 # HQPlayer reports state as an INTEGER, not a word - verified live 2026-08-26
 # by driving a real track through Play/Pause/Stop and watching <Status/>.
@@ -125,6 +142,8 @@ sub new {
         hqTrackNo    => undef,
         hqStaleRun   => 0,
         hqStartedAt  => 0,
+        hqLinkAt     => 0,
+        hqTransSerial => undef,
     );
 
     return $client;
@@ -328,23 +347,43 @@ sub _resolveURL {
             # sent to the LMS player stream, which HQPlayer cannot fetch at all
             # because of the query string in it - see tier 4 below.
             #
-            # `download` transcodes whenever the requested extension differs
-            # from the track's own, and the URL stays PATH-ONLY, which is the
-            # part that matters.  Verified live 2026-08-28: an m4a asked for as
-            # .flac answers `Content-Type: audio/x-flac` with a body opening
-            # `fLaC`, and HQPlayer renders it (process_speed 3.3, input_fill
-            # 0.73).
+            # IT MUST NOT GO VIA /music/<id>/download.flac, AND THE REASON IS
+            # HTTP, NOT AUDIO.  A transcode has no known length, so LMS answers
+            # it with `Transfer-Encoding: chunked` - and HQPLAYER DOES NOT
+            # DE-CHUNK.  It reads the chunk-size lines as audio, and its FLAC
+            # decoder tears itself apart on them:
             #
-            # NOT SEEKABLE.  A transcode has no known length, so LMS answers
-            # `Accept-Ranges: none` and a plain 200 where a native download
-            # gives 206 - so no <Seek> is sent for this tier (see _queueTrack).
-            # It IS gapless-able: every track has its own url.
+            #   ReadFLACErrorCB(): lost sync
+            #   ReadFLACErrorCB(): unparseable stream
+            #   ReadFLACErrorCB(): CRC error
+            #
+            # Reported as garbled mp4 playback 2026-08-28.  A native file gets
+            # `Content-Length` and no chunking, which is why tier 1 was fine.
+            #
+            # THE FILE ITSELF IS PERFECT - that is what makes this so easy to
+            # get wrong.  Downloaded with curl (which de-chunks silently) the
+            # transcode is a valid FLAC: right rate, right duration, and a
+            # 0.9998 loudness-envelope correlation against the original m4a.
+            # Nothing about the audio is wrong; only the framing is.
+            #
+            # AND `state`, `process_speed` AND `input_fill` ALL LOOK HEALTHY
+            # WHILE IT HAPPENS.  This tier was called "verified" on the
+            # strength of exactly those three numbers.  They do not tell you
+            # the decoder is failing - only hqplayerd's own log does.
+            #
+            # So serve it ourselves.  Stream.pm writes raw bytes with
+            # `Connection: close` and no chunking, which is the delivery Qobuz
+            # and Tidal already use successfully.  The cost is gapless: the
+            # plugin's endpoint is the player stream, and there is only one of
+            # those per player, so these hand over like tier 4 rather than
+            # being pre-queued.  Correct audio beats a seamless join.
             $self->hqTier( 3 );
 
-            my $url = $base . '/music/' . $id . '/download.flac';
+            my $url = Plugins::HQPlayerBridge::Stream->urlFor( $self, $base, $song );
 
             main::INFOLOG && $log->is_info && $log->info( $self->name
-                . ": tier 3 ('$ct' is not in HQPlayer's mime table - LMS transcodes to FLAC) $url" );
+                . ": tier 3 ('$ct' is not in HQPlayer's mime table - LMS transcodes, served on"
+                . " the plugin endpoint because a chunked transcode breaks HQPlayer's decoder) $url" );
 
             return $url;
         }
@@ -433,11 +472,36 @@ sub _metadata {
     # length="13" on the playlist item and length="12.699" on <Status/>.
     my $secs = eval { $track->secs };
 
+    # A REMOTE TRACK CARRIES ALMOST NOTHING ON THE TRACK ROW ITSELF.
+    #
+    # `artistName` and `albumname` are populated for a library track, but for
+    # Tidal/Qobuz/Deezer they come back EMPTY - that metadata lives with the
+    # protocol handler, which is where LMS's own displays get it from. The
+    # result was a Tidal track reaching HQPlayer as song + cover + length and
+    # nothing else: no artist, no album, on the endpoint's screen.
+    #
+    # `_coverURL` already asked the handler, which is exactly why the artwork
+    # was right while the text beside it was blank. Ask once, here, and let
+    # both use it.
+    #
+    # THE HANDLER WINS, IT IS NOT A FALLBACK. On RADIO the track row DOES have
+    # a title and it is the wrong one - it is the STATION. Reported live
+    # 2026-08-28 on Radio Paradise:
+    #
+    #   track row      title = 'Main Mix - FLAC Interactive'   <- the station
+    #   handler        title = 'Road to Joy'                   <- the track
+    #
+    # Artist and album looked fine there only because the row had neither and
+    # fell through. Preferring the row is wrong for every remote track; it just
+    # takes a stream whose row title is populated to show it. _handlerMeta
+    # returns {} for a local track, so the library path is untouched.
+    my $meta = $self->_handlerMeta($track);
+
     my @f = (
-        song   => eval { $track->title }      || '',
-        artist => eval { $track->artistName } || '',
-        album  => eval { $track->albumname }  || '',
-        cover  => $self->_coverURL($track)    || '',
+        song   => $meta->{title}  || eval { $track->title }      || '',
+        artist => $meta->{artist} || eval { $track->artistName } || '',
+        album  => $meta->{album}  || eval { $track->albumname }  || '',
+        cover  => $self->_coverURL( $track, $meta ) || '',
         # Guarded rather than defaulted: a zero length is worse than none - it
         # is what the UI was already showing.
         ( $secs && $secs > 0 ? ( length => $secs ) : () ),
@@ -453,8 +517,52 @@ sub _metadata {
     return $meta . '/>';
 }
 
-sub _coverURL {
+# What the protocol handler knows about a remote track, normalised.
+#
+# This is the ONLY source for a streaming track's artist and album: the track
+# row has neither. Returns {} for a local track, so callers can read it
+# unconditionally and let the track's own accessors win.
+#
+# The value of a field is usually a plain string, but a handler is free to hand
+# back an object or a hash for artist/album, so unwrap the obvious shapes
+# rather than stringifying a reference into the metadata HQPlayer displays.
+sub _handlerMeta {
     my ( $self, $track ) = @_;
+
+    my $url = eval { $track->url } || '';
+
+    return {} unless $url && Slim::Music::Info::isRemoteURL($url);
+
+    my $handler = Slim::Player::ProtocolHandlers->handlerForURL($url);
+
+    return {} unless $handler && $handler->can('getMetadataFor');
+
+    my $meta = eval { $handler->getMetadataFor( $self, $url ) } || {};
+
+    return {} unless ref $meta eq 'HASH';
+
+    my %out;
+
+    for my $k (qw( title artist album )) {
+        my $v = $meta->{$k};
+
+        # radio puts the whole "Artist - Title" line here
+        $v = $meta->{remote_title} if !defined $v && $k eq 'title';
+
+        if ( ref $v eq 'HASH' )  { $v = $v->{name} }
+        elsif ( ref $v )         { $v = eval { $v->name } }
+
+        $out{$k} = $v if defined $v && !ref $v && $v ne '';
+    }
+
+    # the artwork keys, left exactly as _coverURL expects them
+    $out{$_} = $meta->{$_} for grep { defined $meta->{$_} } qw( cover coverart icon artwork_url );
+
+    return \%out;
+}
+
+sub _coverURL {
+    my ( $self, $track, $meta ) = @_;
 
     my $url = eval { $track->url } || '';
 
@@ -465,16 +573,14 @@ sub _coverURL {
     # image proxy is for.
     if ( $url && Slim::Music::Info::isRemoteURL($url) ) {
 
-        my $handler = Slim::Player::ProtocolHandlers->handlerForURL($url);
+        # _metadata has usually asked already; only pay for it again if not.
+        $meta ||= $self->_handlerMeta($track);
 
-        if ( $handler && $handler->can('getMetadataFor') ) {
-            my $meta = eval { $handler->getMetadataFor( $self, $url ) } || {};
-            my $art  = $meta->{cover} || $meta->{coverart} || $meta->{icon} || $meta->{artwork_url};
+        my $art = $meta->{cover} || $meta->{coverart} || $meta->{icon} || $meta->{artwork_url};
 
-            if ($art) {
-                return $art if $art =~ m{^https?://};
-                return $self->_serverBase . ( $art =~ m{^/} ? $art : "/$art" );
-            }
+        if ($art) {
+            return $art if $art =~ m{^https?://};
+            return $self->_serverBase . ( $art =~ m{^/} ? $art : "/$art" );
         }
 
         return undef;
@@ -682,7 +788,7 @@ sub _handOver {
     my $newTier = $self->hqTier || 0;
 
     return $self->_appendTrack( $url, $song )
-        if $newTier == 1 || $newTier == 3;
+        if $newTier == 1;
 
     # TIER 4 CANNOT RIDE HQPLAYER'S PLAYLIST, even though its urls ARE unique.
     # A client has ONE streamingsocket and one songStreamController.  Appending
@@ -797,14 +903,16 @@ sub _armNextTrack {
 
     return unless $self->hqControl;
 
-    # Tiers 1 and 3 are both a plain file download, so LMS is not in the byte
-    # path and a second url can be handed over while the first is still being
-    # read.  Tier 4 is not: it IS the byte path, and arming it would move LMS
-    # on to the next song's source while HQPlayer is still pulling this one -
-    # see _handOver.  Arming there would still be SAFE (the track would simply
-    # be held) but it would open that source minutes early for no gain.
+    # ONLY TIER 1 can be pre-queued.  A native file download leaves LMS out of
+    # the byte path entirely, so a second url can be handed over while the
+    # first is still being read.  Tiers 3 and 4 both come off the plugin's own
+    # endpoint, which IS the player stream - and there is one of those per
+    # player, so arming would move LMS on to the next song's source while
+    # HQPlayer is still pulling this one.  See _handOver.  Arming would still
+    # be SAFE (the track is simply held) but it would open that source minutes
+    # early for no gain.
     my $tier = $self->hqTier || 0;
-    return unless $tier == 1 || $tier == 3;
+    return unless $tier == 1;
 
     my $c = $self->controller or return;
 
@@ -1427,6 +1535,17 @@ use constant FIXED_STRIKES => 3;
 # ---------------------------------------------------------------------------
 # The inbound half of the sync: HQPlayer's own level, off every <Status/>.
 # ---------------------------------------------------------------------------
+# True while the endpoint is still settling after a control link-up, which is
+# the only window in which an external volume change is the device describing
+# itself rather than somebody turning a knob.
+sub _inVolSettle {
+    my $self = shift;
+
+    my $at = $self->hqLinkAt or return 0;
+
+    return ( Time::HiRes::time() - $at ) < VOL_SETTLE;
+}
+
 sub _followVolume {
     my ( $self, $db ) = @_;
 
@@ -1457,6 +1576,45 @@ sub _followVolume {
     my $ours   = $self->_lmsToDb( $stored > 0 ? $stored : 0 );
 
     return if abs( $db - $ours ) <= $self->_volTol;
+
+    # DO NOT FOLLOW A JUMP *UP* IN THE SECONDS AFTER A LINK-UP.  PULL IT BACK.
+    #
+    # When an endpoint re-registers, HQPlayer re-splits the level between the
+    # endpoint's hardware volume and its own software attenuator, and the
+    # endpoint announces whatever level it had stored.  That is the device
+    # describing itself, NOT the user asking for anything - but it arrives
+    # through the same channel as the endpoint's own remote, so the ordinary
+    # follow path treats it as intent and moves the slider to match.
+    #
+    # LIVE 2026-08-28, an Eversolo NAA re-registering, 600ms apart:
+    #
+    #   volume changed outside LMS to -39dB - following
+    #   volume changed outside LMS to -18dB - following   <- +21dB
+    #
+    # at the same moment the software attenuator went from -27 to -4. That is
+    # a very loud noise in somebody's listening room, and nothing had asked
+    # for it.
+    #
+    # So during the settling window an INCREASE beyond a slider step or two is
+    # refused and LMS's own level is re-asserted instead. A decrease always
+    # follows immediately - the guard can only ever make things quieter - and
+    # outside the window the endpoint's remote behaves exactly as before.
+    if ( $self->_inVolSettle && $db - $ours > VOL_JUMP_LIMIT ) {
+        $log->warn( $self->name . sprintf(
+            ': refusing a %+.0fdB jump to %sdB %.1fs after link-up - re-asserting %sdB',
+            $db - $ours, _fmtDb($db), Time::HiRes::time() - ( $self->hqLinkAt || 0 ), _fmtDb($ours) ) );
+
+        # Send it directly. Going through the mixer would be a no-op: LMS's
+        # stored volume is already $ours, so nothing would reach HQPlayer and
+        # the endpoint would stay where it put itself.
+        $self->hqVolDb($ours);
+        $self->hqVolSent($ours);
+        $self->hqVolSentAt( Time::HiRes::time() );
+
+        $self->_send( '<Volume value="' . _fmtDb($ours) . '"/>' );
+
+        return;
+    }
 
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ": volume changed outside LMS to ${db}dB - following" );
@@ -1791,6 +1949,29 @@ sub _onStatus {
     my ( $self, $attrs, $raw ) = @_;
 
     $self->hqLastStatus( Time::HiRes::time() );
+
+    # THE OUTPUT TRANSPORT WAS REINITIALISED - open the volume settling window.
+    #
+    # A control link-up is not the only way an endpoint re-registers: the NAA
+    # can drop and come back while our link to HQPlayer stays up the whole
+    # time, and then nothing in refreshInfo runs. `transport_serial` is
+    # HQPlayer telling us the output transport was rebuilt, which is exactly
+    # the moment the endpoint announces its own stored level - so treat it the
+    # same as a link-up. See _followVolume.
+    my $serial = Plugins::HQPlayerBridge::Control::pick( $attrs, 'transport_serial' );
+
+    if ( defined $serial && $serial =~ /^\d+$/ ) {
+        my $seen = $self->hqTransSerial;
+
+        if ( defined $seen && $seen != $serial ) {
+            main::INFOLOG && $log->is_info && $log->info( $self->name
+                . ": output transport reinitialised ($seen -> $serial) - guarding the volume" );
+
+            $self->hqLinkAt( Time::HiRes::time() );
+        }
+
+        $self->hqTransSerial($serial);
+    }
 
     my $controller = $self->controller or return;
 
@@ -2150,6 +2331,11 @@ sub assertRepeatOff {
 
 sub refreshInfo {
     my $self = shift;
+
+    # Open the volume settling window.  This runs when the control link comes
+    # up, which is also when an endpoint that has just re-registered announces
+    # its own stored level - see _followVolume.
+    $self->hqLinkAt( Time::HiRes::time() );
 
     # The volume range does not come from here: GetInfo does not carry one, and
     # the XML control API answers "Unknown command" for GetVolumeDBRange.  It

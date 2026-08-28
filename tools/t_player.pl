@@ -108,6 +108,99 @@ ok(scalar($meta !~ m{\bpicture=}) && scalar($meta !~ m{albumArtURI}),
 # cover. That produced a blank icon on the endpoint; it must never come back.
 ok(scalar($meta !~ m{/imageproxy/}), 'local cover URL is direct, NOT wrapped in the image proxy');
 
+# A REMOTE TRACK CARRIES ALMOST NOTHING ON THE TRACK ROW. artistName and
+# albumname are populated for a library track and EMPTY for Tidal/Qobuz/Deezer,
+# where that metadata lives with the protocol handler. Reported live
+# 2026-08-28: a Tidal track reached HQPlayer as song + cover + length and
+# nothing else - no artist, no album, on the endpoint's screen. The artwork was
+# right the whole time, because _coverURL was the only thing asking the handler.
+#
+# The metadata tests above all use a LOCAL track, which is exactly why this got
+# through: keep a remote one here.
+print "-- a remote track gets artist and album from the handler --\n";
+{
+    package TidalHandler;
+    sub getMetadataFor {
+        return {
+            title  => 'ONLY THING LEFT',
+            artist => 'Alex Warren',
+            album  => 'WILDCHILD',
+            cover  => 'http://resources.tidal.com/images/x/1280x1280.jpg',
+        };
+    }
+    package RefHandler;   # a handler that hands back objects, not strings
+    sub getMetadataFor {
+        return {
+            title  => 'Tempest',
+            artist => { name => 'Deafheaven' },
+            album  => bless({}, 'NamedThing'),
+        };
+    }
+    package NamedThing;
+    sub name { 'Infinite Granite' }
+}
+{
+    no warnings qw(redefine once);
+    local *Slim::Music::Info::isRemoteURL = sub { $_[0] && $_[0] =~ m{^\w+://} && $_[0] !~ m{^file://} };
+    local *Slim::Player::ProtocolHandlers::handlerForURL = sub {
+        return $_[1] =~ /^ref:/ ? 'RefHandler' : 'TidalHandler';
+    };
+
+    # the track row is empty, as a RemoteTrack's is
+    my $rt = FakeTrack->new({ title=>undef, artist=>undef, album=>undef,
+                              id=>-94081882758952, secs=>215, url=>'tidal://555260667.flc' });
+    my $m = $c->_metadata( FakeSong->new($rt) );
+
+    ok(scalar($m =~ m{\bartist="Alex Warren"}), 'artist comes from the protocol handler');
+    ok(scalar($m =~ m{\balbum="WILDCHILD"}),    'album comes from the protocol handler');
+    ok(scalar($m =~ m{\bsong="ONLY THING LEFT"}), 'so does the title when the row has none');
+    ok(scalar($m =~ m{\bcover="http://resources\.tidal\.com/}), 'artwork still works');
+    ok(scalar($m =~ m{\blength="215"}), 'and the duration is still sent');
+
+    # a library track never reaches the handler at all (_handlerMeta returns {}
+    # for a local url), so its own row is what gets sent
+    my $lt = FakeTrack->new({ title=>'Local Title', artist=>'Local Artist',
+                              album=>'Local Album', coverid=>'abc', id=>5, secs=>100,
+                              ct=>'flc', url=>'file:///x.flac' });
+    my $lm = $c->_metadata( FakeSong->new($lt) );
+    ok(scalar($lm =~ m{\bartist="Local Artist"}), 'a local track keeps its own artist');
+    ok(scalar($lm =~ m{\balbum="Local Album"}),   'and its own album');
+
+    # RADIO. The row's title is the STATION, and it IS populated - so a rule of
+    # "row first, handler as fallback" silently sends the station name as the
+    # track for every radio stream. Live 2026-08-28, Radio Paradise:
+    #   row     title = 'Main Mix - FLAC Interactive'
+    #   handler title = 'Road to Joy'
+    {
+        package RadioHandler;
+        sub getMetadataFor {
+            return { title => 'Road to Joy', artist => 'Peter Gabriel', album => 'i/o' };
+        }
+    }
+    {
+        no warnings qw(redefine once);
+        local *Slim::Player::ProtocolHandlers::handlerForURL = sub { 'RadioHandler' };
+
+        my $radio = FakeTrack->new({ title=>'Main Mix - FLAC Interactive',
+                                     id=>-94387584450888, url=>'radioparadise://4.flac' });
+        my $rm = $c->_metadata( FakeSong->new($radio) );
+
+        ok(scalar($rm =~ m{\bsong="Road to Joy"}),
+           'the handler title wins over the row - the row holds the STATION name');
+        ok(scalar($rm !~ m{Main Mix}),
+           'and the station name is not sent as the track title');
+        ok(scalar($rm =~ m{\bartist="Peter Gabriel"}), 'artist still comes through');
+    }
+
+    # a handler returning objects rather than strings must not stringify a ref
+    # into the text HQPlayer displays
+    my $ot = FakeTrack->new({ id=>-1, secs=>60, url=>'ref://1.flc' });
+    my $om = $c->_metadata( FakeSong->new($ot) );
+    ok(scalar($om =~ m{\bartist="Deafheaven"}),      'a hash-shaped artist is unwrapped');
+    ok(scalar($om =~ m{\balbum="Infinite Granite"}), 'an object-shaped album is unwrapped');
+    ok(scalar($om !~ m{=("|)[A-Za-z:]+=HASH}),        'no reference is ever written into the metadata');
+}
+
 print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
 {
     package FakeHandler;
@@ -201,8 +294,8 @@ ok($handedSub && $handedSub !~ /playerEndOfStream|playerStopped/,
    'a hand-over reports Started ONLY - an end-of-stream there would reload the track being played');
 
 my ($armSub) = $src =~ /\nsub _armNextTrack \{(.*?)\n\}/s;
-ok($armSub && $armSub =~ /\$tier == 1 \|\| \$tier == 3/,
-   '_armNextTrack pre-queues tiers 1 and 3 - LMS is not in their byte path - but never tier 4');
+ok($armSub && $armSub =~ /return unless \$tier == 1;/,
+   '_armNextTrack pre-queues ONLY tier 1 - tiers 3 and 4 are both the player stream');
 ok($armSub && $armSub =~ /hqArmNext\(\s*1\s*\).*?playerReadyToStream/s,
    'and arms the flag BEFORE the call - LMS re-enters play() synchronously for a local track');
 
@@ -491,6 +584,73 @@ is(scalar(@sent), '0', 'and the track-start re-assert does not drag it back');
 @sent = ();
 $c->volume(58);
 is(join(',', @sent), '<Volume value="-42"/>', 'a real slider move is still sent');
+
+# HEARING PROTECTION. When an endpoint re-registers, HQPlayer re-splits the
+# level between the endpoint's hardware volume and its own software attenuator,
+# and the endpoint announces whatever level it had stored. That arrives on the
+# same channel as the endpoint's own remote, so the ordinary follow path reads
+# it as intent. LIVE 2026-08-28, an Eversolo NAA re-registering, 600ms apart:
+#   volume changed outside LMS to -39dB - following
+#   volume changed outside LMS to -18dB - following      <- +21dB, in a room
+print "-- an endpoint re-registering must not turn the volume UP --\n";
+{
+    my $sp2 = Slim::Utils::Prefs::preferences('server');
+
+    # settle on -40dB (LMS 60) with the link long since up
+    $c->hqLinkAt(0);
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 8, volume => -40 }, '');
+    $sp2->client($c)->set('volume', 60);
+    $c->hqVolDb(-40);
+
+    # ...the link comes up, and the endpoint announces its own stored level
+    $c->hqLinkAt( Time::HiRes::time() );
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 9, volume => -18 }, '');
+
+    is(scalar(@ex), '0', 'a +22dB jump just after link-up is NOT followed into LMS');
+    is(join(',', @sent), '<Volume value="-40"/>',
+       "and LMS's own level is re-asserted, pulling the endpoint back down");
+
+    # a DECREASE in the same window still follows - the guard can only quieten
+    $c->hqVolDb(-40);
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 10, volume => -60 }, '');
+    is(join(',', @ex), 'mixer volume 40', 'a drop in the same window follows immediately');
+
+    # a small nudge up is still the user, not the device describing itself
+    $sp2->client($c)->set('volume', 60);
+    $c->hqVolDb(-40);
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 11, volume => -38 }, '');
+    is(join(',', @ex), 'mixer volume 62', 'a small increase inside the window is still followed');
+
+    # ...and once the window has passed, the endpoint's remote is honoured again
+    $sp2->client($c)->set('volume', 60);
+    $c->hqVolDb(-40);
+    $c->hqLinkAt( Time::HiRes::time() - 60 );
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 12, volume => -18 }, '');
+    is(join(',', @ex), 'mixer volume 82',
+       'the same jump outside the window IS followed - the remote still works');
+
+    # THE OTHER TRIGGER: the NAA can drop and return while our link to HQPlayer
+    # never bounces, so refreshInfo never runs. transport_serial changing is
+    # HQPlayer saying the output transport was rebuilt.
+    $sp2->client($c)->set('volume', 60);
+    $c->hqVolDb(-40);
+    $c->hqLinkAt( Time::HiRes::time() - 60 );
+    $c->hqTransSerial(7);
+    @sent = (); @ex = ();
+    $c->_onStatus({ state => 2, position => 13, volume => -18, transport_serial => 8 }, '');
+    is(scalar(@ex), '0', 'a transport_serial change re-arms the guard on its own');
+    is(join(',', @sent), '<Volume value="-40"/>', 'and that jump is pulled back too');
+
+    $c->hqLinkAt(0);
+    $c->hqTransSerial(undef);
+    $sp2->client($c)->set('volume', 60);
+    $c->hqVolDb(-40);
+}
 
 # Some HQPlayer setups do not attenuate at all - the DAC or the amp holds the
 # volume - and the LMS slider must sit at the top rather than pretend.
@@ -1177,9 +1337,16 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
     my $alac = FakeSong->new( FakeTrack->new(
         { title=>'Lossless', id=>303, ct=>'alc', secs=>200, url=>'file:///x.m4a' } ) );
 
+    # NOT /music/<id>/download.flac. A transcode has no length, so LMS sends it
+    # `Transfer-Encoding: chunked`, and HQPLAYER DOES NOT DE-CHUNK: it reads the
+    # chunk-size lines as audio and its decoder throws `lost sync` / `CRC error`
+    # on every frame. Reported live 2026-08-28 as garbled mp4 playback. The
+    # plugin's own endpoint writes raw bytes with no chunking.
     my $u = $c->_resolveURL($alac);
-    is( $u, 'http://127.0.0.1:9000/music/303/download.flac',
-        'a local file HQPlayer cannot decode is asked for AS FLAC, path-only' );
+    ok( scalar( $u =~ m{^http://127\.0\.0\.1:9000/hqp/02-ab-88-42-4c-69/\d+\.} ),
+        'a local file HQPlayer cannot decode is served on the PLUGIN endpoint' );
+    ok( scalar( $u !~ m{/download\.flac} ),
+        'NOT the LMS download route - that answers chunked and breaks the decoder' );
     is( $c->hqTier, '3', 'and is tier 3' );
     ok( scalar( $u !~ /\?/ ),
         'the url carries NO query string - HQPlayer silently refuses those' );
