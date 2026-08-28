@@ -37,6 +37,7 @@ then plays it.
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/UPnP.pm` | Async SOAP to HQPlayer's UPnP renderer — **volume range only** since 0.2.13 |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
+| `HQPlayerBridge/Stream.pm` | Tier 4: the path-only audio endpoint HQPlayer can actually fetch |
 | `HQPlayerBridge/Settings.pm` | Read-only status page |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 
@@ -507,7 +508,7 @@ Everything that assumes a live SlimProto socket (`$client->tcpsock`) lives in
 LMS-Groups.
 
 **Do not** copy LMS-Groups' `sub chunks { [] }` — that class deliberately
-carries no audio, whereas tier 2 below needs the real chunk pipeline.
+carries no audio, whereas tier 4 below needs the real chunk pipeline.
 
 ## Track resolution — three URL tiers
 
@@ -553,11 +554,9 @@ the URL we hand it has to be fetchable as-is.
    from the track's own, so a truthful extension keeps it a byte-for-byte
    passthrough.
 
-2. **Anything genuinely remote** (Qobuz, Tidal, Deezer, radio) →
-   `/stream.mp3?player=<mac>`. **This tier does not work**, for the query-string
-   reason above and nothing else. It is left in place as the honest fallback for
-   a track with no local file, and logs that it will not play. The fix is tier 4
-   below.
+2. **Retired.** Tier 2 *was* `/stream.mp3?player=<mac>`, and it never worked a
+   single time — the query string, and nothing else. Its number is left unused
+   rather than recycled, so an old log line still means what it said.
 
 3. **Local track in a format HQPlayer cannot decode** →
    `/music/<trackid>/download.flac` — *the same download route, asked for as
@@ -575,17 +574,67 @@ the URL we hand it has to be fetchable as-is.
      `Accept-Ranges: none` and a plain 200 where a native download gives 206.
      `_queueTrack` therefore sends no `<Seek>` on tier 3.
 
-### Tier 4, not yet built: the path-only proxy
-
-Remote tracks need an endpoint the plugin serves itself — an LMS
-`addRawFunction` handler on a path like `/hqp/<playerid>/<n>.flac` that answers
-HEAD with 200 + Content-Type and then proxies the bytes LMS would have put on
-`/stream.mp3`. Path-only, one URL per track, so it is gapless-able as well.
+4. **Anything genuinely remote** (Qobuz, Tidal, Deezer, radio) →
+   `/hqp/<token>/<seq>.<ext>`, served by `Stream.pm`. This is the same audio
+   `/stream.mp3` would have carried, on a path with no `?` in it.
 
 Range support matters for tiers 1 and 3: HQPlayer logs
 `clStreamReaderHTTP::Skip(): not seekable!` against servers that lack it
 (Python's `http.server` does). LMS's download route supports ranges on a native
 passthrough, which is why seek is a tier 1 capability only.
+
+### Tier 4: the plugin's own audio endpoint (`Stream.pm`)
+
+**There is no proxying and no second HTTP request.** The handler hands the
+socket to LMS's own player-streaming machinery — which is exactly what
+`/stream.mp3` does. Registered with `Slim::Web::Pages->addRawFunction`, whose
+`%rawFunctions` is tied to `Tie::RegexpHash`, so a key registered as a regex
+matches by path.
+
+A raw function is called as `($httpClient, $response)` from the top of
+`processHTTP`, **before `processURL`** — so nothing has guessed at a client for
+us and nothing runs after we return. The whole handover is five lines lifted
+from LMS's own `stream.mp3` branch:
+
+```perl
+$Slim::Web::HTTP::peerclient{$httpClient} = $client->id;
+delete $Slim::Web::HTTP::keepAlives{$httpClient};
+Slim::Utils::Timers::killTimers( $httpClient, \&Slim::Web::HTTP::closeHTTPSocket );
+my $headers = Slim::Web::HTTP::_stringifyHeaders($response) . CRLF;
+$Slim::Web::HTTP::metaDataBytes{$httpClient} = -length($headers);
+Slim::Web::HTTP::addStreamingResponse( $httpClient, $headers );
+```
+
+`%peerclient` is the load-bearing line: `addStreamingResponse` reads it to find
+the player to attach the socket to, and without it the connection is adopted as
+an orphan and closed on the first pass through `sendStreamingResponse`. All
+four of those variables are `our` in LMS 9.1 — `t_stream.pl` asserts against
+stubs carrying the same names, so a rename upstream fails a test rather than
+silently killing the endpoint.
+
+**Answer the HEAD, but do not hand it the socket.** HQPlayer HEADs before it
+GETs. Attaching the player's stream to a HEAD would pour the track into a
+connection that is about to be closed and leave the real GET with nothing.
+
+**Content-Type is read at serve time, not mint time** — from
+`songStreamController->song->streamformat`. The transcode table and the bitrate
+cap both get a say after the URL has been handed over, and HQPlayer picks its
+decoder by Content-Type and ignores the extension entirely.
+
+**The token is the player id with `:` → `-`**, resolved by scanning the client
+list rather than by a registry, so there is nothing to get out of step with the
+players that exist. `<seq>` makes each track's URL unique, which is what stops
+HQPlayer treating a repeat of the same URL as the item it is already holding.
+
+**Tier 4 is NOT pre-queued for gapless, and its unique URLs are not enough to
+change that.** A client has one `streamingsocket` and one
+`songStreamController`. Appending would have LMS resolve and *open* the next
+song's source now, replacing the controller feeding bytes down the socket
+HQPlayer is still pulling — so the rest of the playing track would arrive as
+the beginning of the next one. A real Squeezebox survives this because it
+buffers a whole track ahead of itself; HQPlayer pulls progressively. So a tier 4
+next track is **held** and loaded when the current one ends, which is what
+`_armNextTrack` already arranges.
 
 ### TRAP: declaring `flc` first does not get you FLAC
 
@@ -635,7 +684,7 @@ pushed message and maps it onto the controller callbacks:
 | `track` moves on with something pre-queued | `playerTrackStarted`, then `playerReadyToStream` |
 | position advancing | `playerStatusHeartbeat` |
 | `state` 2 → 0, not ours, nothing held | `playerEndOfStream` + `playerReadyToStream` + `playerStopped` |
-| `state` 2 → 0, not ours, a tier 2 track held | nothing — the held track is loaded instead |
+| `state` 2 → 0, not ours, a tier 4 track held | nothing — the held track is loaded instead |
 | command rejected **on a full load** | `playerStreamingFailed('PROBLEM_OPENING')` |
 
 ### TRAP: a track change straddles the status stream
@@ -657,8 +706,7 @@ has just started is *skipped*. Three things stop it, and all three are needed:
 * **The `<metadata uri="">` child** is the only per-track identity in the status
   stream. `_isStale` uses it *one-sidedly*: a push counts as stale only when its
   uri is exactly `hqPrevURL` and not `hqURL`. Anything unrecognised — a
-  normalised uri, no metadata child, or tier 2, where every track comes off the
-  same `/stream.mp3` URL — is treated as current, so this can only ever suppress
+  normalised uri, no metadata child, or a uri HQPlayer never echoed back — is treated as current, so this can only ever suppress
   a push positively identified as the previous track's. It can never wedge
   playback. Volume is still followed from a stale push; it belongs to the
   instance, not the track.
@@ -741,10 +789,10 @@ The tiers put the offset in different places:
 | | who applies the seek | HQPlayer's `position` |
 |---|---|---|
 | tier 1 (`/music/<id>/download.ext`) | us, via `<Seek>` — LMS is not in the byte path | absolute in the file |
-| tier 2 (`/stream.mp3?player=`) | LMS, when it opens the source (`canDirectStream` is 0) | relative, starts at 0 |
+| tier 4 (`/hqp/<token>/<seq>.<ext>`) | LMS, when it opens the source (`canDirectStream` is 0) | relative, starts at 0 |
 | tier 3 (`/music/<id>/download.flac`) | nobody — **not seekable**, `Accept-Ranges: none` | absolute, always from 0 |
 
-So `<Seek>` goes out on tier 1 only — sending it on tier 2 skips a second time
+So `<Seek>` goes out on tier 1 only — sending it on tier 4 skips a second time
 and lands at twice the offset, and tier 3 cannot honour it at all — and `songElapsedSeconds` subtracts
 `hqSeekOffset`, which is set only when we actually asked HQPlayer to skip.
 Getting this wrong makes LMS run at double the real elapsed time.
@@ -1026,13 +1074,14 @@ player's prefs once; the thrash cost them every round.
 
 ## Testing without LMS
 
-`sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs 189 assertions across four files, and sweeps called-vs-defined subs.
+`sh tools/run_checks.sh` — syntax-checks all seven modules against the stub Slim
+tree, runs 386 assertions across five files, and sweeps called-vs-defined subs.
 
 | file | covers |
 |---|---|
 | `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads** |
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
+| `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
 | `t_upnp.pl` | the describe retry, the bounded Play loop, cancellation |
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift |
 
@@ -1115,6 +1164,18 @@ HTTP played correctly:
 * **`queued="1"` kills the daemon and `queued="0"` does not** — 2026-08-28,
   four controlled runs. See the trap section above.
 * **`<PlayNextURI>` kills the daemon** — 2026-08-28. See "Gapless".
+* **TIER 4 END TO END, and the whole transport swept** — 2026-08-28 on 0.2.27,
+  driven from a real LMS queue against the live daemon:
+
+  | | play | seek | skip | pause/resume | track change |
+  |---|---|---|---|---|---|
+  | tier 1 (local FLAC) | ok | **ok** | ok | ok | ok, gapless |
+  | tier 3 (local ALAC/MP4) | ok | n/a | ok | ok | ok |
+  | tier 4 (Qobuz) | ok | **ok** | ok | ok | ok, with a gap |
+
+  Qobuz arrives as 24/96 FLAC (`process_speed` 3.1-3.2, `input_fill` 0.8-0.94)
+  and is upsampled to DSD256. Tier 1 seek had been unverified since the player
+  was written; it works.
 * **Gapless END TO END through the plugin** — 2026-08-28, driven from a real
   LMS queue on 0.2.20-0.2.21. Three album boundaries seamless; skip x3 clean;
   a playlist edit mid-hand-over (`flush()` -> `<PlaylistClear/>` -> re-arm)
@@ -1122,7 +1183,7 @@ HTTP played correctly:
   ~2.3 s while HQPlayer retunes the output - physics, not a bug; it correlated
   exactly with 96k -> 44.1k and never appeared within a fixed-rate album.
 * **HQPlayer cannot fetch a URL containing `?`** — 2026-08-28, and it does not
-  follow a 302 either. This is the whole of the tier 2 failure. See "Track
+  follow a 302 either. This is the whole of the old tier 2 failure. See "Track
   resolution".
 * **Tier 3 (transcode-on-download) renders** — 2026-08-28: an m4a requested as
   `/music/<id>/download.flac` answers `Content-Type: audio/x-flac`, body opens
@@ -1151,7 +1212,7 @@ reads
 buffer ready [playing=PLAYING streaming=STREAMING]
 HQPlayer is playing
 end of track            <- ~180ms later
-tier 2 (LMS stream) http://.../stream.mp3?player=...
+tier 4 (plugin stream endpoint) http://.../hqp/02-ab-88-42-4c-69/7.flac
 ```
 
 That is the state machine working correctly on a daemon that keeps exiting: the
@@ -1197,7 +1258,7 @@ caught and merely answered as `result="Error"` — the level still applies. That
 is the `%BENIGN` entry in `Control.pm`. Do not confuse the two: caught in the
 control path, fatal in the daemon's main loop.
 
-**A spurious end-of-track makes it fire immediately.** On tier 2 the log shows
+**A spurious end-of-track makes it fire immediately.** On a transcoded stream the log shows
 `MP3 stream format changed` then `End of track at 0.008/195/194.992` — HQPlayer
 read LMS's `/stream.mp3` as ending 8ms in, advanced, and died. So a tier-2
 track can crash the daemon at the *start* rather than the end.
@@ -1271,7 +1332,7 @@ here, that a playlist HQPlayer can advance into on its own stops reporting
 `state` 0 at end of track, was right and is answered rather than dodged: the
 transition is read off the playlist index instead, and `state` 0 now means end
 of *playlist*, which is what the end-of-stream path always wanted it to mean.
-The tier 2 objection stands unchanged and is why tier 2 is excluded.
+The tier 4 objection stands unchanged and is why tier 4 is excluded.
 
 ## THE API IS DOCUMENTED — read the vendor's client, do not probe blind
 
@@ -1426,23 +1487,61 @@ loads the next track the slow way. Neither can misfire on ordinary playback.
 `state` 0 therefore now means **end of playlist**, which is what the
 end-of-stream path always wanted it to mean.
 
-### Tier 2 is excluded, and holds instead of appending
+### TRAP: a seeked stream has no container header, and HQPlayer sniffs
 
-`_armNextTrack` appends on **tiers 1 and 3** — both give every track its own
-path-only URL — and declines on tier 2.
+On a seek LMS re-opens the source at a byte offset, so a FLAC stream starts in
+the middle of the container: no `fLaC` marker, no STREAMINFO. **A Squeezebox is
+told the format out of band, in the `strm` command**, so its decoder just
+resyncs on the next frame. HQPlayer has no such channel — it identifies audio
+by sniffing the stream — so it cannot play it at all.
 
-Every tier 2 track is the **same** `/stream.mp3?player=` URL, so it could never
-be pre-queued as a distinct playlist item: that endpoint serves one consumer at
-a time and is fed by LMS's own `songStreamController`, which `_Stream` **closes**
-as soon as it opens the next one. Two playlist items pointing at it would tear
-the track that is playing. (That objection is now moot in practice, since tier 2
-does not play at all — but it is still the reason the exclusion is written as it
-is, and it will still apply to tier 4's shared-source case if that is ever how
-the proxy is built.)
+The failure is completely silent on the control API. `PlaylistAdd` and `Play`
+both answer OK; only hqplayerd's log tells you, and only by contrast:
 
-So a tier 2 next track is **held**, not appended, and loaded the ordinary way
+```
+good start:  Stream buffer 2880000/393216   <- format known, prefill sized
+after seek:  Stream buffer  262144/0        <- default buffer, nothing
+             Stop request (tail)
+```
+
+**LMS will not do this for you.** `Song::initialAudioBlock` exists for exactly
+this purpose, but `Protocols::HTTP::request` only builds it when the track has
+a `processor` for the wanted format. A straight FLAC passthrough has none, so
+LMS sets `initialAudioBlock('')` and sends the frames bare.
+
+So `Stream::_flacPrelude` synthesises a 42-byte header. The sample rate,
+channels and depth come from the track; total samples 0 ("length unknown") and
+a zero MD5 ("do not verify") are both accepted. **The block size is the part
+that bites**: it reads like a hint, since every frame carries its own, but a
+decoder sizes its buffers from the maximum. Established by decoding 3MB taken
+from the MIDDLE of a real FLAC — the seek case exactly:
+
+| min / max block size | result |
+|---|---|
+| no header at all | refused — this is the bug |
+| 16 / 65535 (the "unknown" form) | refused |
+| 4096 / 16384 | refused — min must equal max |
+| **4096 / 4096** | **decodes**, 4.8MB of PCM out |
+
+Only on a seek, and only on FLAC: an unseeked stream already carries a real
+header and a second one reads as corrupt audio, while MP3 frames are
+self-describing and need nothing.
+
+### Tier 4 is excluded, and holds instead of appending
+
+`_armNextTrack` appends on **tiers 1 and 3** and declines on tier 4. The
+dividing line is **not** whether the URLs are unique — tier 4's are — it is
+whether LMS is in the byte path.
+
+Tiers 1 and 3 are a plain file download: LMS is not streaming them to a player
+at all, so a second URL can be handed over while the first is still being read.
+Tier 4 *is* the player stream, and a client has one `streamingsocket` and one
+`songStreamController` — see "Tier 4" under Track resolution for why appending
+there would tear the playing track.
+
+So a tier 4 next track is **held**, not appended, and loaded the ordinary way
 when the current track ends (`hqNext` with `mode => 'load'`). `_armNextTrack`
-also declines to ask at all while a tier 2 track is playing, so LMS is never
+also declines to ask at all while a tier 4 track is playing, so LMS is never
 made to open a source stream minutes before it is needed.
 
 ### Three things that had to change with it
@@ -1461,7 +1560,7 @@ made to open a source stream minutes before it is needed.
   handling was written for.
 * **`playerBufferReady` is skipped when the controller is already PLAYING.**
   `BufferReady` in the PLAYING row is `_Invalid` — a warning and a backtrace.
-  The deferred tier 2 load is the case that hits it.
+  The deferred tier 4 load is the case that hits it.
 
 ### What is deliberately NOT done
 
@@ -1566,14 +1665,15 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Still unverified
 
-* **Tier 3 gapless across a boundary.** Tier 3 renders (verified live) and is
-  structurally gapless-able, but a tier 3 → tier 3 hand-over has not been run.
+* **Tier 3 gapless across a boundary.** The ARMING half is confirmed live
+  (2026-08-28): a tier 3 track pre-queues the next one and `_handedOver` polls
+  with the right `want=` url. The boundary itself has not been watched — the
+  one attempt collided with the player being used by hand.
 * **How HQPlayer presents fixed volume.** Now has an obvious answer to test:
   `enabled` on `<VolumeRange/>`. Flip the setting on a live instance and read
   it back. Detection currently assumes a zero-width range, and falls back to
   `_watchForFixed` (three sends that change nothing), which does not depend on
   knowing.
-* Seek initiated from LMS on tier 1.
 * `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS
   shows the player as present even when the control link is down. Discovered-but-
   unreachable is a normal recurring state here (the NAA lives at home), and

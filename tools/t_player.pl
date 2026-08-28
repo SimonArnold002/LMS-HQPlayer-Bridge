@@ -202,7 +202,7 @@ ok($handedSub && $handedSub !~ /playerEndOfStream|playerStopped/,
 
 my ($armSub) = $src =~ /\nsub _armNextTrack \{(.*?)\n\}/s;
 ok($armSub && $armSub =~ /\$tier == 1 \|\| \$tier == 3/,
-   '_armNextTrack pre-queues tiers 1 and 3 - both give each track its own url - but never tier 2');
+   '_armNextTrack pre-queues tiers 1 and 3 - LMS is not in their byte path - but never tier 4');
 ok($armSub && $armSub =~ /hqArmNext\(\s*1\s*\).*?playerReadyToStream/s,
    'and arms the flag BEFORE the call - LMS re-enters play() synchronously for a local track');
 
@@ -274,7 +274,7 @@ is($c->songElapsedSeconds, '0', 'a position behind the seek point clamps at zero
 
 my ($queueSub) = $src =~ /\nsub _queueTrack \{(.*?)\n\}/s;
 ok($queueSub && $queueSub =~ /hqTier[^;]*==\s*1[^;]*\{[^}]*Seek/s,
-   'Seek is sent on tier 1 only - tier 2 bytes already start at the offset');
+   'Seek is sent on tier 1 only - tier 4 bytes already start at the offset');
 ok($queueSub && $queueSub =~ /hqSeekOffset\(/,
    'and the offset we asked HQPlayer to skip is recorded');
 
@@ -691,8 +691,8 @@ is($p->hqPosition, '0',
    "and its position (197s into the previous track) is not adopted as ours");
 $p->hqPrevURL(undef);
 
-# ... and even with no way to tell the tracks apart (tier 2 - every track comes
-# off the same /stream.mp3 URL), an unacknowledged PLAYING is not a start
+# ... and even with no way to tell the tracks apart (a push carrying no uri at
+# all), an unacknowledged PLAYING is not a start
 status($p, 2, undef, 0);
 is($p->hqStarted, '0', 'an unacknowledged PLAYING push is never taken as a start');
 
@@ -1087,7 +1087,7 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
 
 print "-- a stop right after a track starts is start-up noise --\n";
 {
-    # LIVE FAILURE 2026-08-28, tier 2.  HQPlayer reports PLAYING as soon as it
+    # LIVE FAILURE 2026-08-28, on a transcoded stream.  HQPlayer reports PLAYING as soon as it
     # accepts the stream, then drops back to STOPPED for a moment while LMS is
     # still spinning up the transcode - measured at 0.33s.  Read as the end, it
     # skipped the track 0.33s in and jumped to the next one.
@@ -1170,7 +1170,8 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
     # does not, and neither does /stream.mp3?player=...  PlaylistAdd answers
     # result="OK" either way and then never fetches it.
     #
-    # So a local file in a format HQPlayer cannot decode must NOT go to tier 2.
+    # So a local file in a format HQPlayer cannot decode must NOT go on the
+    # LMS player stream.
     # `download` transcodes whenever the requested extension differs from the
     # track's own, and that url is path-only.
     my $alac = FakeSong->new( FakeTrack->new(
@@ -1190,22 +1191,27 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
         'a native FLAC is unchanged' );
     is( $c->hqTier, '1', 'and stays tier 1 - it is a byte-for-byte passthrough, and seekable' );
 
-    # only something genuinely remote falls through to the broken tier
+    # only something genuinely remote falls through to the plugin's own
+    # endpoint - it is the one case with no file to serve
     my $rem = FakeSong->new( FakeTrack->new(
         { title=>'Streamed', id=>-9454304, ct=>'flc', secs=>200,
           url=>'qobuz://445307221.flac' } ) );
-    ok( scalar( $c->_resolveURL($rem) =~ m{/stream\.mp3\?player=} ),
-        'only a remote track reaches tier 2, which is the one with no file to serve' );
-    is( $c->hqTier, '2', 'and is tier 2' );
+    my $ru = $c->_resolveURL($rem);
+    ok( scalar( $ru =~ m{^http://127\.0\.0\.1:9000/hqp/02-ab-88-42-4c-69/\d+\.} ),
+        'only a remote track reaches tier 4, the plugin stream endpoint' );
+    ok( scalar( $ru !~ /\?/ ),
+        'and it too is path-only - /stream.mp3?player= is exactly what HQPlayer will not fetch' );
+    is( $c->hqTier, '4', 'and is tier 4' );
 }
 
 print "-- gapless: the guards --\n";
 {
-    # TIER 2 CANNOT RIDE HQPLAYER'S PLAYLIST.  Every tier 2 track is the same
-    # /stream.mp3?player= URL, that endpoint serves one consumer at a time, and
-    # it is fed by LMS's own songStreamController - which _Stream closes as
-    # soon as it opens the next one.  Two items pointing at it would tear the
-    # track that is playing, so the track is HELD and loaded the ordinary way.
+    # TIER 4 CANNOT RIDE HQPLAYER'S PLAYLIST, even though its urls ARE unique.
+    # A client has ONE streamingsocket and one songStreamController, so
+    # appending would move LMS on to the next song's source while HQPlayer is
+    # still pulling this one down the socket - the rest of the playing track
+    # would arrive as the start of the next.  So it is HELD and loaded the
+    # ordinary way.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:ef', 'paddr', 1.0, undef, 12, undef);
     $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
@@ -1219,7 +1225,7 @@ print "-- gapless: the guards --\n";
     status( $gp, 2, $u1, 1, 1 );
 
     # A LOCAL file of any format is tier 3 now (LMS transcodes it on a
-    # path-only url), so only a genuinely REMOTE track reaches tier 2 - it is
+    # path-only url), so only a genuinely REMOTE track reaches tier 4 - it is
     # the one case with no file to serve.
     my $remote = FakeSong->new( FakeTrack->new(
         { title=>'Streamed', id=>-94543041325440, ct=>'flc', secs=>200,
@@ -1230,7 +1236,7 @@ print "-- gapless: the guards --\n";
     $gc->{playing} = 1;
     $gp->play({ controller => $gc });
 
-    is( scalar(@sent), '0', 'a tier 2 next track is NOT pre-queued - nothing is sent' );
+    is( scalar(@sent), '0', 'a tier 4 next track is NOT pre-queued - nothing is sent' );
     is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'it is held for a normal load instead' );
     is( $gp->hqTier, '1', "and the PLAYING track's tier is left alone" );
 

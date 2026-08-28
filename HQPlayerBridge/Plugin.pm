@@ -35,6 +35,7 @@ use Slim::Display::NoDisplay;
 use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Discovery;
 use Plugins::HQPlayerBridge::Player;
+use Plugins::HQPlayerBridge::Stream;
 use Plugins::HQPlayerBridge::UPnP;
 
 # The version is READ from install.xml, never restated here.  A second copy is
@@ -75,6 +76,10 @@ sub initPlugin {
         require Plugins::HQPlayerBridge::Settings;
         Plugins::HQPlayerBridge::Settings->new;
     }
+
+    # The tier 4 audio endpoint.  Registered before discovery so that a player
+    # created by the very first probe reply already has somewhere to point.
+    Plugins::HQPlayerBridge::Stream->init;
 
     Plugins::HQPlayerBridge::Discovery->start( \&_onInstances );
 

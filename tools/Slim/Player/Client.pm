@@ -5,10 +5,24 @@ use Slim::Utils::Accessor;
 __PACKAGE__->mk_accessor('rw', qw(
     id macaddress paddr revision deviceid uuid tcpsock udpsock
     display controller name songElapsedSeconds streamingsocket
-    bufferReady readyToStream _tempVolume
+    bufferReady readyToStream _tempVolume chunks
 ));
-sub new { my $class = shift; my $c = $class->SUPER::new; $c->id($_[0]); return $c }
+# The tier 4 endpoint resolves a url token by scanning the client list, so the
+# stub has to have one.
+our @REGISTRY;
+
+sub new { my $class = shift; my $c = $class->SUPER::new; $c->id($_[0]); $c->chunks([]); push @REGISTRY, $c; return $c }
 sub init {}
+
+sub clients { return @REGISTRY }
+
+# The real one delegates to Slim::Player::Source::nextChunk; the tier 4 tests
+# only care that an override can see what it returns.  NOTE the client is a
+# blessed ARRAY, so this cannot be stashed on the object.
+our $NEXT_CHUNK;
+sub nextChunk { return $NEXT_CHUNK }
+sub getClient { my $id = shift; for (@REGISTRY) { return $_ if $_->id eq $id } return undef }
+sub _resetRegistry { @REGISTRY = () }
 sub execute {}
 sub forgetClient {}
 

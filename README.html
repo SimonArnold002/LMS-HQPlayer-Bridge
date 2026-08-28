@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
   <div class="badges">
-    <span class="badge accent">v0.2.23</span>
+    <span class="badge accent">v0.2.27</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No audio through the plugin</span>
@@ -190,7 +190,8 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <p>A library track HQPlayer can decode is handed over as <strong>the original file</strong>, byte for byte — FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg, including native DSD. Nothing is re-encoded, and nothing about your files needs to match between the two machines: everything is addressed by URL, never by filesystem path.</p>
 <p>HQPlayer has no decoder for <strong>ALAC, AAC or anything else in an MP4/M4A container</strong>, so those don't go over as files — LMS transcodes them instead, the same way it would for any other player. You don't have to do anything; the plugin checks the format and picks the route.</p>
 <h3>Streaming services and radio</h3>
-<p>Qobuz, Tidal, Deezer, internet radio and everything else remote is streamed through LMS, which transcodes as needed (FLAC first, so usually there's no transcoding at all). The service plugin handles its own authentication as usual — the HQPlayer player looks like any other player to it.</p>
+<p>Qobuz, Tidal, Deezer, internet radio and everything else remote is streamed through LMS, which transcodes as needed (FLAC first, so usually there's no transcoding at all — a 24/96 Qobuz track reaches HQPlayer at full rate). The service plugin handles its own authentication as usual — the HQPlayer player looks like any other player to it.</p>
+<p>These are the one case with no file to hand over, so the plugin serves the audio itself on a plain path of its own. That is not a detail you have to care about, with one consequence you might notice: see the note on gapless below.</p>
 <p>Artwork works here too: the cover comes from the service via LMS's image proxy and is passed on to HQPlayer.</p>
 <h3>Volume</h3>
 <p>HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.</p>
@@ -208,7 +209,7 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 </li>
 <li><strong>A silent output-format mismatch is HQPlayer's to report, not the plugin's.</strong> If HQPlayer's output format is set to something your endpoint can't accept, it reports itself as playing and answers every command normally while rendering nothing at all. There's no way to detect that from the control API — the evidence is only in HQPlayer's own log (<code>NAA output requested format not available!</code>). If a track looks like it's playing but you hear nothing, check the output format there first.
 </li>
-<li><strong>Streaming services don't play yet.</strong> Qobuz, Tidal, Deezer and radio are not working. The cause is now known and it's a narrow one: <strong>HQPlayer won't fetch a URL that contains a <code>?</code></strong>, and the URL LMS serves a remote track on is <code>/stream.mp3?player=…</code>. HQPlayer accepts the track, answers OK, and then simply never requests it. The fix is an endpoint the plugin serves on a plain path, which is the next thing being built. Your local library is unaffected.
+<li><strong>Streaming services play, but without gapless.</strong> Qobuz, Tidal, Deezer and radio are served on a path of the plugin's own, because HQPlayer won't fetch a URL containing a <code>?</code> and the URL LMS gives a remote track is <code>/stream.mp3?player=…</code>. Unlike a local file, that audio passes through LMS, and a player has only one such stream at a time — so the next track can't be handed over early, and there's a short gap between streaming tracks. Local files are unaffected and stay gapless.
 </li>
 <li><strong>Gapless on your local library.</strong> The next track is handed to HQPlayer's own playlist while the current one is still playing, so HQPlayer makes the transition itself with no gap at all. A <strong>sample rate change</strong> between tracks is the one exception — HQPlayer needs a couple of seconds to retune its output, and no bridge can avoid that.
 </li>
