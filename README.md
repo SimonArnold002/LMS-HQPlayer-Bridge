@@ -72,10 +72,9 @@ LMS and HQPlayer are both *pull* engines: each is used to being handed a URL and
 
 That's the whole reason there's no buffer to tune, no transcoder to configure and no helper process to keep alive.
 
-Two connections are used, because each does something the other can't:
+Everything goes over **HQPlayer's own XML control API**: the track and its URL, the title, artist and album, the **cover art**, transport, volume, and a status stream coming back about once a second that drives the progress bar, the play/pause state and the volume slider.
 
-- **HQPlayer's XML control API** carries transport and state. It pushes a status message about once a second, which is what drives the progress bar, the play/pause state and the volume slider.
-- **HQPlayer's UPnP renderer** carries the track — its URL, title, artist, album and **cover art**. Over the control API, HQPlayer labels anything arriving over HTTP as *"HTTP stream"* and ignores track details, so artwork would never reach the endpoint's display. Over UPnP it accepts all of it, and re-serves the cover from its own web server, which is where an endpoint's screen looks for it.
+One thing still uses HQPlayer's UPnP renderer, and only at connect: reading the **volume range**. The control API can set a level but has no way to report what the range is, and the range is a setting whose top and bottom can both move.
 
 ### Playing your library
 
@@ -93,7 +92,7 @@ Artwork works here too: the cover comes from the service via LMS's image proxy a
 
 HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.
 
-**One LMS step is one dB**, with LMS 100 being 0 dB. That's the same mapping HQPlayer's UPnP endpoint applied to the 0–100 it received, so if you're coming from the UPnP bridge the slider behaves as it did before.
+**One LMS step is one dB**, with LMS 100 being 0 dB — the same mapping HQPlayer applies to the 0–100 its UPnP endpoint receives, so if you're coming from the UPnP bridge the slider behaves as it did before. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled, and a fixed-volume HQPlayer shows as 100 and locked.
 
 ### Pause from either end
 
@@ -112,6 +111,7 @@ It reports HQPlayer's **transport id** rather than your endpoint's name. HQPlaye
 - **The player shows as present even when HQPlayer isn't reachable.** An HQPlayer instance that's discovered but currently off is a normal state, and tying the LMS player's presence to the control link would have LMS churning prefs and sync groups every time it went away.
 - **A silent output-format mismatch is HQPlayer's to report, not the plugin's.** If HQPlayer's output format is set to something your endpoint can't accept, it reports itself as playing and answers every command normally while rendering nothing at all. There's no way to detect that from the control API — the evidence is only in HQPlayer's own log (`NAA output requested format not available!`). If a track looks like it's playing but you hear nothing, check the output format there first.
 - **Not gapless.** The next track is handed over when the current one ends, so there's a brief gap between tracks. Pre-queuing isn't implemented.
+- **HQPlayer's repeat setting is turned off while the bridge is connected.** LMS owns the queue, so the plugin hands HQPlayer one track at a time and needs to see it end in order to send the next. With repeat on, HQPlayer loops that single track instead and the queue never advances — so the plugin asserts repeat off whenever the control link comes up. Set repeat and shuffle in LMS, as you would for any other player.
 - **HQPlayer's DSP settings aren't exposed.** Filter, shaper, modulator, output mode and rate are set in HQPlayer, as before — the plugin doesn't change them and can't select them.
 - **HQPlayer's own library isn't browsed.** Music comes from LMS; this plugin makes HQPlayer a destination, not a source.
 - **Multi-room sync with hardware players is untested.** The player registers as a normal LMS player, so nothing blocks it, but it hasn't been verified and a bridged player can't be sample-accurate with a Squeezebox.

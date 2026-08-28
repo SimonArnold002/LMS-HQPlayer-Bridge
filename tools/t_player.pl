@@ -83,18 +83,30 @@ print "-- DIDL-Lite metadata (the only channel that reaches HQPlayer) --\n";
 }
 my $tr = FakeTrack->new({ title=>'Colony & "Collapse"', artist=>'Johanna <Warren>',
     album=>'Gemini I', coverid=>'abc123', id=>447812, secs=>107, ct=>'flc' });
-my $didl = $c->_didl( FakeSong->new($tr), 'http://lms:9000/music/447812/download.flac', 'audio/x-flac' );
+my $meta = $c->_metadata( FakeSong->new($tr) );
 
-ok($didl =~ /<DIDL-Lite\b/ && $didl =~ m{</DIDL-Lite>$}, 'DIDL is a complete document');
-ok($didl =~ m{<dc:title>Colony &amp; &quot;Collapse&quot;</dc:title>}, 'title is XML-escaped');
-ok($didl =~ m{<upnp:artist>Johanna &lt;Warren&gt;</upnp:artist>}, 'artist is XML-escaped');
-ok($didl =~ m{<dc:creator>Johanna &lt;Warren&gt;</dc:creator>}, 'dc:creator mirrors artist');
-ok($didl =~ m{<upnp:album>Gemini I</upnp:album>}, 'album present');
-ok($didl =~ m{<upnp:albumArtURI>[^<]*/music/abc123/cover\.jpg</upnp:albumArtURI>},
-   'albumArtURI points at the LMS cover - this is what lights up the endpoint');
+ok(scalar($meta =~ /^<metadata\b/) && scalar($meta =~ m{/>$}), 'metadata is a complete element');
+ok(scalar($meta =~ m{\bsong="Colony &amp; &quot;Collapse&quot;"}), 'song is XML-escaped');
+ok(scalar($meta =~ m{\bartist="Johanna &lt;Warren&gt;"}), 'artist is XML-escaped');
+ok(scalar($meta =~ m{\balbum="Gemini I"}), 'album present');
+ok(scalar($meta =~ m{\bcover="[^"]*/music/abc123/cover\.jpg"}),
+   'cover points at the LMS cover - this is what lights up the endpoint');
+
+# THE regression guard for 2026-08-28.  HQPlayer base64-encodes the cover URL
+# into the playlist item's `picture` field ITSELF; handing it base64 gets that
+# base64 encoded a second time and the endpoint shows nothing.  Verified live
+# against engine 6.0.4: a plain URL in `cover` reproduces the DIDL path
+# byte-for-byte.
+ok(scalar($meta =~ m{\bcover="https?://}), 'cover is a PLAIN url - never pre-encoded');
+
+# The field is `cover`.  picture=/albumArtURI=/art= and a <picture> child were
+# all tested against the live daemon and are silently ignored.
+ok(scalar($meta !~ m{\bpicture=}) && scalar($meta !~ m{albumArtURI}),
+   'artwork goes in cover=, not the fields HQPlayer ignores');
+
 # proxiedImage on a LOCAL path returns the "no artwork" placeholder, not the
 # cover. That produced a blank icon on the endpoint; it must never come back.
-ok($didl !~ m{/imageproxy/}, 'local cover URL is direct, NOT wrapped in the image proxy');
+ok(scalar($meta !~ m{/imageproxy/}), 'local cover URL is direct, NOT wrapped in the image proxy');
 
 print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
 {
@@ -123,17 +135,14 @@ Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerAbs');
 is($c->_coverURL($remote), 'https://static.qobuz.com/direct.jpg', 'an absolute handler URL is passed through unchanged');
 
 Slim::Player::ProtocolHandlers->_setTestHandler(undef);
-is($c->_coverURL($remote), '(undef)', 'no handler artwork -> no albumArtURI rather than a bad one');
-ok($didl =~ m{protocolInfo="http-get:\*:audio/x-flac:\*"}, 'res protocolInfo carries the real mime');
-ok($didl =~ m{duration="0:01:47"}, 'duration formatted as H:MM:SS');
-ok($didl !~ /<upnp:albumArtURI></, 'no empty albumArtURI element');
+is($c->_coverURL($remote), '(undef)', 'no handler artwork -> no cover attribute rather than a bad one');
 
-# a track with nothing set must still yield valid DIDL, not broken XML
+# a track with nothing set must still yield a valid element, not broken XML
 my $bare = FakeTrack->new({ title=>'X', id=>1, ct=>'flc' });
-my $d2 = $c->_didl( FakeSong->new($bare), 'http://lms/x.flac', undef );
-ok($d2 =~ m{</DIDL-Lite>$}, 'bare track still yields a complete document');
-ok($d2 !~ /<upnp:artist>/ && $d2 !~ /<upnp:album>/, 'absent fields are omitted, not emitted empty');
-ok($d2 =~ m{protocolInfo="http-get:\*:\*:\*"}, 'unknown mime falls back to a wildcard');
+my $m2 = $c->_metadata( FakeSong->new($bare) );
+ok(scalar($m2 =~ m{^<metadata\b}) && scalar($m2 =~ m{/>$}), 'bare track still yields a complete element');
+ok(scalar($m2 !~ /\bartist=/) && scalar($m2 !~ /\balbum=/), 'absent fields are omitted, not emitted empty');
+ok(scalar($m2 !~ /\bcover=""/), 'a missing cover is omitted rather than sent empty');
 
 
 # ---------------------------------------------------------------------------
@@ -249,9 +258,32 @@ print "-- two-way transport --\n";
 }
 
 my @sent;
+# Loading a track is now two commands on the control socket, each with a
+# callback, so the mock has to hold the callbacks for the test to answer -
+# @sentCb is the reply the daemon has not sent yet.
+my @sentCb;
+# TRAP THIS MOCK ONCE HID: Control::send's callback contract is ($attrs, $raw).
+# $raw is the RAW REPLY on success as well as on failure - it is never an error
+# string - and failure is $attrs being undef.  This mock used to pass '' as the
+# second argument, so a callback that read it as ($res, $err) and tested $err
+# passed every test here and then reported every SUCCESSFUL PlaylistAdd as
+# "HQPlayer would not accept the track URI" on the live daemon, one
+# PROBLEM_OPENING per track, playing nothing.  Answer the way Control.pm does.
+sub _answer {           # answer the oldest outstanding command, OK unless told
+    my $ok = @_ ? shift : 1;
+    my $cb = shift @sentCb or return 0;
+    my $raw = '<?xml version="1.0" encoding="utf-8"?><PlaylistAdd result="'
+            . ( $ok ? 'OK' : 'Error' ) . '"/>';
+    $cb->( $ok ? { result => 'OK' } : undef, $raw );
+    return 1;
+}
 {
     no warnings 'redefine';
-    *Plugins::HQPlayerBridge::Player::_send      = sub { push @sent, $_[1] };
+    *Plugins::HQPlayerBridge::Player::_send      = sub {
+        push @sent, $_[1];
+        push @sentCb, $_[2] if $_[2];
+        return;
+    };
     *Plugins::HQPlayerBridge::Player::_startPolling = sub {};
     *Plugins::HQPlayerBridge::Player::_stopPolling  = sub {};
 }
@@ -504,6 +536,7 @@ print "-- track changes --\n";
     sub setURI {
         my ( $s, $url, $didl, $cb ) = @_;
         push @{ $s->{uris} }, $url;
+        $s->{didl}  = $didl;
         $s->{uriCb} = $cb;
     }
     sub playWhenReady { $_[1] and $_[0]->{playCb} = $_[1] }
@@ -530,6 +563,9 @@ my $two = FakeSong->new( FakeTrack->new({ title=>'Two', id=>202, ct=>'flc', secs
 
 my $p = Plugins::HQPlayerBridge::Player->new('02:11:22:33:44:55', 'paddr', 1.0, undef, 12, undef);
 $p->hqUPnP($up);
+# _queueTrack refuses to load without a control link now that the load runs on
+# it.  _send itself is mocked above, so this only has to be present and true.
+$p->hqControl( bless {}, 'FakeCtl' );
 my $lc = LoadController->new($one);
 $p->controller($lc);
 
@@ -543,10 +579,41 @@ sub status {
     return;
 }
 
-@sent = ();
+@sent = (); @sentCb = ();
 $p->play({ controller => $lc });
-my $url1 = $up->{uris}->[0];
+
+my ($addCmd) = grep { /^<PlaylistAdd\b/ } @sent;
+my ($url1)   = $addCmd ? $addCmd =~ m{\buri="([^"]+)"} : ();
+
 ok($url1 && $url1 =~ m{/music/101/download\.flac}, 'play() hands HQPlayer the tier-1 URL');
+
+# THE ORDER IS THE FIX.  Splitting the load across two channels - <Stop/> on
+# the control socket, SetAVTransportURI/Play over UPnP - meant a Stop for the
+# OLD track could land after the Play for the new one, because a control
+# command answers in ~9-150ms and a UPnP round trip in 300-550ms.  HQPlayer's
+# AVTransport never saw a Stop at all, so the engine's playlist was emptied
+# underneath a renderer that still thought it was playing: that is
+# clPlaylist::GetAlbumGain(): trackn > last, the fatal that killed hqplayerd
+# whenever an album was loaded over a playing one.  One socket, one order.
+is(join(',', grep { !/^<Seek/ } @sent),
+   '<Stop/>,<PlaylistClear/>,' . $addCmd,
+   'the load opens with three ordered commands on the control socket');
+
+# <Play/> is deliberately NOT sent yet: it is chained off PlaylistAdd's reply,
+# so HQPlayer can never be told to play a queue it has not confirmed loading.
+ok(scalar(!grep { $_ eq '<Play/>' } @sent), 'and Play waits for PlaylistAdd to be acknowledged');
+
+# TRAP: clear="1" is IGNORED by engine 6.0.4 - PlaylistAdd answers OK and
+# APPENDS anyway, which is why the explicit <PlaylistClear/> above is load
+# bearing.  The attribute is still sent as the documented spelling.
+ok(scalar($addCmd =~ m{\bclear="1"}), 'PlaylistAdd still carries the documented clear="1"');
+
+# The artwork lever.  cover= takes a PLAIN url and HQPlayer base64-encodes it
+# into the item's `picture` itself - verified byte-identical to the DIDL path
+# against engine 6.0.4 on 2026-08-28.  picture=/albumArtURI=/art= and a
+# <picture> child are all silently ignored.
+ok(scalar($addCmd =~ m{<metadata\b[^>]*\bcover="https?://[^"]*/cover\.jpg"}),
+   'the load carries <metadata cover="..."> - this is what sets the picture field');
 is($p->hqExpectStop, '1',
    'play() leaves the stop guard ARMED - the stop that ended the previous track is still in flight');
 is($p->hqPlayAck, '0', 'and the track is not acknowledged until HQPlayer accepts Play');
@@ -570,10 +637,23 @@ status($p, 0, undef, 0);
 is(scalar(@{$lc->{calls}}), '0',
    'our own stop, arriving during the load, is NOT reported as end-of-track');
 
-# HQPlayer accepts the track and starts playing it
-$up->finishURI;
-$up->finishPlay;
+# HQPlayer accepts the track and starts playing it: PlaylistAdd answers, which
+# sends <Play/>, and then Play answers.
+$lc->{calls} = [];
+_answer();      # PlaylistAdd -> OK
+ok(scalar(grep { $_ eq '<Play/>' } @sent), 'PlaylistAdd acknowledged -> Play follows, in order');
+
+# A SUCCESSFUL reply must never be read as a failure.  0.2.13 shipped reading
+# the callback's second argument as an error - it is the raw reply, present on
+# success too - so every load reported PROBLEM_OPENING, LMS skipped to the next
+# track, and the player raced the whole playlist without playing anything.
+ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$lc->{calls}}),
+   'an OK PlaylistAdd is NOT reported as a failed load');
+
+_answer();      # Play        -> OK
 is($p->hqPlayAck, '1', 'Play accepted -> the track is acknowledged');
+ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$lc->{calls}}),
+   'nor is an OK Play');
 is($p->bufferReady, '1', 'and the buffer is asserted for the controller');
 
 $lc->{calls} = [];
@@ -588,6 +668,27 @@ $lc->{calls} = [];
 status($p, 0, $url1, 200);
 is(join(',', @{$lc->{calls}}), 'playerEndOfStream,playerReadyToStream,playerStopped',
    'HQPlayer stopping on its own IS end-of-track');
+
+print "-- a load that genuinely fails --\n";
+{
+    # The other half of the contract: $attrs undef IS the failure, and it must
+    # still reach the controller.  Without this the guard above could simply be
+    # inverted and both would pass.
+    my $fp = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:55', 'paddr', 1.0, undef, 12, undef);
+    $fp->hqUPnP( LoadUPnP->new );
+    $fp->hqControl( bless {}, 'FakeCtl' );
+    my $fc = LoadController->new($one);
+    $fp->controller($fc);
+
+    @sent = (); @sentCb = ();
+    $fp->play({ controller => $fc });
+    $fc->{calls} = [];
+    _answer(0);     # PlaylistAdd -> Error
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$fc->{calls}}),
+       'a rejected PlaylistAdd IS reported as a failed load');
+    ok(scalar(!grep { $_ eq '<Play/>' } @sent),
+       'and Play is never sent for a track HQPlayer refused');
+}
 
 print "-- a load superseded mid-flight --\n";
 # skip: play track two, then stop before HQPlayer has answered
@@ -643,6 +744,56 @@ $c->fade_volume(-0.3125, sub { });
 is(Slim::Utils::Timers::_pending(), '0', 'a new fade cancels the pending one');
 Slim::Utils::Timers::_fireAll();
 is($stopped, '0', 'so the superseded fade never fires');
+
+print "-- repeat must be OFF, or the player can never advance --\n";
+# This shipped the other way round for one build.  <SetRepeat value="1"/> was
+# added to stop HQPlayer walking off the end of a one-entry playlist
+# (clPlaylist::GetAlbumGain(): trackn > last, unhandled, kills the daemon) -
+# but with repeat ON the playlist never ends, `state` never reaches 0,
+# end-of-track is never reported, and a full LMS queue plays its FIRST TRACK
+# forever.  Verified live 2026-08-28: with repeat OFF a complete track ends at
+# state 0, the daemon survives, and LMS advances by itself.  The overrun needed
+# the old two-channel load, which no longer exists.
+{
+    my @sent;
+    no warnings 'redefine';
+    local *Plugins::HQPlayerBridge::Player::_send = sub { push @sent, $_[1] };
+
+    $c->assertRepeatOff;
+    is(scalar(@sent), '1', 'assertRepeatOff sends exactly one command');
+    is($sent[0], '<SetRepeat value="0"/>', 'it is <SetRepeat value="0"/>, NOT value="1"');
+}
+# The whitelist gates what can reach the wire at all - a verb missing from it
+# is dropped before it is sent, silently.
+ok(do { open my $fh,'<','../HQPlayerBridge/Control.pm'; local $/; <$fh> } =~ /\bSetRepeat\b/,
+   'SetRepeat is in Control.pm\'s %KNOWN, or the guard never leaves the plugin');
+
+print "-- bitrate limit: the difference between FLAC and MP3 --\n";
+# LMS caps an unset maxBitrate at 320kbps for anything that is not a
+# Squeezebox, which silently transcodes every streamed track to MP3.  The pref
+# must end up 0, and ONLY when the user has never chosen one.
+{
+    my $sp = Slim::Utils::Prefs::preferences('server');
+
+    my $fresh = Plugins::HQPlayerBridge::Player->new('02:ab:88:42:4c:70', 'paddr', 1.0, undef, 12, undef);
+    my $cp    = $sp->client($fresh);
+
+    is($cp->get('maxBitrate'), '(undef)', 'a new player starts with no bitrate limit set');
+    is($fresh->initBitrateLimit, '1', 'initBitrateLimit acts when the pref is unset');
+    is($cp->get('maxBitrate'), '0', 'and sets it to 0 - unlimited, so LMS streams FLAC');
+
+    # TRAP: 0 is a real choice and is NOT undef.  Re-running must not treat an
+    # already-set 0 as "never set" and must stay idempotent.
+    is(scalar($fresh->initBitrateLimit), '(undef)', 'running it again does nothing');
+    is($cp->get('maxBitrate'), '0', 'and leaves the value alone');
+
+    # A deliberate user limit is theirs, not ours to overwrite.
+    my $chosen = Plugins::HQPlayerBridge::Player->new('02:ab:88:42:4c:71', 'paddr', 1.0, undef, 12, undef);
+    my $cp2    = $sp->client($chosen);
+    $cp2->set('maxBitrate', 320);
+    is(scalar($chosen->initBitrateLimit), '(undef)', 'a chosen limit is not overridden');
+    is($cp2->get('maxBitrate'), '320', 'and survives untouched');
+}
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

@@ -73,17 +73,11 @@ my %HQP_PLAYS = map { $_ => 1 } qw(
 # extension still matters to LMS itself: downloadMusicFile only transcodes when
 # the resolved type differs from the track's own, so a truthful extension keeps
 # it a byte-for-byte passthrough.
-# HQPlayer decides by Content-Type, but the DIDL <res protocolInfo> should
-# still be truthful.
-my %MIME_FOR_TYPE = (
-    flc => 'audio/x-flac',  flac => 'audio/x-flac',
-    wav => 'audio/x-wav',   aif  => 'audio/x-aiff',  aiff => 'audio/x-aiff',
-    dsf => 'audio/x-dsf',   dff  => 'audio/x-dff',
-    wvp => 'audio/x-wv',    wv   => 'audio/x-wv',
-    mp3 => 'audio/mpeg',    mp2  => 'audio/mpeg',
-    ogg => 'audio/ogg',     ogf  => 'audio/ogg',
-);
-
+#
+# There is no MIME table any more.  It existed to fill the DIDL's
+# <res protocolInfo>, and the load no longer goes over UPnP; HQPlayer decides
+# by Content-Type and reports what it found back on the playlist item's own
+# `mime` attribute (audio/x-flac, confirmed live).
 my %EXT_FOR_TYPE = (
     flc => 'flac',
     aif => 'aiff',
@@ -119,6 +113,44 @@ sub modelName { 'HQPlayer' }
 sub formats   { qw(flc pcm aif mp3) }   # order is LMS's preference order
 
 sub maxSupportedSamplerate { 768000 }
+
+# TRAP: declaring flc first is NOT enough to be sent FLAC.
+#
+# Slim::Utils::Prefs::maxRate applies a bitrate cap when the maxBitrate client
+# pref has never been set, and its default is by player family: wired
+# Squeezeboxen and all SB2s get 0 (no limit), and EVERY OTHER PLAYER gets
+# 320kbps.  This player is deliberately a Slim::Player::Player subclass rather
+# than a Squeezebox (see the note on that choice above), so it lands in "every
+# other player" and LMS transcodes to MP3 to fit the cap - a 750kbps Qobuz FLAC
+# arrives at HQPlayer as MP3 320, and any tag the original carried, replaygain
+# included, is gone with it.  VERIFIED against the live server 2026-08-28: with
+# the pref unset the stream is MP3, and with it 0 the same endpoint answers
+# Content-Type: audio/x-flac and a body starting `fLaC` + STREAMINFO.
+#
+# This is invisible in tier 1, which is a plain file download and never goes
+# near the cap - which is why local playback always sounded right and only
+# streaming was quietly downgraded.
+#
+# philippe_44's bridges do not need this: their players connect over slimproto,
+# so LMS builds them as Squeezebox2 subclasses and the default gives them no
+# limit for free.  We have to ask.
+#
+# Only when the pref has never been set.  A user who has deliberately chosen a
+# limit owns that choice, and undef is exactly LMS's own "not been set yet".
+sub initBitrateLimit {
+    my $self = shift;
+
+    my $cprefs = $serverPrefs->client($self);
+
+    return if defined $cprefs->get('maxBitrate');
+
+    $cprefs->set( 'maxBitrate', 0 );
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': no bitrate limit was set - defaulting to unlimited, so LMS streams FLAC rather than transcoding to MP3' );
+
+    return 1;
+}
 
 sub isPlayer          { 1 }
 # Volume is shared with HQPlayer rather than owned by either side - see the
@@ -231,45 +263,59 @@ sub _resolveURL {
     return $url;
 }
 
-# Build the DIDL-Lite that rides along with SetAVTransportURI.
+# Build the <metadata/> child that rides along with PlaylistAdd.
 #
-# This is the ONLY way metadata reaches HQPlayer.  Over the XML control API it
-# labels any http source "HTTP stream" and ignores title/artist/album/song
-# attributes outright; via UPnP it honours all of them, and it re-serves
-# <upnp:albumArtURI> from its own web server at /cover/current - which is where
-# an endpoint's display picks the cover up.  That is what the squeeze2upnp
-# bridge was doing, and why artwork appeared there and not here.
-sub _didl {
-    my ( $self, $song, $url, $mime ) = @_;
+# PlaylistAdd is written as an open/close pair rather than self-closing because
+# it HAS a body, and that body is where metadata goes.  This was missed for a
+# long time: probing the attributes of PlaylistAdd itself found nothing, so the
+# load was routed over UPnP for months on the belief that DIDL was the only
+# channel that could carry a cover.  It is not.
+#
+# THE ARTWORK FIELD IS `cover`, AND IT TAKES A PLAIN URL.  Verified against the
+# live daemon (engine 6.0.4) on 2026-08-28 by writing an item both ways and
+# reading it back with <PlaylistGet picture="1"/>.  The two are byte-identical:
+#
+#   <metadata cover="http://.../cover.jpg"/>   -> cover="http://.../cover.jpg"
+#   SetAVTransportURI + <upnp:albumArtURI>     -> cover="http://.../cover.jpg"
+#
+#   both -> picture="aHR0cDovLzE5Mi4xNjguMS4yMzQ6OTAwMC9tdXNpYy81MTQ0NjFjZS9jb3Zlci5qcGc="
+#
+# HQPlayer base64-encodes the URL into `picture` ITSELF.  Handing it base64
+# gets that base64 encoded a second time (68 chars in, 92 chars back), so pass
+# the URL exactly as it is.
+#
+# These were all tested and DO NOT work - do not re-test them:
+#
+#   picture="<url>"  picture="<base64 url>"  albumArtURI="..."  art="..."
+#   a <picture> child element inside <metadata>
+#
+# song/artist/album are merged with, not overridden by, HQPlayer's own tag
+# decode: it fills in albumartist, date, bitrate and bits from the file while
+# keeping the three fields set here.  The item also carries album_artist, date,
+# genre, composer and performer if there is ever a reason to set them.
+sub _metadata {
+    my ( $self, $song ) = @_;
 
-    my $track = eval { $song->currentTrack() } or return '';
+    my $track = eval { $song->currentTrack() } or return '<metadata/>';
     my $e = \&Plugins::HQPlayerBridge::Control::escape;
 
-    my $title  = eval { $track->title }      || '';
-    my $artist = eval { $track->artistName } || '';
-    my $album  = eval { $track->albumname }  || '';
-    my $art    = $self->_coverURL($track);
-    my $secs   = eval { $track->secs };
+    # Deliberately the same four fields the DIDL carried, and no more: this is
+    # the set that was proven equivalent end to end.
+    my @f = (
+        song   => eval { $track->title }      || '',
+        artist => eval { $track->artistName } || '',
+        album  => eval { $track->albumname }  || '',
+        cover  => $self->_coverURL($track)    || '',
+    );
 
-    my $didl =
-        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"'
-      . ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
-      . ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
-      . '<item id="1" parentID="0" restricted="1">'
-      . '<dc:title>' . $e->($title) . '</dc:title>';
+    my $meta = '<metadata';
 
-    $didl .= '<upnp:artist>' . $e->($artist) . '</upnp:artist>'
-           . '<dc:creator>'  . $e->($artist) . '</dc:creator>' if $artist ne '';
-    $didl .= '<upnp:album>'  . $e->($album)  . '</upnp:album>'  if $album  ne '';
-    $didl .= '<upnp:albumArtURI>' . $e->($art) . '</upnp:albumArtURI>' if $art;
+    while ( my ( $k, $v ) = splice( @f, 0, 2 ) ) {
+        next if $v eq '';
+        $meta .= ' ' . $k . '="' . $e->($v) . '"';
+    }
 
-    $didl .= '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
-           . '<res protocolInfo="http-get:*:' . ( $mime || '*' ) . ':*"'
-           . ( $secs ? ' duration="' . sprintf( '%d:%02d:%02d', int($secs/3600), int($secs/60)%60, int($secs)%60 ) . '"' : '' )
-           . '>' . $e->($url) . '</res>'
-           . '</item></DIDL-Lite>';
-
-    return $didl;
+    return $meta . '/>';
 }
 
 sub _coverURL {
@@ -316,8 +362,11 @@ sub _coverURL {
 
 # Everything that loads a track is asynchronous, so a transport command has to
 # invalidate whatever the previous one left in flight.  Bumping the generation
-# makes every outstanding callback recognise itself as superseded, and
-# cancelPlay stops the UPnP Play retry loop from firing after the fact.
+# makes every outstanding callback recognise itself as superseded.
+#
+# cancelPlay is still called even though the load no longer runs over UPnP: the
+# renderer keeps its own Play retry timer, and a describe that raced a teardown
+# could still have one armed.  It is a counter bump, so it costs nothing.
 sub _newGeneration {
     my $self = shift;
 
@@ -354,7 +403,7 @@ sub play {
     my $url = $self->_resolveURL($song);
 
     # A new track generation.  Loading a track is several async round trips
-    # (SetAVTransportURI, then Play with retries), and a stop or a skip during
+    # (Stop, PlaylistClear, PlaylistAdd, then Play), and a stop or a skip during
     # that window must not let the PREVIOUS track's completion callback land on
     # this one - it would re-assert bufferReady and apply the old track's seek.
     # Every callback below is stamped with the generation it started in.
@@ -396,43 +445,86 @@ sub play {
     return 1;
 }
 
+# The whole load runs on the XML control socket.  Nothing here touches UPnP.
+#
+# THE ORDER IS THE POINT.  Four commands, one socket, each queued behind the
+# last: Stop, PlaylistClear, PlaylistAdd, Play.  The load used to be split
+# across two channels - <Stop/> on the control socket while
+# SetAVTransportURI/Play went over UPnP - and they could not be ordered against
+# each other.  A control command answers in ~9-150ms and a UPnP round trip in
+# 300-550ms, so a Stop meant for the OLD track could land after the Play for
+# the new one and kill it, and HQPlayer's AVTransport never saw a Stop at all:
+# from the renderer's side the transport went straight from PLAYING into
+# SetAVTransportURI while the XML Stop emptied the engine's playlist underneath
+# it.  That is the shape of `clPlaylist::GetAlbumGain(): trackn > last`, the
+# fatal that took hqplayerd down whenever an album was loaded over a playing
+# one.  On one socket the reordering is not possible.
+#
+# Verified against the live daemon (engine 6.0.4) on 2026-08-28: this exact
+# sequence run five times in rapid succession over a playing track swapped
+# cleanly every time, with the right metadata, and the daemon survived.
+#
+# TRAP: `clear="1"` ON PlaylistAdd IS IGNORED.  It is in the documented
+# attribute set and PlaylistAdd answers result="OK", but the item is APPENDED -
+# a swap over a playing track left a two-item playlist with the engine still on
+# item 1.  The explicit <PlaylistClear/> is what actually empties it, and it is
+# safe during playback: HQPlayer keeps the currently playing item and drops the
+# rest.  The attribute is still sent, because it is the documented spelling and
+# costs nothing if a later engine starts honouring it.
+#
+# TRAP: <Stop/> IS REQUIRED FIRST.  PlaylistClear leaves the current track
+# playing, so a following Play is a no-op on an already-playing engine and the
+# new track never starts.
 sub _queueTrack {
     my ( $self, $url, $song, $seek ) = @_;
 
-    my $upnp = $self->hqUPnP;
-
-    if ( !$upnp || !$upnp->ready ) {
-        $log->error( $self->name . ': UPnP renderer not ready - cannot start playback' );
+    if ( !$self->hqControl ) {
+        $log->error( $self->name . ': no control link - cannot start playback' );
         my $c = $self->controller;
         $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
         return;
     }
 
-    my $track = eval { $song->currentTrack() };
-    my $ct    = $track ? ( eval { $track->content_type } || '' ) : '';
-    my $mime  = ( $self->hqTier || 0 ) == 1 ? $MIME_FOR_TYPE{$ct} : undef;
-
-    my $didl = $self->_didl( $song, $url, $mime );
+    my $e    = \&Plugins::HQPlayerBridge::Control::escape;
+    my $meta = $self->_metadata($song);
 
     # The generation this load belongs to - see _newGeneration.
     my $gen = $self->hqGen || 0;
 
-    $upnp->setURI( $url, $didl, sub {
-        my ( $res, $err ) = @_;
+    # Clear the decks.  Both are fire-and-forget: they carry no information
+    # back, and holding the chain up for their replies would only widen the
+    # window in which a skip can arrive.  Ordering is guaranteed by the socket,
+    # not by the callbacks.
+    $self->_send('<Stop/>');
+    $self->_send('<PlaylistClear/>');
 
-        return if $self->_superseded( $gen, 'SetAVTransportURI' );
+    $self->_send(
+        '<PlaylistAdd uri="' . $e->($url) . '" queued="0" clear="1">'
+      . $meta
+      . '</PlaylistAdd>',
+        sub {
+            # TRAP: Control::send's callback is ($attrs, $raw) - the SECOND
+            # argument is the raw reply on success AND on failure, never an
+            # error string.  Failure is the FIRST argument being undef.  Read
+            # it the SimpleAsyncHTTP way, as ($res, $err), and every successful
+            # PlaylistAdd is reported as a failure: 0.2.13 shipped with exactly
+            # that and LMS raced the whole playlist, one PROBLEM_OPENING per
+            # track, playing nothing.
+            my ( $res, $raw ) = @_;
 
-        if ($err) {
-            $log->error( $self->name . ": HQPlayer would not accept the track URI: $err" );
-            my $c = $self->controller;
-            $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
-            return;
-        }
+            return if $self->_superseded( $gen, 'PlaylistAdd' );
 
-        # Play, with retries: HQPlayer needs a moment to fetch and probe the
-        # media after accepting the URI - see playWhenReady in UPnP.pm.
-        $upnp->playWhenReady( sub {
-            my ( $r2, $e2 ) = @_;
+            if ( !$res ) {
+                $log->error( $self->name . ': HQPlayer would not accept the track URI: '
+                    . ( defined $raw ? $raw : 'no reply' ) );
+                my $c = $self->controller;
+                $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+                return;
+            }
+
+        $self->_send( '<Play/>', sub {
+            # ($attrs, $raw) again - see the note on PlaylistAdd above.
+            my ( $r2, $raw2 ) = @_;
 
             # A stop or a skip during the load window supersedes this track.
             # Without this the old track's completion still re-asserts
@@ -440,7 +532,9 @@ sub _queueTrack {
             # whatever is playing now.
             return if $self->_superseded( $gen, 'Play' );
 
-            if ($e2) {
+            if ( !$r2 ) {
+                $log->error( $self->name . ': HQPlayer would not start the track: '
+                    . ( defined $raw2 ? $raw2 : 'no reply' ) );
                 my $c = $self->controller;
                 $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
                 return;
@@ -1280,6 +1374,65 @@ sub songElapsedSeconds {
 # ---------------------------------------------------------------------------
 # One-off queries used by the status page
 # ---------------------------------------------------------------------------
+# Stop HQPlayer walking off the end of its own playlist, because doing so
+# KILLS THE DAEMON.
+#
+# VERIFIED 2026-08-28 from hqplayerd's own log: at the end of a track HQPlayer
+# advances by itself (`Next (0)`), and this bridge keeps its playlist at
+# exactly one entry, so that advance runs past the end.  With the album-gain
+# option on - `playlist_album_gain="1"`, and it is HQPlayer's ONLY replaygain
+# mode, so a user who wants replaygain has it on - the overrun throws
+# `clPlaylist::GetAlbumGain(): trackn > last`, which is UNHANDLED in
+# `clPlayerDaemon::Main()` and takes the process down:
+#
+#   End of track at 185.472/188/2.528
+#   Next  (0)
+#   ! NextNL(): clPlaylist::GetAlbumGain(): trackn > last
+#   ! Main(): Stop(): clPlaylist::GetAlbumGain(): trackn > last
+#   - Server stopping...
+#
+# It fires on a COMPLETE track, not just a truncated one, so it is not a
+# streaming artifact - and from LMS's side it reads as the bridge racing
+# through the playlist, because `state` 0 means both "the engine died" and
+# "end of track".
+#
+# THAT GUARD WAS `<SetRepeat value="1"/>`, AND IT WAS WRONG.  Its own note
+# above asked the right question - whether HQPlayer with repeat on still
+# reports state 0 at the end of a track, or loops and stays at 2 - and shipped
+# without answering it.  It loops.  So the playlist never ended, `state` never
+# reached 0, `_onStatus` never reported end-of-track, and LMS never sent the
+# next track: a full LMS queue played its FIRST TRACK on repeat forever.
+#
+# Repeat is asserted OFF instead.  LMS owns the playlist; HQPlayer is a
+# one-track renderer here, and end-of-track has to be observable as state 0 or
+# the bridge cannot advance.  Asserting it also stops a user's own HQPlayer
+# repeat setting from silently breaking the advance.
+#
+# AND THE OVERRUN NO LONGER HAPPENS.  Verified live 2026-08-28 against engine
+# 6.0.4, repeat off, a complete 13.5s track played to its natural end:
+#
+#   t=6s   state="2" position="11.6"
+#   t=8s   state="0" position="0"     <- clean end, daemon ALIVE
+#   t=10s  state="2" position="0"     <- LMS sent the next track by itself
+#
+# The daemon survived, and LMS advanced from its own queue. The crash needed
+# the two-channel load: with Stop on the control socket racing a UPnP
+# SetAVTransportURI, the engine's playlist was emptied underneath a renderer
+# that still believed it was playing, and THAT is what walked `trackn` past
+# `last`.  On one ordered socket the playlist and the engine never disagree.
+#
+# If `GetAlbumGain(): trackn > last` is ever seen again, the fallback is the
+# user-side switch, not repeat: `playlist_album_gain="0"` in
+# `~/.hqplayer/hqplayerd.xml`.  Do NOT bring repeat back - it trades a crash
+# for a player that cannot advance.
+sub assertRepeatOff {
+    my $self = shift;
+
+    $self->_send('<SetRepeat value="0"/>');
+
+    return 1;
+}
+
 sub refreshInfo {
     my $self = shift;
 
@@ -1287,6 +1440,8 @@ sub refreshInfo {
     # the XML control API answers "Unknown command" for GetVolumeDBRange.  It
     # is a UPnP action, and it works - see refreshVolumeRange.
     $self->refreshVolumeRange;
+
+    $self->assertRepeatOff;
 
     $self->_send( '<GetInfo/>', sub {
         my $attrs = shift or return;

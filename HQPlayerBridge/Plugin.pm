@@ -277,6 +277,12 @@ sub _create {
     eval { $client->name($name) };
     $log->warn("could not set player name for $id: $@") if $@;
 
+    # Also after init, for the same reason: the client's prefs have to exist
+    # before we can tell an unset bitrate cap from a chosen one.  Without this
+    # LMS transcodes every streamed track to MP3 320 - see initBitrateLimit.
+    eval { $client->initBitrateLimit };
+    $log->warn("could not set the bitrate limit for $id: $@") if $@;
+
     my $ctl = Plugins::HQPlayerBridge::Control->new(
         ip      => $inst->{ip},
         name    => $name,
@@ -292,9 +298,16 @@ sub _create {
         },
     );
 
-    # The UPnP renderer runs alongside the XML control link: it is the only
-    # channel that carries metadata and artwork to HQPlayer, and the only one
-    # that can set the volume.  See UPnP.pm for why both are needed.
+    # The UPnP renderer runs alongside the XML control link for ONE thing: the
+    # volume RANGE.  The control API has <Volume value="-53"/>, <VolumeUp/> and
+    # <VolumeDown/> but no way to ask what the range is, and the range is a
+    # user setting - so RenderingControl's GetVolumeDBRange is read once at
+    # connect and nothing else here depends on UPnP.
+    #
+    # It used to carry the track load as well, on the belief that DIDL was the
+    # only way to get artwork to the endpoint.  It is not: PlaylistAdd takes a
+    # <metadata cover="..."/> child that produces a byte-identical playlist
+    # item.  See _metadata in Player.pm.
     my $upnp = Plugins::HQPlayerBridge::UPnP->new(
         ip   => $inst->{ip},
         name => $name,

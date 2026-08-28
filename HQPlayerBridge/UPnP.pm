@@ -1,21 +1,32 @@
 package Plugins::HQPlayerBridge::UPnP;
 
-# HQPlayer's UPnP MediaRenderer, used alongside the XML control API.
+# HQPlayer's UPnP MediaRenderer, used alongside the XML control API for ONE
+# remaining job: reading the volume RANGE.
 #
-# Why both?  The XML API on 4321 is the better state channel - <Status/> is a
-# subscribe and pushes ~1/s - but it cannot do two things that matter:
+# The XML API on 4321 is the better channel in every other respect - <Status/>
+# is a subscribe and pushes ~1/s, and a command answers in ~9-150ms against
+# 300-550ms for a UPnP round trip - but it has no way to ask what the volume
+# range is.  It has <Volume value="-53"/>, <VolumeUp/> and <VolumeDown/> and
+# nothing else, while the range is a user setting that moves at BOTH ends.  So
+# RenderingControl's GetVolumeDBRange is read once at connect.
 #
-#   * METADATA AND ARTWORK.  <PlaylistAdd/> takes a bare uri; HQPlayer labels
-#     anything fetched over http as "HTTP stream" and ignores title/artist/
-#     album/song attributes entirely.  UPnP's SetAVTransportURI carries
-#     DIDL-Lite, which HQPlayer does honour - verified live, including
-#     <upnp:albumArtURI>.  HQPlayer then re-serves that cover from its own web
-#     server at /cover/current, which is where an endpoint's display picks it
-#     up.  This is exactly what the squeeze2upnp bridge was relying on.
-#   * VOLUME.  SetVolume/SetVolumeDB/GetVolume all answer "Unknown command" on
-#     the XML API - they exist only as UPnP RenderingControl actions.  And
-#     RenderingControl speaks 0-100, which is LMS's own scale, so no dB mapping
-#     is needed.
+# WHAT THIS MODULE NO LONGER DOES: the track load.
+#
+# SetAVTransportURI + DIDL-Lite was carrying the load for months on the belief
+# that DIDL was the only way to put a cover on the endpoint's display.  That
+# was wrong.  <PlaylistAdd> has a BODY, and a <metadata cover="<plain url>"/>
+# child in it produces a byte-identical playlist item - same cover, same
+# base64 `picture`.  Verified against engine 6.0.4 on 2026-08-28 by writing an
+# item both ways and reading it back with <PlaylistGet picture="1"/>.
+#
+# Moving the load off UPnP is also what stopped hqplayerd crashing: Stop was
+# going down the control socket while the load went over UPnP, the two could
+# not be ordered against each other, and the engine's playlist got emptied
+# underneath a renderer that still believed it was playing.  See _queueTrack.
+#
+# setURI, play, playWhenReady, pause, stop and seek are all still here and all
+# still work; nothing in the plugin calls them.  They are kept because they
+# are the tested fallback if the control socket ever loses PlaylistAdd.
 #
 # Verified live 2026-08-26 against HQPlayer Embedded 6:
 #   http://<ip>:8019/root.xml  ->  MediaRenderer:3

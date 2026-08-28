@@ -50,16 +50,33 @@ use constant ROUND_PERIOD => 60;    # seconds between rounds
 # recreate it moments later.  Better to keep the player and let the control link
 # reconnect - which is exactly what it did.
 
+# Retry interval used while NOTHING has been found yet, doubling up to
+# ROUND_PERIOD.
+#
+# The steady-state period is deliberately slow, but it used to apply to the
+# cold start too, and that is a different problem: with an empty instance list
+# there is no player at all, so a single lost probe costs a full minute of the
+# plugin looking broken.  One multicast datagram is easy to lose - the probe
+# went out at 09:48:49 while hqplayerd happened to be restarting, and the
+# player did not appear until 09:49:49.
+#
+# So: probe hard until something answers, then settle down.  Once an instance
+# is known this backs off to ROUND_PERIOD and stays there, and a silent round
+# no longer matters because INSTANCE_TTL keeps the player alive across it.
+use constant FIRST_BACKOFF => 2;
+
 my $sock;         # live only for the duration of a round
 my %found;        # ip => { ip, name, version, lastSeen }
 my $onChange;     # caller's callback
 my $running = 0;
+my $backoff = 0;  # current cold-start retry interval, 0 once something answers
 
 sub start {
     my ( $class, $cb ) = @_;
 
     $onChange = $cb;
     $running  = 1;
+    $backoff  = 0;
 
     _round();
 
@@ -68,6 +85,7 @@ sub start {
 
 sub stop {
     $running = 0;
+    $backoff = 0;
     Slim::Utils::Timers::killTimers( undef, \&_round );
     Slim::Utils::Timers::killTimers( undef, \&_roundDone );
     _closeSocket();
@@ -183,8 +201,23 @@ sub _roundDone {
 sub _schedule {
     return unless $running;
 
+    my $wait = ROUND_PERIOD;
+
+    if ( scalar keys %found ) {
+        # Something answered - settle into the steady-state period.
+        $backoff = 0;
+    }
+    else {
+        $backoff = $backoff ? $backoff * 2 : FIRST_BACKOFF;
+        $backoff = ROUND_PERIOD if $backoff > ROUND_PERIOD;
+        $wait    = $backoff;
+
+        main::DEBUGLOG && $log->is_debug && $log->debug(
+            "discovery: nothing found yet, retrying in ${wait}s" );
+    }
+
     Slim::Utils::Timers::killTimers( undef, \&_round );
-    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + ROUND_PERIOD, \&_round );
+    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + $wait, \&_round );
 
     return;
 }

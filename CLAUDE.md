@@ -35,7 +35,7 @@ then plays it.
 | `HQPlayerBridge/Plugin.pm` | Lifecycle, discovery wiring, player create/teardown |
 | `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list |
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
-| `HQPlayerBridge/UPnP.pm` | Async SOAP to HQPlayer's UPnP renderer (metadata, artwork, volume) |
+| `HQPlayerBridge/UPnP.pm` | Async SOAP to HQPlayer's UPnP renderer — **volume range only** since 0.2.13 |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
 | `HQPlayerBridge/Settings.pm` | Read-only status page |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
@@ -173,34 +173,57 @@ anyway. Both verified live; see the review ledger.
 * **`active_rate` is the DSD/output rate, not the source rate.** The source
   format is on the `<metadata/>` **child** (`samplerate`, `bits`).
 
-## Two channels, and why both are needed
+## One channel, and the one thing still on the other
 
-The XML API on 4321 is the better **state** channel — `<Status/>` is a subscribe
-and pushes ~1/s. But it cannot do two things, and HQPlayer's **UPnP
-MediaRenderer** (`http://<ip>:8019/root.xml`, `MediaRenderer:3`) can:
+**Everything runs on the XML control API on 4321.** `<Status/>` is a subscribe
+pushing ~1/s, and a command answers in **~9–150 ms** against **300–550 ms** for
+a UPnP round trip.
 
 | | XML API (4321) | UPnP (8019) |
 |---|---|---|
-| transport + state | **used** — subscribe, pause, stop, seek | available |
-| track + metadata + artwork | attributes silently ignored | **used** — `SetAVTransportURI` + DIDL-Lite |
-| volume | **used** — `<Volume value="-53"/>` in dB, ~9ms | available but slow (300–550ms) |
+| transport + state | **used** — subscribe, play, pause, stop, seek | available, unused |
+| track + metadata + artwork | **used** — `PlaylistAdd` + `<metadata cover="…"/>` | available, unused |
+| volume level | **used** — `<Volume value="-53"/>` in dB | available but slow |
+| volume **range** | no such command | **used** — `GetVolumeDBRange`, once at connect |
 
-So: **UPnP sets the URI and starts playback, the XML API reports state.** Both
-drive the same engine — verified, `<Status/>` tracks a UPnP-started session
-exactly, and an XML `<Stop/>` cleanly stops one.
+The only reason `UPnP.pm` still exists is the last row: the control API can set
+a level but cannot report the range, and the range is a user setting whose
+**both** ends move.
 
-**Artwork is the whole reason for this split.** Over the XML API HQPlayer labels
-any http source `song="HTTP stream"` and ignores `title`/`artist`/`album`/`song`
-attributes on `PlaylistAdd`. Over UPnP it honours all of them, including
-`<upnp:albumArtURI>`, which it then re-serves from its own web server at
-`/cover/current` — and that is where an endpoint's display fetches the cover.
-This is exactly what squeeze2upnp was relying on, and why artwork appeared
-through the UPnP bridge but not through the first version of this plugin.
+### The artwork field is `cover`, and it takes a plain URL
 
-**Volume goes over the XML channel**, not UPnP — see the volume section below.
-UPnP `RenderingControl` does work and speaks 0–100, but measured against the
-live daemon it takes **300–550ms** per call where an XML command on the already
-open control socket answers in **~9ms**. That was the volume lag.
+This cost a lot of time, so it is written down precisely. `PlaylistAdd` is not
+a self-closing element — it has a **body**, and that body takes a `<metadata/>`
+child:
+
+```xml
+<PlaylistAdd uri="http://lms:9000/music/101/download.flac" queued="0" clear="1">
+  <metadata song="…" artist="…" album="…" cover="http://lms:9000/music/abc/cover.jpg"/>
+</PlaylistAdd>
+```
+
+Verified against engine **6.0.4** on 2026-08-28 by writing an item both ways and
+reading it back with `<PlaylistGet picture="1"/>`. The results are
+byte-identical — same `cover`, same 68-char `picture`:
+
+| written | `picture` read back |
+|---|---|
+| `<metadata cover="http://…/cover.jpg"/>` | `aHR0cDovLzE5Mi4x…` (68) |
+| `SetAVTransportURI` + `<upnp:albumArtURI>` | `aHR0cDovLzE5Mi4x…` (68) |
+| `<metadata cover="<base64 url>"/>` | 92 chars — **double-encoded** |
+| `picture=`, `albumArtURI=`, `art=`, `<picture>` child | empty |
+
+**HQPlayer base64-encodes the URL into `picture` itself.** Pass the URL exactly
+as it is. And HQPlayer *merges* rather than overrides: it fills in
+`albumartist`, `date`, `bitrate` and `bits` from the file's own tags while
+keeping the `song`/`artist`/`album` set here. The item also carries
+`album_artist`, `genre`, `composer` and `performer` if they are ever wanted.
+
+**The earlier claim that only DIDL could do this was wrong**, and it was wrong
+in a specific way worth remembering: the probing tested `picture=` as an
+attribute and `<picture>` as a child, concluded "everything is ruled out", and
+wrote that conclusion down as fact. It never tested the field HQPlayer's own
+`library.xml` uses for exactly this, which is `cover`.
 
 ### TRAP: artwork comes from two different places
 
@@ -219,6 +242,11 @@ already an `/imageproxy/` path, which is what the proxy is genuinely for.  If
 the handler has no artwork, emit **no** `albumArtURI` rather than a bad one.
 
 ### TRAP: Play races SetAVTransportURI
+
+**Dormant since 0.2.13** — the load no longer goes over UPnP, and `<Play/>` on
+the control socket has never needed a retry (it is chained off `PlaylistAdd`'s
+reply, and answered OK first time in every live test). Kept because
+`UPnP::playWhenReady` still exists and this is why it looks the way it does.
 
 `SetAVTransportURI` returns as soon as it has *accepted* the URI, but HQPlayer
 then fetches and probes the media before the transport actually holds anything.
@@ -321,12 +349,50 @@ the per-install configuration this plugin exists to avoid.
    HQPlayer's: `downloadMusicFile` only transcodes when the resolved type differs
    from the track's own, so a truthful extension keeps it a byte-for-byte
    passthrough.
-2. **Anything remote** → `/stream.mp3?player=<mac>` — transcoded per `formats()`
-   (`flc` first, so no transcoder in the common case).
+2. **Anything remote** → `/stream.mp3?player=<mac>` — served per `formats()`
+   (`flc` first, so no transcoder in the common case — but see the bitrate cap
+   below, which silently overrode that for the whole of development).
 
 Range support matters: HQPlayer logs `clStreamReaderHTTP::Skip(): not seekable!`
 against servers that lack it (Python's `http.server` does). LMS's download route
 supports ranges, so seeking should work — untested.
+
+### TRAP: declaring `flc` first does not get you FLAC
+
+`Slim::Utils::Prefs::maxRate` applies a bitrate cap whenever the `maxBitrate`
+client pref **has never been set**, and the default is by player family: wired
+Squeezeboxen and all SB2s get `0` (no limit), and **every other player gets
+320kbps**. This player is deliberately not a Squeezebox, so it lands in "every
+other player" — and LMS transcodes to MP3 to fit under the cap.
+
+The effect, found 2026-08-28 after a user reported HQPlayer showing MP3: a
+750kbps Qobuz FLAC arrived as MP3 320, and every tag the original carried —
+replaygain included — was destroyed on the way. `formats()` listing `flc` first
+made no difference at all; the cap is applied downstream of the preference
+order.
+
+**Verified on the live server, same endpoint, same player, pref the only
+change:**
+
+| `maxBitrate` | what `/stream.mp3?player=` serves |
+|---|---|
+| unset (LMS default → 320) | MP3 |
+| `0` | `Content-Type: audio/x-flac`, body opens `fLaC` + STREAMINFO |
+
+So `Player::initBitrateLimit` sets it to `0` at player creation, **only when it
+is undef** — an explicit choice belongs to the user, and undef is exactly LMS's
+own "not been set yet". `Plugin::_create` calls it after `init`, because the
+client's prefs have to exist before an unset cap can be told from a chosen one.
+
+**Tier 1 was never affected**, which is why this hid for so long: a plain file
+download does not go through the streaming path and never meets the cap. Local
+playback always sounded right; only streaming was quietly downgraded.
+
+philippe_44's bridges (CastBridge, UPnPBridge) never hit this — their players
+connect over slimproto, so LMS builds them as `Squeezebox2` subclasses and the
+default hands them no limit for free. Comparing player prefs across the three
+is what identified it: two bridge players both showing `maxBitrate` unset, but
+only ours resolving to a cap.
 
 ## State machine
 
@@ -733,7 +799,7 @@ tree, runs 189 assertions across four files, and sweeps called-vs-defined subs.
 | file | covers |
 |---|---|
 | `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads** |
-| `t_player.pl` | player construction, DIDL, artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
+| `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_upnp.pl` | the describe retry, the bounded Play loop, cancellation |
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift |
 
@@ -785,6 +851,15 @@ HTTP played correctly:
   61 at −39 dB, i.e. HQPlayer's own 0-100 scale is linear over the range. The
   level was restored to −39 dB afterwards.
 * End of track is detectable: `state` goes 2 → 0 on its own.
+* **The 0.2.9 volume path, on the live LMS** — 2026-08-27, read out of
+  `log.txt` and a JSON-RPC `status` while the bridge was running: at every
+  link-up `UPnP GetVolumeDBRange ok` → `volume range -100dB to 0dB` →
+  `HQPlayer volume range is -100dB to 0dB (1.00dB per LMS step)`; the inbound
+  mirror followed the endpoint's own remote (`volume changed outside LMS to
+  -39dB / -51dB - following`); `status` reported `"mixer volume": 61` against
+  −39 dB, which is the mapping agreeing with HQPlayer's own 0-100 scale, with
+  `digital_volume_control: 1` and `use_volume_control: 1` — so fixed-volume
+  detection correctly stayed off on a variable instance.
 
 **Watch for a silent output-format mismatch.** When HQPlayer's output format
 exceeds what the endpoint accepts, it reports `state=2` and returns OK to
@@ -798,15 +873,236 @@ everything while rendering nothing. The only evidence is `process_speed=0` /
 
 Never conclude "playback works" from `state` alone.
 
+## TRAP: racing tracks mean hqplayerd is dying, not the bridge
+
+The symptom is "it is not streaming at all": LMS tears through the whole
+playlist in a couple of seconds and lands on stopped. In `log.txt` each track
+reads
+
+```
+buffer ready [playing=PLAYING streaming=STREAMING]
+HQPlayer is playing
+end of track            <- ~180ms later
+tier 2 (LMS stream) http://.../stream.mp3?player=...
+```
+
+That is the state machine working correctly on a daemon that keeps exiting: the
+engine stops under us, `state` goes to 0, and 0 is also how end-of-track
+presents, so LMS advances — over and over.
+
+**ROOT CAUSE, verified 2026-08-27 from hqplayerd's own log** (`/tmp/hqplayerd.log`
+on the HQPlayer host; on a Mac instance `lsof -p <pid> | grep '\.log'` finds it):
+
+```
+End of track at 0.008/195/194.992
+Next  (0)
+! clHQPlayerEngine::Execute(): clHQPlayerEngine::NextNL(): clPlaylist::GetAlbumGain(): trackn > last
+  Stop request (reset)
+! clPlayerDaemon::Main(): clHQPlayerEngine::Stop(): clPlaylist::GetAlbumGain(): trackn > last
+- Server stopping...
+```
+
+`clPlaylist::GetAlbumGain()` throws `trackn > last` when the playlist index has
+run past the end, and in `clPlayerDaemon::Main()` that throw is **unhandled and
+takes the process down**. It is an HQPlayer defect: no control input should be
+able to kill the daemon.
+
+**Two things reach it, and both are ordinary:**
+
+* **End of track.** HQPlayer auto-advances (`Next (0)`) when a track finishes.
+  This bridge feeds it exactly one URI at a time — gapless pre-queuing is not in
+  v1 — so *every* track end is an end-of-playlist, and every one of them calls
+  `GetAlbumGain` past the end.
+* **Stop.** `clHQPlayerEngine::Stop()` takes the same path, which is why
+  pressing Stop in HQPlayer's own UI crashes it, with no LMS involved at all.
+
+**The switch that disarms it** is `playlist_album_gain` in
+`~/.hqplayer/hqplayerd.xml` (the album-gain / playlist volume-levelling option
+in the web UI). At `1`, `GetAlbumGain` is consulted on every advance and stop;
+at `0` it is not called and the throw cannot happen. Nothing in the bridge
+changes this — it is the user's setting.
+
+**Same defect, harmless elsewhere.** With an empty playlist a `<Volume>` command
+returns the identical error through `clControlThread::ParseMsg()`, where it is
+caught and merely answered as `result="Error"` — the level still applies. That
+is the `%BENIGN` entry in `Control.pm`. Do not confuse the two: caught in the
+control path, fatal in the daemon's main loop.
+
+**A spurious end-of-track makes it fire immediately.** On tier 2 the log shows
+`MP3 stream format changed` then `End of track at 0.008/195/194.992` — HQPlayer
+read LMS's `/stream.mp3` as ending 8ms in, advanced, and died. So a tier-2
+track can crash the daemon at the *start* rather than the end.
+
+**Diagnosing it from the LMS side**, since the player still *looks* connected
+(`Player::connected` returns `tcpsock`, a literal 1):
+
+1. `control link down - connect: Connection refused`, then again on the 2/4/8/16s
+   backoff. Refused is not "HQPlayer closed the link" — nothing is listening.
+2. `<Play> failed: ... Empty transport` — the engine is up but has no playlist.
+3. Port 4321 flapping. From any machine on the subnet, no shell on the host:
+
+```
+python3 -c 'import socket,time
+for i in range(30):
+    r=[]
+    for p in (4321,8019):
+        try: socket.create_connection(("<hqplayer-ip>",p),1).close(); r.append("up")
+        except Exception: r.append("DOWN")
+    print(time.strftime("%H:%M:%S"), r, flush=True); time.sleep(1)'
+```
+
+A daemon that answers `GetInfo` one second and refuses the next is exiting and
+being restarted. The bridge has nothing to fix here: it reconnects on its own,
+and did.
+
+**Do not read the requested output rate as the cause.** `Requested output rate:
+12288000` against an endpoint that lists only 44.1-family DSD rates looks like
+[hqplayerd-naa-format-mismatch], but the NAA reconciles it — the next lines are
+`NAA output network format: 11289600/1/2 [sdm]` and `engine started at:
+11289600`. That mismatch is a *silence* symptom, not a crash symptom.
+
+## Repeat must be OFF — and why it was briefly ON
+
+`Player::assertRepeatOff` sends `<SetRepeat value="0"/>` at every link-up.
+
+For one build it sent `value="1"`. That was an attempt to stop HQPlayer walking
+off the end of a one-entry playlist — it advances by itself at the end of a
+track, and the overrun throws out of `clPlayerDaemon::Main()` and kills the
+daemon ([hqplayerd-album-gain-crash]). Repeat does make the advance wrap. It
+also means **the playlist never ends**, so `state` never reaches 0,
+`_onStatus` never reports end-of-track, and LMS never sends the next track: a
+full LMS queue played its **first track on repeat, forever**.
+
+That section of this file asked exactly the right question — *"with repeat on,
+does HQPlayer still report `state` 0 at end of track, or loop at 2?"* — and the
+guard shipped without answering it. **It loops.** Answer the question before
+shipping the workaround, not after.
+
+**Verified live 2026-08-28**, engine 6.0.4, repeat off, a complete 13.5 s track
+played to its natural end:
+
+```
+t=6s   state="2" position="11.6"
+t=8s   state="0" position="0"     <- clean end, daemon ALIVE
+t=10s  state="2" position="0"     <- LMS sent the next track by itself
+```
+
+No crash. The overrun needed the **two-channel load**: Stop on the control
+socket racing a UPnP `SetAVTransportURI` emptied the engine's playlist
+underneath a renderer that still believed it was playing, and that is what
+walked `trackn` past `last`. On one ordered socket the playlist and the engine
+never disagree.
+
+If `GetAlbumGain(): trackn > last` is ever seen again, the fallback is the
+user-side switch — `playlist_album_gain="0"` in `~/.hqplayer/hqplayerd.xml` —
+**not** repeat. Repeat trades a crash for a player that cannot advance.
+
+**Still not built:** pre-queueing the next track for gapless. `PlaylistAdd
+queued="1"` does work, but on tier 2 every track is the same
+`/stream.mp3?player=` URL and a second connection to that single-consumer
+endpoint tears the first; and a playlist HQPlayer can advance into on its own
+stops reporting `state` 0 at end of track, which is the signal the state
+machine is built on.
+
+## Why the load runs on the control socket: the crash
+
+The load is **four ordered commands on one socket**:
+
+```
+<Stop/> → <PlaylistClear/> → <PlaylistAdd …><metadata …/></PlaylistAdd> → <Play/>
+```
+
+`<Play/>` is chained off `PlaylistAdd`'s reply; the first two are
+fire-and-forget, because ordering comes from the socket rather than from the
+callbacks.
+
+**This is what stopped hqplayerd crashing.** The load used to be split: `<Stop/>`
+on the control socket while `SetAVTransportURI` and `Play` went over UPnP. Those
+two channels cannot be ordered against each other — a control command answers in
+~9–150 ms and a UPnP round trip in 300–550 ms — so a `Stop` meant for the *old*
+track could land after the `Play` for the new one and kill it. Worse, HQPlayer's
+AVTransport never saw a Stop at all: from the renderer's side the transport went
+straight from PLAYING into `SetAVTransportURI` while the XML Stop emptied the
+engine's playlist underneath it. That is the shape of
+`clPlaylist::GetAlbumGain(): trackn > last`, the fatal that took the daemon down
+**whenever an album was loaded over a playing one** — the exact reproducer.
+
+Verified 2026-08-28: this sequence run five times in rapid succession over a
+playing track swapped cleanly every time, correct metadata each time, daemon
+alive throughout.
+
+### Discovery: fast until found, slow once found
+
+`ROUND_PERIOD` is 60 s, which is right for the steady state — `INSTANCE_TTL` is
+15 minutes, so a silent round never tears a player down, and the control link is
+the real liveness signal.
+
+But it used to apply to the **cold start** as well, and that is a different
+problem: with nothing found there is no player at all, so one lost multicast
+datagram costs a full minute of the plugin looking broken. Observed live — the
+probe went out at 09:48:49 while hqplayerd happened to be restarting, and the
+player did not appear until 09:49:49.
+
+`_schedule` now backs off **2, 4, 8, 16, 32, 60 s** while `%found` is empty and
+resets to `ROUND_PERIOD` the moment anything answers. Covered in `t_plugin.pl`,
+including the settle-back case (seeded by handing `_reply` a real datagram on
+loopback).
+
+### TRAP: `Control::send`'s callback is `($attrs, $raw)`, not `($res, $err)`
+
+`$raw` is the **raw reply on success as well as on failure** — it is never an
+error string. Failure is `$attrs` being **undef**:
+
+```perl
+$req->{cb}->( undef,  $raw );   # result="Error"
+$req->{cb}->( $attrs, $raw );   # OK
+```
+
+`UPnP.pm` and `SimpleAsyncHTTP` use the opposite shape, `($res, $err)`, and
+0.2.13 shipped with `_queueTrack` reading the control callback that way. Every
+**successful** `PlaylistAdd` was therefore logged as
+`HQPlayer would not accept the track URI: <PlaylistAdd result="OK"/>`, reported
+`PROBLEM_OPENING`, and LMS skipped to the next track — the player raced an
+entire album in ~100 ms and played nothing. Test `!$res`, never `$err`.
+
+The unit tests did not catch it because the mock answered with `''` as the
+second argument where the real code answers with the reply. **A mock that is
+laxer than the contract is worse than no mock.** `_answer` now returns real
+reply XML on both outcomes, and both directions are asserted.
+
+### TRAP: `clear="1"` is ignored
+
+It is in the documented attribute set and `PlaylistAdd` answers `result="OK"`,
+but engine 6.0.4 **appends anyway** — a swap over a playing track left a
+two-item playlist with the engine still on item 1. The explicit
+`<PlaylistClear/>` is load-bearing. It is safe during playback: HQPlayer keeps
+the currently playing item and drops the rest. The attribute is still sent as
+the documented spelling, in case a later engine honours it.
+
+### TRAP: `<Stop/>` is required first
+
+`PlaylistClear` leaves the current track playing, so a following `<Play/>` is a
+no-op on an already-playing engine and the new track never starts.
+
+### What HQPlayer supplies by itself
+
+Title, artist, album, genre and **replaygain**, all read from the file's own
+tags once `initBitrateLimit` stopped LMS transcoding to MP3 —
+`Adaptive transport gain: -6.31 dB` matched the file's `REPLAYGAIN_ALBUM_GAIN`
+exactly. `<metadata>`'s `song`/`artist`/`album` are therefore belt-and-braces;
+`cover` is the part that earns its place.
+
+**`/cover/current` is not evidence of anything.** It serves the correct embedded
+JPEG whichever way the track was loaded, because it is HQPlayer's own web
+surface — not the channel that reaches the NAA. Judge artwork by
+`<PlaylistGet picture="1"/>`, which is the item HQPlayer forwards.
+
 ## Still unverified
 
 * **How HQPlayer presents fixed volume.** Needs the setting flipped on a live
   instance, then a `<Status/>` and a `GetVolumeDBRange`. Detection currently
   assumes a zero-width range, and falls back to `_watchForFixed` (three sends
   that change nothing), which does not depend on knowing.
-* The volume work as a whole is verified at the protocol level and unit-tested,
-  but has not yet run on the live LMS — the bridge was not loaded there when
-  0.2.9 was built.
 * Seek initiated from LMS, and tier 2 (`/stream.mp3?player=`) Content-Type
   matching the format actually streamed.
 * `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS

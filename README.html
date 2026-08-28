@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
   <div class="badges">
-    <span class="badge accent">v0.2.7</span>
+    <span class="badge accent">v0.2.16</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No audio through the plugin</span>
@@ -184,12 +184,8 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <h3>What actually moves where</h3>
 <p>LMS and HQPlayer are both <em>pull</em> engines: each is used to being handed a URL and fetching the bytes itself. So the bridge hands HQPlayer a URL pointing back at LMS's own HTTP server and then stays out of the audio path entirely. What crosses the bridge is control messages — play, pause, seek, volume, and a status stream coming back the other way.</p>
 <p>That's the whole reason there's no buffer to tune, no transcoder to configure and no helper process to keep alive.</p>
-<p>Two connections are used, because each does something the other can't:</p>
-<ul>
-<li><strong>HQPlayer's XML control API</strong> carries transport and state. It pushes a status message about once a second, which is what drives the progress bar, the play/pause state and the volume slider.
-</li>
-<li><strong>HQPlayer's UPnP renderer</strong> carries the track — its URL, title, artist, album and <strong>cover art</strong>. Over the control API, HQPlayer labels anything arriving over HTTP as <em>"HTTP stream"</em> and ignores track details, so artwork would never reach the endpoint's display. Over UPnP it accepts all of it, and re-serves the cover from its own web server, which is where an endpoint's screen looks for it.
-</li></ul>
+<p>Everything goes over <strong>HQPlayer's own XML control API</strong>: the track and its URL, the title, artist and album, the <strong>cover art</strong>, transport, volume, and a status stream coming back about once a second that drives the progress bar, the play/pause state and the volume slider.</p>
+<p>One thing still uses HQPlayer's UPnP renderer, and only at connect: reading the <strong>volume range</strong>. The control API can set a level but has no way to report what the range is, and the range is a setting whose top and bottom can both move.</p>
 <h3>Playing your library</h3>
 <p>A library track HQPlayer can decode is handed over as <strong>the original file</strong>, byte for byte — FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg, including native DSD. Nothing is re-encoded, and nothing about your files needs to match between the two machines: everything is addressed by URL, never by filesystem path.</p>
 <p>HQPlayer has no decoder for <strong>ALAC, AAC or anything else in an MP4/M4A container</strong>, so those don't go over as files — LMS transcodes them instead, the same way it would for any other player. You don't have to do anything; the plugin checks the format and picks the route.</p>
@@ -198,7 +194,7 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <p>Artwork works here too: the cover comes from the service via LMS's image proxy and is passed on to HQPlayer.</p>
 <h3>Volume</h3>
 <p>HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.</p>
-<p><strong>One LMS step is one dB</strong>, with LMS 100 being 0 dB. That's the same mapping HQPlayer's UPnP endpoint applied to the 0–100 it received, so if you're coming from the UPnP bridge the slider behaves as it did before.</p>
+<p><strong>One LMS step is one dB</strong>, with LMS 100 being 0 dB — the same mapping HQPlayer applies to the 0–100 its UPnP endpoint receives, so if you're coming from the UPnP bridge the slider behaves as it did before. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled, and a fixed-volume HQPlayer shows as 100 and locked.</p>
 <h3>Pause from either end</h3>
 <p>Pause and play work from LMS, and also <em>at</em> HQPlayer — if you pause on the endpoint's remote or in HQPlayer's own interface, LMS follows within a second rather than carrying on counting time against silent audio. Stop, seek and end-of-track are likewise reported back, so the LMS progress bar tracks what's really happening.</p>
 <h3>The status page</h3>
@@ -213,6 +209,8 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <li><strong>A silent output-format mismatch is HQPlayer's to report, not the plugin's.</strong> If HQPlayer's output format is set to something your endpoint can't accept, it reports itself as playing and answers every command normally while rendering nothing at all. There's no way to detect that from the control API — the evidence is only in HQPlayer's own log (<code>NAA output requested format not available!</code>). If a track looks like it's playing but you hear nothing, check the output format there first.
 </li>
 <li><strong>Not gapless.</strong> The next track is handed over when the current one ends, so there's a brief gap between tracks. Pre-queuing isn't implemented.
+</li>
+<li><strong>HQPlayer's repeat setting is turned off while the bridge is connected.</strong> LMS owns the queue, so the plugin hands HQPlayer one track at a time and needs to see it end in order to send the next. With repeat on, HQPlayer loops that single track instead and the queue never advances — so the plugin asserts repeat off whenever the control link comes up. Set repeat and shuffle in LMS, as you would for any other player.
 </li>
 <li><strong>HQPlayer's DSP settings aren't exposed.</strong> Filter, shaper, modulator, output mode and rate are set in HQPlayer, as before — the plugin doesn't change them and can't select them.
 </li>

@@ -86,5 +86,60 @@ for my $f (glob '../HQPlayerBridge/*.pm') {
 }
 ok(!@copies, 'no module keeps its own copy of the version'.(@copies ? " (@copies)" : ''));
 
+print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
+{
+    # One lost multicast datagram used to cost a full minute of the plugin
+    # looking broken: with nothing found there is no player at all, and the
+    # retry was the same 60s as the steady-state round. Observed live -
+    # the probe went out at 09:48:49 while hqplayerd happened to be
+    # restarting, and the player did not appear until 09:49:49.
+    require Plugins::HQPlayerBridge::Discovery;
+    use IO::Socket::INET;
+
+    no warnings 'redefine';
+    # never touch the network from a unit test
+    local *Plugins::HQPlayerBridge::Discovery::_round = sub { };
+
+    Slim::Utils::Timers::_reset();
+    Plugins::HQPlayerBridge::Discovery->start( sub { } );
+
+    my @waits;
+    for ( 1 .. 7 ) {
+        Slim::Utils::Timers::_reset();
+        my $t0 = Time::HiRes::time();
+        Plugins::HQPlayerBridge::Discovery::_roundDone();
+        my $t = Slim::Utils::Timers::_timers()->[0];
+        push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
+    }
+
+    is(join(',', @waits), '2,4,8,16,32,60,60',
+       'with nothing found it retries fast and doubles, capped at ROUND_PERIOD');
+
+    # ...and once an instance answers it settles down. Seed %found the way a
+    # real round does, by handing _reply an actual datagram on loopback.
+    my $rx = IO::Socket::INET->new( Proto => 'udp', LocalAddr => '127.0.0.1', LocalPort => 0 );
+    if ($rx) {
+        my $tx = IO::Socket::INET->new( Proto => 'udp',
+            PeerAddr => '127.0.0.1', PeerPort => $rx->sockport );
+        $tx->send('<?xml version="1.0" encoding="UTF-8"?><discover name="HQPlayerEmbedded"'
+                . ' result="OK" version="Signalyst HQPlayer Embedded 6">hqplayer</discover>');
+        select( undef, undef, undef, 0.1 );
+        Plugins::HQPlayerBridge::Discovery::_reply($rx);
+
+        is(scalar @{ Plugins::HQPlayerBridge::Discovery::instances() }, '1',
+           'the seeded reply is recorded as an instance');
+
+        Slim::Utils::Timers::_reset();
+        my $t0 = Time::HiRes::time();
+        Plugins::HQPlayerBridge::Discovery::_roundDone();
+        my $t = Slim::Utils::Timers::_timers()->[0];
+        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '60',
+           'once something answers it settles back to the steady-state period');
+    }
+
+    Plugins::HQPlayerBridge::Discovery->stop;
+    Slim::Utils::Timers::_reset();
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

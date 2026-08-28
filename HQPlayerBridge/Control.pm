@@ -65,7 +65,7 @@ use constant BACKOFF_MAX     => 60;
 # the live daemon 2026-08-27: SetVolume, SetVolumeDB and GetVolume are all
 # "Unknown command" - an earlier guess from the binary's strings was wrong.
 my %KNOWN = map { $_ => 1 } qw(
-    Play Pause Stop Seek SelectTrack Status State GetInfo Volume
+    Play Pause Stop Seek SelectTrack Status State GetInfo Volume SetRepeat
     PlaylistAdd PlaylistClear PlaylistGet
     GetTransport SetTransport GetInputs GetRates GetModes GetFilters
 );
