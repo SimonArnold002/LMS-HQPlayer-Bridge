@@ -1274,7 +1274,7 @@ HTTP played correctly:
   |---|---|---|---|---|---|
   | tier 1 (local FLAC) | ok | **ok** | ok | ok | ok, gapless |
   | tier 3 (local ALAC/MP4) | see below | n/a | ok | ok | ok |
-  | tier 4 (Qobuz) | ok | **ok** | ok | ok | ok, with a gap |
+  | tier 4 (Qobuz) | ok | **ok** | ok | ok | ok, and gapless in practice |
 
   Qobuz arrives as 24/96 FLAC (`process_speed` 3.1-3.2, `input_fill` 0.8-0.94)
   and is upsampled to DSD256. Tier 1 seek had been unverified since the player
@@ -1638,6 +1638,41 @@ from the MIDDLE of a real FLAC — the seek case exactly:
 Only on a seek, and only on FLAC: an unseeked stream already carries a real
 header and a second one reads as corrupt audio, while MP3 frames are
 self-describing and need nothing.
+
+### Tiers 3 and 4 sound gapless anyway, and here is why
+
+**Reported by Simon 2026-08-28: Dark Side of the Moon streamed from Tidal
+played gapless.** That was not designed for and it is worth understanding
+rather than just believing, because it is a MARGIN, not a guarantee.
+
+The held-track reload really does run - `end of playlist`, then the full
+four-command load. Measured over 13 live transitions it takes **392-756ms**,
+median about 470ms. But HQPlayer reports `state` 0 when its INPUT is
+exhausted, and its output pipeline still holds `output_delay` microseconds of
+already-decoded audio on its way to the NAA. On this setup:
+
+```
+output_delay = 1502902     -> 1.50s still in flight
+reload       = 0.39-0.76s
+```
+
+So the next track starts roughly a second before the previous one drains, and
+nothing is ever heard. The same applies to tier 3 since 0.2.31 moved it onto
+the same endpoint, so ALAC/mp4 are effectively gapless too.
+
+**What eats the margin — do not promise this unconditionally:**
+
+* **A sample-rate change.** That forces an engine reinit, measured at ~2.3s
+  earlier the same day, which is longer than the buffer and IS audible. An
+  album at one rate is fine; a mixed-rate playlist is not.
+* **`output_delay` is this setup's, not a constant.** It comes from DSD256 plus
+  convolution. A lower-latency output would shrink the window, and a short
+  enough one would make the reload audible.
+* **A slow resolve.** The 470ms assumes LMS already has the next track, which
+  it does because the hand-over held it minutes ago.
+
+Pre-queuing would remove the dependency entirely, but it cannot be done here -
+see below.
 
 ### Tier 4 is excluded, and holds instead of appending
 
