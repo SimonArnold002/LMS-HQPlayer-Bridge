@@ -166,6 +166,55 @@ anyway. Both verified live; see the review ledger.
 </Status>
 ```
 
+That is what one live instance sent. The **full** attribute set, from the
+vendor client's own parser (`ControlInterface.cpp`, `cmd == "Status"`), is
+larger and several of them matter here:
+
+`state track track_id min sec volume clips tracks_total track_serial
+transport_serial queued position length begin_min begin_sec remain_min
+remain_sec total_min total_sec output_delay apod active_mode active_filter
+active_shaper active_rate active_bits active_channels filter_junk correction
+random repeat input_fill output_fill process_speed`
+
+* **`queued` is a BOOLEAN**, not a count — the client reads it as `bool`.
+  Observed live it reads 1 from a gapless advance onward, so it means "this
+  track came off the queue" rather than "a hand-over is pending". See
+  "Gapless".
+* `track_serial` and `transport_serial` are per-track / per-transport
+  counters; the vendor client marks both `Q_UNUSED`, so their exact semantics
+  are unconfirmed, but a serial that bumps per track would be a cleaner
+  advance signal than the playlist index.
+* `input_fill` / `output_fill` are HQPlayer's own buffer levels, which is the
+  one honest answer this bridge could give to `bufferFullness` — it currently
+  reports a fixed healthy-but-not-full figure instead. **Careful**: `usage()`
+  is `bufferFullness / bufferSize`, and `_CheckPaused` closes the source stream
+  outright above 98% on a paused remote track, which for this player is always
+  wrong. Any move to a real figure has to keep it off that ceiling.
+
+The `<metadata/>` **child** of `<Status/>` carries, in full:
+
+`uri` (or `secure_uri` + `nonce`) `mime artist composer performer album song
+genre date albumartist track_id samplerate bits channels float sdm bitrate
+features extrainfo gain`
+
+`gain` is the replaygain HQPlayer actually applied — the figure the log prints
+as `Adaptive transport gain: -6.31 dB`, available on every push rather than
+only in a log nobody can reach. `float` and `sdm` say what the *source* was.
+The plugin reads only `uri`, `samplerate` and `bits`.
+
+### `<Status subscribe="0|1"/>` — the flag nobody knew about
+
+Verified live 2026-08-28: `subscribe="0"` is a **one-shot poll** (one reply, no
+push stream) and `subscribe="1"` subscribes. The bare `<Status/>` the plugin
+sends behaves as `subscribe="1"`.
+
+This matters in two places the plugin gets slightly wrong today. `refreshInfo`
+and the settings page have no way to ask for the current state without
+(re-)subscribing, and `_statusWatchdog` re-sends a bare `<Status/>` every time
+the stream dries up — so a subscription is repeatedly re-asserted and never
+turned off, including on a player sitting idle. Sending the flag explicitly
+makes both intentional.
+
 * **`state` is an INTEGER**: `0` = Stopped, `1` = Paused, `2` = Playing.
   Matching it as a word silently never fires — this was a real bug here.
 * `length` is the true duration in seconds, correctly read from the FLAC.
@@ -186,9 +235,30 @@ a UPnP round trip.
 | volume level | **used** — `<Volume value="-53"/>` in dB | available but slow |
 | volume **range** | no such command | **used** — `GetVolumeDBRange`, once at connect |
 
-The only reason `UPnP.pm` still exists is the last row: the control API can set
-a level but cannot report the range, and the range is a user setting whose
-**both** ends move.
+**That last row is now WRONG, and `UPnP.pm` can be retired.** `<VolumeRange/>`
+is a control command. Verified live 2026-08-28 against engine 6.0.4:
+
+```xml
+<VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
+```
+
+Same range UPnP's `GetVolumeDBRange` reports, in **plain dB** rather than
+1/256, on the socket that is already open, answering in ~9 ms instead of
+300–550 ms. It removes the whole UPnP device-description dance
+(`describe` and its backoff retry, `root.xml`, the SOAP client) along with the
+class of bug that lives there.
+
+`enabled` is almost certainly the **fixed-volume** flag — the thing "Still
+unverified" below says needs a live instance with the setting flipped. That
+would replace `_watchForFixed`, which currently infers it from three sends that
+change nothing.
+
+`GetVolumeDBRange` and `GetVolumeDB` really are absent from the control API —
+but they are the **UPnP action names**, and the earlier note here inferred "so
+there is no way to ask" from their absence. It stopped one command short. The
+range was always available; nobody had read the vendor's list.
+
+*(Not yet done — this is a proposal with the evidence attached, not a change.)*
 
 ### The artwork field is `cover`, and it takes a plain URL
 
@@ -281,12 +351,126 @@ Note `SetAVTransportURI` is logged by hqplayerd as `Playlist clear` +
 
 ## One thing HQPlayer still will not do
 
-**The NAA name is not exposed.** `GetTransport` answers with a bare numeric
-id (`arg="" value="240"`) and no device name. `GetInputs` lists sources
+**The NAA name is not exposed.** `GetTransport` answers `value` (a numeric id)
+and `arg` (a string) — corrected from the vendor source, which reads exactly
+those two; the earlier note here said there was no name field at all, when in
+fact `arg` **is** that field and simply came back **empty** on this instance
+(`arg="" value="240"`). `SetTransport` takes the same pair, so `arg` is a
+device path rather than a display name in any case. `GetInputs` lists sources
 (`cd:`), not outputs. The endpoint name appears only in hqplayerd's own log
 (`NAA output endpoint 'Eversolo:DMP-A8(ManCave)' : 'hw:0'`), which is not
 reachable from another host. The status page therefore reports the transport id
 and says plainly that the name is unavailable.
+
+## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
+
+**Isolated live 2026-08-28, engine 6.0.4, four controlled runs.** This is the
+end-of-album crash, and it is not the album-gain setting.
+
+| what | outcome |
+|---|---|
+| both items added **before** `Play`, `queued="0"` | plays through, **survives** |
+| append **mid-playback**, `queued="0"` | plays through, **survives** (×2) |
+| append **mid-playback**, `queued="1"` | end of playlist, **daemon exits** (×2) |
+| same, playlist trimmed back to one item before the end | **daemon exits anyway** |
+
+`queued="1"` leaves HQPlayer's own track index inconsistent, and at the end of
+the **last** item the engine walks past it —
+`clPlaylist::GetAlbumGain(): trackn > last`, unhandled out of
+`clPlayerDaemon::Main()`, process gone. The control port then answers
+`Connection refused` rather than resetting; on this install launchd brings it
+back in ~7 s, which is why it reads as a link blip rather than a crash.
+
+**Trimming the playlist first does not undo it**, so the damage is done at
+append time, not at the end. That also rules out the workarounds worth trying:
+a pre-emptive `<Stop/>` would have to truncate audio, and `<Play last="1"/>`
+makes no difference (a one-item playlist survives either way).
+
+**`queued="0"` appends identically and advances identically** — `tracks_total`
+1 → 2, `track` 1 → 2 with no `state` 0 between tracks. It is what
+`_appendTrack` sends. The whole feature, and the daemon lives.
+
+This also revises the older note that the `GetAlbumGain` crash "no longer
+happens". It happens, deterministically, and `playlist_album_gain="0"` is not
+needed to avoid it — not sending `queued="1"` is.
+
+## HQPlayer does not probe an http:// item for its duration
+
+A bridge-added track came back from `<PlaylistGet/>` with `length="0"` — and
+`rate`, `bits`, `channels` and `bitrate` all `0` too. HQPlayer accepts the URI
+and plays it without reading a duration out of it, so its own UI showed no
+length. The old UPnP path filled it in only because DIDL carries
+`<res duration="">`.
+
+**`<metadata length="…"/>` is accepted, in seconds.** Verified live:
+`length="12.7"` reads back as `length="13"` on the playlist item and
+`length="12.699"` on `<Status/>`. `_metadata` now sends it, guarded — a zero
+duration is omitted rather than sent as `length="0"`, which is the bug it fixes.
+
+## TRAP: THE CONTROL SOCKET CARRIES OCTETS, NOT CHARACTERS
+
+**This one took the player out completely, and it is invisible on an
+ASCII-only library.** Found live 2026-08-28 on *Orbital 2*.
+
+LMS hands out track titles as Perl **character** strings. The album has a track
+called `Lush 3‒1` — a **U+2012 FIGURE DASH**. That went into the
+`<metadata song="..."/>` of a `PlaylistAdd`, and:
+
+```
+onStatus handler died: Wide character in syswrite at Control.pm line 299.
+```
+
+**The die is catastrophic, not cosmetic.** It threw out of the status handler
+that was pumping the command queue, so the command stayed `inflight` **forever**
+— and because exactly one command may be in flight at a time, *every*
+subsequent command was queued behind it and never sent. Symptoms, none of which
+point at encoding:
+
+* **skip, stop and pause silently do nothing** — the player is deaf
+* **LMS's position freezes while HQPlayer plays on**
+* 30 s later, `no reply to <PlaylistAdd> after 30s` tears the link down
+* on reconnect LMS floods the log with `HQPlayer would not accept the track URI`
+
+The fix is one line, in `Control::_pump`: `wbuf` is a **byte** buffer, encoded
+once with `Encode::encode('UTF-8', ...)` as the command is queued, and each
+complete message is decoded back on the way in. HQPlayer was never the problem
+— verified live, `song="Lush 3‒1"` round-trips byte-perfect through
+`PlaylistAdd` + `PlaylistGet`.
+
+**The quieter half of the same bug:** `_flush` does
+`substr($wbuf, 0, $wrote, '')`, cutting by **character** while `syswrite`
+counts **bytes**. A partial write of a non-ASCII command would have resumed
+mid-character and corrupted the stream. Encoding once makes both agree.
+
+Same family as the LMS characters-vs-octets trap: anything that reaches a
+**socket, a database or a digest** needs bytes. `tools/t_control.pl` asserts
+both directions.
+
+## TRAP: a spurious hand-over is unrecoverable
+
+The first cut of `_handedOver` fired on *"the playlist index changed **or** the
+uri matches"*. Live, it declared the hand-over **0.2 s** after queueing the
+track, while HQPlayer was still playing the previous one.
+
+**That failure does not self-correct.** `hqURL` then names a track HQPlayer is
+not playing and `hqPrevURL` names the one it **is**, so `_isStale` suppresses
+*every* push from then on as "the previous track" — position frozen, LMS
+showing the wrong track, no way out short of restarting the player.
+
+Two changes, and both are needed:
+
+* **The uri is a VETO, not a hint.** On tier 1 every track has its own url, so a
+  push naming a url that is *not* the one we queued is positive evidence the
+  hand-over has **not** happened, whatever the index says. The index is used
+  alone only when the push carries no uri at all, and then only an **increase**
+  counts — HQPlayer reports `track="0"` whenever it is not playing, so
+  "changed" reads an ordinary stop as an advance. The append must also be
+  **acknowledged** first.
+* **The stale suppression is bounded** (`STALE_LIMIT`, 5). A track change
+  straddles one or two pushes; it never legitimately straddles five. Past that,
+  HQPlayer's account of what it is playing beats ours — adopt it, log a
+  warning, carry on. A few seconds of wrong elapsed time is a far better
+  failure than a player that has to be restarted.
 
 ## TRAP: the client object is a blessed ARRAY
 
@@ -401,10 +585,12 @@ pushed message and maps it onto the controller callbacks:
 
 | HQPlayer | LMS |
 |---|---|
-| `state` → 2, first time **for an acknowledged track** | `playerTrackStarted` **only** |
+| `state` → 2, first time **for an acknowledged track** | `playerTrackStarted`, then `playerReadyToStream` (the request for the next track — see Gapless) |
+| `track` moves on with something pre-queued | `playerTrackStarted`, then `playerReadyToStream` |
 | position advancing | `playerStatusHeartbeat` |
-| `state` 2 → 0, not ours | `playerEndOfStream` + `playerReadyToStream` + `playerStopped` |
-| command rejected | `playerStreamingFailed('PROBLEM_OPENING')` |
+| `state` 2 → 0, not ours, nothing held | `playerEndOfStream` + `playerReadyToStream` + `playerStopped` |
+| `state` 2 → 0, not ours, a tier 2 track held | nothing — the held track is loaded instead |
+| command rejected **on a full load** | `playerStreamingFailed('PROBLEM_OPENING')` |
 
 ### TRAP: a track change straddles the status stream
 
@@ -861,6 +1047,28 @@ HTTP played correctly:
   `digital_volume_control: 1` and `use_volume_control: 1` — so fixed-volume
   detection correctly stayed off on a variable instance.
 
+* **`<VolumeRange/>` on the control API** — 2026-08-28:
+  `<VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>`. Same range UPnP
+  reports, in plain dB, on the socket already open.
+* **`<Status subscribe="0"/>` is a one-shot poll** — 2026-08-28: one reply and
+  no push stream, against `subscribe="1"` (and the bare `<Status/>`) which
+  subscribes.
+* **`<metadata length="…"/>` is accepted, in seconds** — 2026-08-28:
+  `length="12.7"` reads back `length="13"` on the playlist item and
+  `length="12.699"` on `<Status/>`. Without it HQPlayer shows no duration at
+  all for an http:// item.
+* **Non-ASCII metadata survives the wire as UTF-8 octets** — 2026-08-28:
+  `song="Lush 3‒1"` (U+2012 FIGURE DASH) written with `PlaylistAdd` and read
+  back byte-identical with `PlaylistGet`. HQPlayer was never the problem; the
+  plugin was sending characters.
+* **Gapless, end to end on the protocol** — 2026-08-28, two tracks of 12.7 s
+  and 17.9 s: `tracks_total` 1 → 2 on the append, `track` 1 → 2 at 12.5 s with
+  **no `state` 0 between the tracks**, clean `state` 0 at the end of the last
+  item, daemon alive. See "Gapless".
+* **`queued="1"` kills the daemon and `queued="0"` does not** — 2026-08-28,
+  four controlled runs. See the trap section above.
+* **`<PlayNextURI>` kills the daemon** — 2026-08-28. See "Gapless".
+
 **Watch for a silent output-format mismatch.** When HQPlayer's output format
 exceeds what the endpoint accepts, it reports `state=2` and returns OK to
 everything while rendering nothing. The only evidence is `process_speed=0` /
@@ -910,9 +1118,10 @@ able to kill the daemon.
 **Two things reach it, and both are ordinary:**
 
 * **End of track.** HQPlayer auto-advances (`Next (0)`) when a track finishes.
-  This bridge feeds it exactly one URI at a time — gapless pre-queuing is not in
-  v1 — so *every* track end is an end-of-playlist, and every one of them calls
-  `GetAlbumGain` past the end.
+  The bridge fed it exactly one URI at a time, so *every* track end was an
+  end-of-playlist and every one of them called `GetAlbumGain` past the end.
+  (Since gapless the playlist holds up to two items, so this is reached once per
+  run rather than once per track — see "Gapless" below.)
 * **Stop.** `clHQPlayerEngine::Stop()` takes the same path, which is why
   pressing Stop in HQPlayer's own UI crashes it, with no LMS involved at all.
 
@@ -997,12 +1206,205 @@ If `GetAlbumGain(): trackn > last` is ever seen again, the fallback is the
 user-side switch — `playlist_album_gain="0"` in `~/.hqplayer/hqplayerd.xml` —
 **not** repeat. Repeat trades a crash for a player that cannot advance.
 
-**Still not built:** pre-queueing the next track for gapless. `PlaylistAdd
-queued="1"` does work, but on tier 2 every track is the same
-`/stream.mp3?player=` URL and a second connection to that single-consumer
-endpoint tears the first; and a playlist HQPlayer can advance into on its own
-stops reporting `state` 0 at end of track, which is the signal the state
-machine is built on.
+**Pre-queueing is now built** — see "Gapless" below. The objection recorded
+here, that a playlist HQPlayer can advance into on its own stops reporting
+`state` 0 at end of track, was right and is answered rather than dodged: the
+transition is read off the playlist index instead, and `state` 0 now means end
+of *playlist*, which is what the end-of-stream path always wanted it to mean.
+The tier 2 objection stands unchanged and is why tier 2 is excluded.
+
+## THE API IS DOCUMENTED — read the vendor's client, do not probe blind
+
+`hqp-control-601-src/` in the repo root — and the `hqp-control-601-src.zip` it
+came from — is **Signalyst's own source** for their `hqp-control` client. It is
+committed unpacked so it can be grepped directly, and it is MIT licensed
+(`COPYING`), so redistributing it here is fine. `ControlInterface.cpp` writes every command this API
+has and parses every reply, so it is the authority. Months of this file's
+protocol notes were reconstructed by probing a live daemon and guessing at
+attribute names — several of them wrongly, each recorded and then corrected in
+place. **Read `ControlInterface.cpp` first.** The complete command list is now
+copied into `Control.pm` above `%KNOWN`.
+
+**TRAP WHEN EXTRACTING THE COMMAND LIST.** One command — the most useful one
+here — is written as `writeEmptyElement("VolumeRange")` with a **plain string
+literal**, while every other command uses `QStringLiteral(...)`. A grep for
+`QStringLiteral` misses it, and this file did exactly that the first time
+round. Match both forms.
+
+What it settles that had been open or wrong:
+
+* **`<VolumeRange/>` IS A CONTROL COMMAND — see below. UPnP.pm can go.**
+* **`<Status subscribe="0|1"/>` takes an explicit flag.** Verified live:
+  `subscribe="0"` is a genuine **one-shot poll** — one reply, no push stream —
+  and `subscribe="1"` (or the bare `<Status/>` the plugin sends) subscribes.
+  So a status *query* need not touch the subscription at all.
+* **`<PlayNextURI value="…"><metadata/></PlayNextURI>` exists** — note `value`,
+  not `uri`. **It kills the daemon; see "Gapless".**
+* **`<Play last="0|1"/>` takes a flag** saying whether this is the last track.
+  The plugin sends a bare `<Play/>`.
+* `PlaylistAdd` also takes `start` and `freewheel`, neither of which the plugin
+  sends. `start` looks like "begin playing on accept", which would fold the
+  chained `<Play/>` into one command.
+* **Keep-alive is a single space** written raw to the socket
+  (`csocket->write(" ")`), not an XML command.
+* **HQPlayer DOUBLE-ESCAPES text metadata.** The client runs `fromEscaped()` —
+  a second `&amp;`/`&lt;`/`&quot;` pass — over every text field it reads *after*
+  the XML parser has already unescaped once. It does **not** double-escape on
+  the way in, so `Control::escape` is right; but `Control::parseChildren`
+  unescapes only once, so any text read back is one pass short. Harmless today
+  (the plugin only reads `uri`, `samplerate` and `bits`, and neither tier's URL
+  contains `&`) — but a URL that ever grows a query string with `&` would break
+  the exact-match `uri` comparisons in `_isStale` and `_handedOver`.
+* **Session authentication is Ed25519** with a Signalyst-issued per-client key
+  (`SessionAuthentication`, then `secure_uri`/`secure_value` ChaCha20Poly1305).
+  Not available to a third party and not needed — plain `uri` works.
+
+## Gapless
+
+**VERIFIED live 2026-08-28, engine 6.0.4.** Two mechanisms were candidates and
+the probe settled it — decisively, in both directions.
+
+### `PlaylistAdd queued="1"` — this is the one. It works.
+
+```
+t      state track  of   queued  position  uri
+0.0    2     1      1    0       0         .../458773/download.flac   <- A playing
+2.7    2     1      2    0       2.59      .../458773/download.flac   <- B accepted, still on A
+12.5   2     2      2    1       0         .../458770/download.flac   <- ADVANCE, no state 0
+29.7   0     0      0    0       0                                    <- clean end of playlist
+```
+
+Track A is 12.7 s and the advance is at 12.5 s; A+B is 30.6 s and the stop is at
+29.7 s. Every question answered yes:
+
+* the second item lands **while the first is playing** — `tracks_total` 1 → 2
+* HQPlayer advances **by itself**, and `track` 1 → 2 marks it with **no
+  `state` 0 in between**
+* `state` still reaches **0 at the end of the last item**, repeat off
+* the daemon was **alive** afterwards (`GetInfo` answered)
+
+`queued` on `<Status/>` reads 1 from the advance onward, so it appears to mean
+"this track came off the queue" rather than "a hand-over is pending" — either
+way `track` is the signal `_handedOver` should keep using.
+
+### `<PlayNextURI>` — DO NOT SEND IT. IT KILLS THE DAEMON.
+
+Sent over a playing playlist item, it answered `result="OK"`, the very next
+`<Status/>` showed it had **replaced** the playing uri rather than queuing
+behind it, and then **hqplayerd exited**: both 4321 and 8019 stopped listening
+(`Connection refused`, not a reset) and it did not come back on its own.
+
+This is the same class of failure as `clPlaylist::GetAlbumGain(): trackn > last`
+— an unhandled throw out of `clPlayerDaemon::Main()`. It is in `%KNOWN` only so
+`tools/probe_gapless.py` can re-test it deliberately on a future engine; the arm
+is **default-off** and prints a warning.
+
+**The inference that led here was reasonable and still wrong.** `<Status/>`
+carrying a `queued` boolean and `<Play last="0|1"/>` taking a "more is coming"
+flag both pointed at `PlayNextURI` being the intended primitive, and it is
+plainly *meant* for this. It is simply not safe on this engine. Inference from
+an API's shape is a reason to test, never a reason to ship.
+
+```
+python3 tools/probe_gapless.py 192.168.1.238 \
+  http://192.168.1.234:9000/music/458773/download.flac \
+  http://192.168.1.234:9000/music/458770/download.flac
+```
+
+**The gap was ours, not HQPlayer's.** HQPlayer is gapless between the items of
+its own playlist. The bridge fed it exactly one item at a time, so every track
+end was an end of playlist: HQPlayer stopped, LMS noticed the stop on the next
+status push, resolved the next track, and ran a fresh four-command load. That
+round trip is the gap.
+
+The fix is to be a **two-deep player**, which is what a real Squeezebox is.
+
+### The LMS half
+
+`play()` is called for two different things now, and telling them apart is the
+whole of it:
+
+| | trigger | what it sends |
+|---|---|---|
+| **start this track** | any ordinary `play()` | the four-command load in `_startTrack` / `_queueTrack` |
+| **here is the next one** | `play()` after **we** asked, via `_armNextTrack` | one `<PlaylistAdd … queued="1">`, nothing else |
+
+The request is recognised by **our own flag** (`hqArmNext`), never guessed from
+the controller's state — a guess would misread the first `play()` after a
+pause, a jump or a sync change. The flag is consumed by *every* `play()`, so a
+stale one cannot swallow a later call.
+
+`_armNextTrack` sends `playerReadyToStream` while the track is playing, which
+is exactly what a Squeezebox's decoder does when it can take another stream.
+`ReadyToStream` in the PLAYING/STREAMING cell is `_NextIfMore`: LMS resolves the
+next playlist entry and calls `play()` again, leaving the playing track alone.
+At the end of the playlist it does nothing at all, which is why nothing here has
+to know how long the playlist is.
+
+**This is the note that used to say the opposite.** `_onStatus` carried
+"ReadyToStream must NOT be sent while a track is playing… we are not gapless".
+That was true while every `play()` replaced the playing track. It is now the
+first half of the feature.
+
+### The status half — there is no `state` 0 between tracks
+
+With two items on the playlist HQPlayer never stops at the boundary, so the
+signal the whole state machine was built on is simply absent there. Two
+attributes carry the transition instead, and `_handedOver` takes either:
+
+* **`track`** — HQPlayer's own playlist index, numbered from 1, on every
+  `<Status/>` next to `tracks_total`. Primary.
+* **the `<metadata uri="">` child**, which on tier 1 is unique per track. Kept
+  for an engine that does not report `track`.
+
+Both are **one-sided**: the check only runs while something has actually been
+pre-queued, and the uri test must match the exact url we queued. The worst
+either can do is *fail to notice* an advance, which degrades to the old
+behaviour — HQPlayer reaches the end of its playlist, reports `state` 0, and LMS
+loads the next track the slow way. Neither can misfire on ordinary playback.
+
+`state` 0 therefore now means **end of playlist**, which is what the
+end-of-stream path always wanted it to mean.
+
+### Tier 2 is excluded, and holds instead of appending
+
+Every tier 2 track is the **same** `/stream.mp3?player=` URL. That endpoint
+serves one consumer at a time, and it is fed by LMS's own
+`songStreamController` — which `_Stream` **closes** as soon as it opens the next
+one. Two playlist items pointing at it would tear the track that is playing.
+
+So a tier 2 next track is **held**, not appended, and loaded the ordinary way
+when the current track ends (`hqNext` with `mode => 'load'`). That is the
+pre-gapless behaviour minus the time LMS used to spend resolving the track
+*after* the gap had already started. `_armNextTrack` also declines to ask at all
+while a tier 2 track is playing, so LMS is never made to open a source stream
+minutes before it is needed.
+
+### Three things that had to change with it
+
+* **`flush()` was a no-op stub** and is now real. `_FlushGetNext` calls it when
+  LMS discards the track it handed over — a playlist edit, or a jump — and
+  `<PlaylistClear/>` is exactly right: verified live, it keeps the item that is
+  **playing** and drops the rest. If the append is still in flight the clear
+  queues behind it on the same socket, so it cannot overtake the item it is
+  meant to remove.
+* **A refused pre-queue is not reported as a failed load.**
+  `playerStreamingFailed` leads to `_SyncStopNext` → `_getNextTrack` →
+  `play()`, and *that* `play()` is a full load — it would stop a track that is
+  playing perfectly well. The track is demoted to `mode => 'load'` instead and
+  the ordinary load reports the failure at end of track, in the state the error
+  handling was written for.
+* **`playerBufferReady` is skipped when the controller is already PLAYING.**
+  `BufferReady` in the PLAYING row is `_Invalid` — a warning and a backtrace.
+  The deferred tier 2 load is the case that hits it.
+
+### What is deliberately NOT done
+
+`hqGen` is **not** bumped for a hand-over. The generation belongs to the track
+that is playing and its callbacks must keep running; bumping it there would make
+the running track supersede itself. A hand-over also cannot carry a **seek** —
+`<Seek>` acts on what is playing now, not on a queued item — so an armed
+`play()` with seekdata falls back to the full load.
 
 ## Why the load runs on the control socket: the crash
 
@@ -1099,10 +1501,16 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Still unverified
 
-* **How HQPlayer presents fixed volume.** Needs the setting flipped on a live
-  instance, then a `<Status/>` and a `GetVolumeDBRange`. Detection currently
-  assumes a zero-width range, and falls back to `_watchForFixed` (three sends
-  that change nothing), which does not depend on knowing.
+* **Gapless END TO END through LMS.** The *protocol* is verified (see
+  "Gapless"); what has not been run once is the plugin driving it — a real LMS
+  queue, `_armNextTrack` → `play()` → `_appendTrack` → `_handedOver`, a skip
+  mid-hand-over, a playlist edit hitting `flush()`, and a tier 1 → tier 2
+  boundary taking the deferred-load path.
+* **How HQPlayer presents fixed volume.** Now has an obvious answer to test:
+  `enabled` on `<VolumeRange/>`. Flip the setting on a live instance and read
+  it back. Detection currently assumes a zero-width range, and falls back to
+  `_watchForFixed` (three sends that change nothing), which does not depend on
+  knowing.
 * Seek initiated from LMS, and tier 2 (`/stream.mp3?player=`) Content-Type
   matching the format actually streamed.
 * `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS
@@ -1112,6 +1520,6 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Not in v1
 
-Gapless pre-queuing, HQPlayer DSP/filter/mode selection from LMS, HQPlayer's own
+Gapless on tier 2, HQPlayer DSP/filter/mode selection from LMS, HQPlayer's own
 library browsing, multi-room sync with hardware players, editable settings,
 plugin icon artwork, HTTP auth on the LMS URLs when a server password is set.

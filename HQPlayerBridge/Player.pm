@@ -41,6 +41,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
     hqVolSent hqVolSentAt hqVolMissed
     hqGen hqPlayAck hqURL hqPrevURL
+    hqNext hqArmNext hqTrackNo hqStaleRun
 ) );
 
 my $log        = logger('plugin.hqplayerbridge');
@@ -103,6 +104,10 @@ sub new {
         hqWanted     => 'stop',
         hqGen        => 0,
         hqPlayAck    => 0,
+        hqNext       => undef,
+        hqArmNext    => 0,
+        hqTrackNo    => undef,
+        hqStaleRun   => 0,
     );
 
     return $client;
@@ -183,7 +188,11 @@ sub startAt       { 1 }
 sub resumeAt      { 1 }
 sub skipAhead     { 1 }
 sub pauseForInterval { 1 }
-sub flush         { 1 }
+
+# flush() is NOT a stub any more - see the gapless section below.  It was one
+# for as long as HQPlayer's playlist only ever held the track that was
+# playing; now that a second one can be sitting behind it, LMS discarding the
+# track it handed us early has to reach HQPlayer's playlist too.
 
 # ---------------------------------------------------------------------------
 # The control link, wired up by Plugin.pm
@@ -301,11 +310,23 @@ sub _metadata {
 
     # Deliberately the same four fields the DIDL carried, and no more: this is
     # the set that was proven equivalent end to end.
+    # `length` IS ACCEPTED, IN SECONDS, AND IT IS WHY HQPLAYER'S UI SHOWED NO
+    # DURATION.  HQPlayer does NOT probe an http:// item for its duration when
+    # it accepts it - a bridge-added track came back from <PlaylistGet/> with
+    # length="0" (and rate/bits/channels/bitrate all 0 too).  The old UPnP path
+    # filled it in because DIDL carries <res duration="">; the XML path has to
+    # be told.  Verified live 2026-08-28: length="12.7" reads back as
+    # length="13" on the playlist item and length="12.699" on <Status/>.
+    my $secs = eval { $track->secs };
+
     my @f = (
         song   => eval { $track->title }      || '',
         artist => eval { $track->artistName } || '',
         album  => eval { $track->albumname }  || '',
         cover  => $self->_coverURL($track)    || '',
+        # Guarded rather than defaulted: a zero length is worse than none - it
+        # is what the UI was already showing.
+        ( $secs && $secs > 0 ? ( length => $secs ) : () ),
     );
 
     my $meta = '<metadata';
@@ -370,6 +391,18 @@ sub _coverURL {
 sub _newGeneration {
     my $self = shift;
 
+    # Anything handed over early belonged to the run that is ending.  Nothing
+    # extra has to be sent to HQPlayer: the four-command load opens with
+    # <PlaylistClear/>, which drops a pre-queued item along with everything
+    # else that is not playing.
+    $self->hqNext( undef );
+    $self->hqArmNext( 0 );
+
+    # HQPlayer numbers its playlist from 1 and starts again after a clear, so
+    # the index we last saw means nothing across a load - and leaving it set
+    # would make the first status of the new track look like an advance.
+    $self->hqTrackNo( undef );
+
     my $gen = ( $self->hqGen || 0 ) + 1;
     $self->hqGen($gen);
 
@@ -391,6 +424,21 @@ sub _superseded {
     return 1;
 }
 
+# play() is called for TWO different things, and telling them apart is the
+# whole of gapless.
+#
+#   1. Start playing THIS track, now.  Replaces whatever HQPlayer is doing:
+#      the four-command load in _queueTrack.  Every play() was this before.
+#
+#   2. Here is the NEXT track, while the current one is still playing.  LMS
+#      only ever sends this because we asked for it (_armNextTrack), so the
+#      request is recognised by our own flag rather than guessed at from the
+#      controller's state - a guess would misread the first play() after a
+#      pause, a jump or a sync change.
+#
+# The second one must NOT touch the track that is playing.  A <Stop/> or a
+# <PlaylistClear/> there kills it; the whole point is that HQPlayer makes the
+# transition itself, out of its own playlist, with no gap.
 sub play {
     my ( $self, $params ) = @_;
 
@@ -399,6 +447,23 @@ sub play {
         $log->error( $self->name . ': play() with no song' );
         return 0;
     };
+
+    my $seek = $params->{seekdata} ? $params->{seekdata}->{timeOffset} : undef;
+
+    # Consume the flag either way.  One left armed would make an ordinary
+    # play() later on think it was a hand-over and never start anything.
+    my $armed = $self->hqArmNext ? 1 : 0;
+    $self->hqArmNext( 0 );
+
+    return $self->_handOver( $song, $seek )
+        if $armed && $self->_canHandOver($seek);
+
+    return $self->_startTrack( $song, $seek );
+}
+
+# Case 1: replace whatever HQPlayer is playing with this track.
+sub _startTrack {
+    my ( $self, $song, $seek ) = @_;
 
     my $url = $self->_resolveURL($song);
 
@@ -436,12 +501,230 @@ sub play {
     # new one.
     $self->bufferReady( 0 );
 
-    my $seek = $params->{seekdata} ? $params->{seekdata}->{timeOffset} : undef;
-
     $self->_queueTrack( $url, $song, $seek );
 
     # The controller counts the player as started from here; actual playback
     # is confirmed by the status poll below.
+    return 1;
+}
+
+# ---------------------------------------------------------------------------
+# Gapless: hand the next track to HQPlayer's own playlist
+#
+# HQPlayer is gapless between the items of its OWN playlist - it is the whole
+# reason people run it - but this bridge fed it exactly one item at a time, so
+# every track end was an end of playlist and the next track only started after
+# LMS had noticed the stop and run a fresh four-command load.  That round trip
+# is the gap.
+#
+# The fix is to be a two-deep player, which is what a real Squeezebox is: ask
+# LMS for the next track while the current one plays, append it behind the
+# playing item, and let HQPlayer make the transition.  Nothing about the LMS
+# side is unusual - ReadyToStream while PLAYING is exactly the signal a
+# Squeezebox's decoder sends when it can take another stream.
+#
+# TWO THINGS CHANGE ON THE STATUS SIDE, and both are handled in _onStatus:
+#
+#   * There is NO state 0 between tracks any more, because HQPlayer never
+#     stops.  The hand-over is observed instead as the playlist index on
+#     <Status/> moving on - `track="1"` to `track="2"`.
+#   * state 0 now means end of PLAYLIST rather than end of track, which is
+#     what the existing end-of-stream path always wanted it to mean.
+# ---------------------------------------------------------------------------
+
+# Is a hand-over possible at this instant?
+sub _canHandOver {
+    my ( $self, $seek ) = @_;
+
+    # Only while a track is genuinely running under our own control.  hqStarted
+    # alone is not enough: hqPlayAck says the Play that is running is the one
+    # WE sent for the track we think is playing.
+    return 0 unless $self->hqStarted && $self->hqPlayAck;
+    return 0 unless ( $self->hqWanted || '' ) eq 'play';
+    return 0 unless $self->hqControl;
+
+    # A hand-over has nowhere to put a seek - <Seek> acts on what is playing
+    # now, not on a queued item.  The full load does have somewhere, so let it
+    # take this one.
+    return 0 if $seek && $seek > 0;
+
+    return 1;
+}
+
+# Case 2: LMS has handed us the next track early.
+sub _handOver {
+    my ( $self, $song, $seek ) = @_;
+
+    # _resolveURL sets hqTier as a side effect, so remember the playing
+    # track's tier: the answer below may not be for the same tier at all, and
+    # until the hand-over actually happens hqTier still describes what is
+    # playing.
+    my $tier = $self->hqTier;
+    my $url  = $self->_resolveURL($song);
+
+    return $self->_appendTrack( $url, $song )
+        if ( $self->hqTier || 0 ) == 1;
+
+    # TIER 2 CANNOT RIDE HQPLAYER'S PLAYLIST.  Every tier 2 track is the SAME
+    # /stream.mp3?player= URL, that endpoint serves one consumer at a time, and
+    # it is fed by LMS's own songStreamController - which _Stream closes the
+    # moment it opens the next one.  Two items pointing at it would tear the
+    # track that is playing.
+    #
+    # So hold the track and load it the ordinary way when the current one ends.
+    # That is exactly the pre-gapless behaviour, minus the time LMS used to
+    # spend resolving the track after the gap had already started.
+    $self->hqTier($tier);
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': the next track is tier 2 - holding it for a normal load at end of track' );
+
+    $self->hqNext( { mode => 'load', song => $song, seek => $seek } );
+
+    return 1;
+}
+
+# Append behind the playing item.  NO <Stop/> and NO <PlaylistClear/>: those
+# are what the four-command load uses to REPLACE a track, and either one here
+# would kill the track that is playing.
+sub _appendTrack {
+    my ( $self, $url, $song ) = @_;
+
+    my $e    = \&Plugins::HQPlayerBridge::Control::escape;
+    my $meta = $self->_metadata($song);
+
+    # Deliberately NOT a new generation.  hqGen belongs to the track that is
+    # playing and its callbacks must keep running; bumping it here would make
+    # the running track supersede itself.
+    my $gen = $self->hqGen || 0;
+
+    $self->hqNext( { mode => 'queue', url => $url, song => $song, acked => 0 } );
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ": pre-queuing the next track for a gapless hand-over - $url" );
+
+    # queued="0", NOT queued="1".  THIS ATTRIBUTE CRASHES HQPLAYERD.
+    #
+    # Isolated live 2026-08-28 on engine 6.0.4, four controlled runs:
+    #
+    #   both items added before Play, queued="0"   -> plays through, SURVIVES
+    #   append mid-playback, queued="0"            -> plays through, SURVIVES
+    #   append mid-playback, queued="1"            -> end of playlist, DAEMON EXITS
+    #   ...and again, with the playlist trimmed
+    #      back to one item before the end         -> DAEMON EXITS anyway
+    #
+    # `queued="1"` puts the item somewhere that leaves HQPlayer's own track
+    # index inconsistent, and at the end of the LAST item the engine walks past
+    # it - `clPlaylist::GetAlbumGain(): trackn > last`, unhandled out of
+    # clPlayerDaemon::Main(), process gone.  Trimming the playlist first does
+    # not undo it, so the damage is done at append time, not at the end.
+    #
+    # queued="0" appends just the same - CLAUDE.md's note that PlaylistAdd
+    # APPENDS regardless of its attributes is exactly why this works - and the
+    # gapless advance is identical: tracks_total goes 1 -> 2, track goes 1 -> 2
+    # with no state 0 between the tracks.  We get the whole feature and the
+    # daemon lives.
+    $self->_send(
+        '<PlaylistAdd uri="' . $e->($url) . '" queued="0">' . $meta . '</PlaylistAdd>',
+        sub {
+            # TRAP: ($attrs, $raw), not ($res, $err) - see _queueTrack.
+            my ( $res, $raw ) = @_;
+
+            return if $self->_superseded( $gen, 'PlaylistAdd (hand-over)' );
+
+            my $next = $self->hqNext;
+            return unless $next && ( $next->{url} || '' ) eq $url;
+
+            if ( !$res ) {
+                # DO NOT report this as a failed load.  StreamingFailed here
+                # leads to _SyncStopNext -> _getNextTrack -> play(), and that
+                # play() is not a hand-over - it is a full load, which would
+                # stop the track that is still playing perfectly well.  A
+                # refused pre-queue is not a reason to interrupt anything.
+                #
+                # Demote it to a held track instead: the ordinary load runs at
+                # end of track, in the state the error handling was written
+                # for, and reports the failure properly then if it is real.
+                $log->warn( $self->name . ': HQPlayer would not pre-queue the next track ('
+                    . ( defined $raw ? $raw : 'no reply' )
+                    . ') - falling back to a normal load at end of track' );
+
+                $next->{mode} = 'load';
+                delete $next->{url};
+
+                return;
+            }
+
+            $next->{acked} = 1;
+
+            main::INFOLOG && $log->is_info && $log->info(
+                $self->name . ': the next track is queued behind the playing one' );
+        } );
+
+    return 1;
+}
+
+# Ask LMS for the next track.  Called when a track has just been confirmed
+# playing - at the start of a run, and again after each hand-over.
+sub _armNextTrack {
+    my $self = shift;
+
+    # One hand-over at a time.  _NextIfMore makes the same check on its side
+    # (it will not fetch a third song while two are queued), but the flag has
+    # to be right here too or a second arm would consume the first's play().
+    return if $self->hqNext || $self->hqArmNext;
+
+    return unless $self->hqControl;
+
+    # Gapless is a tier 1 property - see _handOver.  Arming on tier 2 would
+    # still be safe, because the track would simply be held, but it would have
+    # LMS open a source stream minutes before it is played for no gain.
+    return unless ( $self->hqTier || 0 ) == 1;
+
+    my $c = $self->controller or return;
+
+    # ReadyToStream in PLAYING/STREAMING is _NextIfMore: LMS resolves the next
+    # playlist entry and calls play() again with it, leaving the track that is
+    # playing alone.  At the end of the playlist it does nothing at all, which
+    # is why nothing here has to know how long the playlist is - hqArmNext is
+    # just consumed by whatever the next play() turns out to be.
+    #
+    # Set the flag BEFORE the call: for a local track LMS resolves the next
+    # song synchronously and play() is re-entered before this returns.
+    $self->hqArmNext( 1 );
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': asking LMS for the next track' . _ctlState($c) );
+
+    $c->playerReadyToStream($self);
+
+    return;
+}
+
+# LMS is discarding the track it handed us early: the playlist was edited, or
+# the user jumped.  _FlushGetNext drops it from the song queue, calls this, and
+# then asks for a replacement - which arrives as an ordinary play() with
+# hqArmNext clear, so it takes the full load path and starts cleanly.
+#
+# <PlaylistClear/> is exactly the right command here: verified live, it keeps
+# the item that is PLAYING and drops the rest.  If the append is still in
+# flight the clear queues behind it on the same socket, so it cannot overtake
+# the item it is meant to remove.
+sub flush {
+    my $self = shift;
+
+    my $next = $self->hqNext;
+
+    $self->hqNext( undef );
+    $self->hqArmNext( 0 );
+
+    return 1 unless $next && $next->{mode} eq 'queue';
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': flush - dropping the pre-queued track' );
+
+    $self->_send('<PlaylistClear/>');
+
     return 1;
 }
 
@@ -572,7 +855,14 @@ sub _queueTrack {
             $self->bufferReady( 1 );
 
             my $c = $self->controller;
-            $c->playerBufferReady($self) if $c;
+
+            # ...but only report it while the controller still needs the
+            # answer.  BufferReady in the PLAYING row of the state table is
+            # _Invalid - a warning and a backtrace - and the controller is
+            # already PLAYING when this load is the deferred hand-over of a
+            # tier 2 track (see _handOver): the buffer question was settled by
+            # the track that has just finished.
+            $c->playerBufferReady($self) if $c && !$c->isPlaying(1);
 
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ': buffer ready' . _ctlState( $self->controller ) );
@@ -1189,19 +1479,159 @@ sub _ctlState {
 # child, or tier 2, where every track comes off the same /stream.mp3 URL - is
 # treated as current, so this can only ever suppress a push we can positively
 # identify as belonging to the previous track.  It can never wedge playback.
+use constant STALE_LIMIT => 5;
+
 sub _isStale {
     my ( $self, $uri ) = @_;
 
     return 0 unless defined $uri && $uri ne '';
 
     my $prev = $self->hqPrevURL;
-    return 0 unless defined $prev && $prev ne '' && $uri eq $prev;
+
+    if ( !( defined $prev && $prev ne '' && $uri eq $prev ) ) {
+        $self->hqStaleRun( 0 );
+        return 0;
+    }
 
     my $cur = $self->hqURL;
-    return 0 if defined $cur && $uri eq $cur;
+
+    if ( defined $cur && $uri eq $cur ) {
+        $self->hqStaleRun( 0 );
+        return 0;
+    }
+
+    # THE SUPPRESSION IS BOUNDED, and it has to be.
+    #
+    # This test suppresses a push because our bookkeeping says it describes a
+    # track we have moved on from.  If that bookkeeping is ever WRONG - and a
+    # spurious hand-over made it wrong, live - then every push is suppressed,
+    # the position freezes, LMS keeps showing a track HQPlayer is not playing,
+    # and there is no path out of it short of restarting the player.
+    #
+    # A track change straddles one or two pushes, which is what this exists
+    # for; it never legitimately straddles five.  Past that, HQPlayer's account
+    # of what it is playing beats ours, so adopt it and carry on.  A few
+    # seconds of wrong elapsed time is a far better failure than a player that
+    # has to be restarted.
+    my $run = ( $self->hqStaleRun || 0 ) + 1;
+    $self->hqStaleRun( $run );
+
+    if ( $run > STALE_LIMIT ) {
+        $log->warn( $self->name
+            . ": $run consecutive status pushes suppressed as stale - our idea of the"
+            . " current track is wrong.  Adopting HQPlayer's: $uri" );
+
+        $self->hqPrevURL( undef );
+        $self->hqURL( $uri );
+        $self->hqStaleRun( 0 );
+
+        return 0;
+    }
 
     main::DEBUGLOG && $log->is_debug && $log->debug(
-        $self->name . ': ignoring a status push for the previous track' );
+        $self->name . ": ignoring a status push for the previous track ($run)" );
+
+    return 1;
+}
+
+# Has HQPlayer advanced into the track we pre-queued?
+#
+# THIS IS THE SIGNAL THAT REPLACES state 0 BETWEEN TRACKS.  With two items on
+# HQPlayer's playlist it never stops at a track boundary - which is the point -
+# so the transition has to be read out of the status stream some other way.
+# Two attributes carry it, and either is enough:
+#
+#   * `track` is HQPlayer's own playlist index, numbered from 1, and it is on
+#     every <Status/> next to `tracks_total`.  This is the primary signal and
+#     it works whatever the uri looks like.
+#   * the <metadata uri=""> child, which on tier 1 is unique per track.  Kept
+#     as corroboration for an engine that does not report `track`.
+#
+# BOTH ARE ONE-SIDED.  This only runs while something has actually been
+# pre-queued (`hqNext`, mode `queue`), so neither can misfire on ordinary
+# single-track playback, and the uri test additionally has to match the exact
+# url we queued.  The worst either can do is fail to notice an advance, which
+# degrades to the pre-gapless behaviour: HQPlayer reaches the end of its
+# playlist, reports state 0, and LMS loads the next track the slow way.
+sub _handedOver {
+    my ( $self, $track, $meta ) = @_;
+
+    my $next = $self->hqNext;
+
+    return 0 unless $next && $next->{mode} eq 'queue';
+
+    # Not until HQPlayer has CONFIRMED it holds the track.  Before the ack
+    # there is nothing to advance into, and an index that moves inside that
+    # window is describing something else.
+    return 0 unless $next->{acked};
+
+    my $seen = $self->hqTrackNo;
+    my $uri  = $meta ? $meta->{uri} : undef;
+    my $want = $next->{url} || '';
+
+    # THE URI IS A VETO, NOT A HINT.  This is the correction to the first cut,
+    # which took "the playlist index changed" OR "the uri matches" and fired on
+    # either.  Live, it declared the hand-over 0.2s after queueing the track -
+    # while HQPlayer was still playing the previous one.
+    #
+    # A SPURIOUS ADVANCE IS THE WORST FAILURE IN THIS FILE, because it is not
+    # self-correcting: it points hqURL at a track HQPlayer is not playing and
+    # hqPrevURL at the one it IS, so _isStale then suppresses EVERY push from
+    # then on as "the previous track".  Position freezes, LMS shows the wrong
+    # track, and nothing recovers it.
+    #
+    # On tier 1 every track has its own url, so a push naming a url that is not
+    # the one we queued is positive evidence the hand-over has NOT happened,
+    # whatever the index says.  Require the match; never merely prefer it.
+    my $moved;
+
+    if ( defined $uri && $uri ne '' ) {
+        $moved = ( $uri eq $want );
+    }
+    else {
+        # Nothing to judge by but the index, so only an INCREASE counts:
+        # HQPlayer reports track="0" whenever it is not playing, so "changed"
+        # reads an ordinary stop as an advance.
+        $moved = ( defined $track && defined $seen
+                   && $track =~ /^\d+$/ && $seen =~ /^\d+$/
+                   && $track > $seen );
+    }
+
+    main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
+        . sprintf( ': hand-over check - track=%s seen=%s uri=%s want=%s -> %s',
+            defined $track ? $track : '?', defined $seen ? $seen : '?',
+            defined $uri ? $uri : '(none)', $want, $moved ? 'ADVANCED' : 'not yet' ) );
+
+    return 0 unless $moved;
+
+    my $controller = $self->controller or return 0;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ': HQPlayer advanced into the pre-queued track' . _ctlState($controller) );
+
+    $self->hqNext( undef );
+
+    # The pre-queued track is now the current one.  hqStarted and hqPlayAck
+    # both stay set: HQPlayer never stopped, and the <Play/> that is running is
+    # still the one we sent - which is exactly why there is no re-arming of
+    # hqExpectStop here either.  A stop from now on is a real end of playlist.
+    $self->hqPrevURL( $self->hqURL );
+    $self->hqURL( $next->{url} );
+
+    # Position is HQPlayer's own, and it restarts with the new track.  The seek
+    # offset belonged to the track that has just finished; a hand-over is never
+    # seeked (see _canHandOver), so the new one starts at zero.
+    $self->hqPosition( 0 );
+    $self->hqSeekOffset( 0 );
+
+    # Started in the PLAYING row of the state table is _Playing: it retires the
+    # song that finished and promotes the one that was streaming.  It is the
+    # ONLY thing to report - there was no end of stream and no stop, and saying
+    # otherwise would make LMS load the track it is already playing.
+    $controller->playerTrackStarted($self);
+
+    # And line up the one after it.
+    $self->_armNextTrack;
 
     return 1;
 }
@@ -1230,16 +1660,17 @@ sub _onStatus {
     # the root element.  The same child carries the uri HQPlayer is playing,
     # which is the only per-track identity in the status stream.
     my $stale = 0;
+    my $meta;
 
     if ( $raw && $raw =~ /<metadata\b/ ) {
-        my ($m) = Plugins::HQPlayerBridge::Control::parseChildren( $raw, 'metadata' );
+        ($meta) = Plugins::HQPlayerBridge::Control::parseChildren( $raw, 'metadata' );
 
-        if ($m) {
-            $stale = $self->_isStale( $m->{uri} );
+        if ($meta) {
+            $stale = $self->_isStale( $meta->{uri} );
 
             if ( !$stale ) {
-                $self->hqRate( $m->{samplerate} );
-                $self->hqBits( $m->{bits} );
+                $self->hqRate( $meta->{samplerate} );
+                $self->hqBits( $meta->{bits} );
             }
         }
     }
@@ -1258,6 +1689,15 @@ sub _onStatus {
     # even from a stale push.  Position and transport state are not: they
     # describe a track we have already moved on from.
     return if $stale;
+
+    # Did HQPlayer advance into a track we handed it early?  This has to run
+    # before the position below, because from this push on the position belongs
+    # to the NEW track.
+    my $track = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track' );
+
+    $self->_handedOver( $track, $meta ) if $self->hqNext;
+
+    $self->hqTrackNo($track) if defined $track;
 
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );
@@ -1298,15 +1738,18 @@ sub _onStatus {
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ': HQPlayer is playing' . _ctlState($controller) );
 
-            # ONLY Started here.
+            # Started, and then - separately - ReadyToStream.
             #
-            # ReadyToStream must NOT be sent while a track is playing: it is
-            # the "I can accept another stream" signal, and LMS answers it by
-            # streaming the NEXT song and calling play() again - which for this
-            # player means SetAVTransportURI + Play, clobbering the track that
-            # is still playing.  We are not gapless, so ReadyToStream belongs
-            # at end-of-track, below.
+            # ReadyToStream while a track is playing is the "I can take another
+            # stream" signal, and LMS answers it by resolving the next song and
+            # calling play() again.  That used to be fatal here, because every
+            # play() ran the four-command load and clobbered the track that was
+            # still playing.  It is now the FIRST HALF OF GAPLESS: play()
+            # recognises the call and appends rather than replaces.  See
+            # _armNextTrack, which also declines to ask on tier 2.
             $controller->playerTrackStarted($self);
+
+            $self->_armNextTrack;
         }
 
         $controller->playerStatusHeartbeat($self);
@@ -1332,9 +1775,37 @@ sub _onStatus {
     elsif ( $state == HQP_STOPPED ) {
 
         if ( $self->hqStarted && !$self->hqExpectStop ) {
-            # HQPlayer ran off the end of the track under its own steam, so
-            # this is end-of-stream: report it and let LMS advance.  Verified
-            # live: state goes 2 -> 0 when a track finishes.
+
+            # A track LMS handed over early that could NOT ride HQPlayer's own
+            # playlist - tier 2, see _handOver.  Load it now, the ordinary way.
+            # There is nothing to report to LMS: it has been streaming this
+            # song since the hand-over, and the playerTrackStarted at the far
+            # end of the load is what retires the one that just finished.
+            #
+            # This is the pre-gapless gap, and on tier 2 it is unavoidable -
+            # but LMS resolved the track minutes ago, so the gap is now just
+            # HQPlayer's own load.
+            my $next = $self->hqNext;
+
+            if ( $next && $next->{mode} eq 'load' ) {
+                $self->hqNext( undef );
+
+                main::INFOLOG && $log->is_info && $log->info(
+                    $self->name . ': end of track - loading the tier 2 track LMS handed over early'
+                        . _ctlState($controller) );
+
+                $self->_startTrack( $next->{song}, $next->{seek} );
+
+                return;
+            }
+
+            # Otherwise HQPlayer ran off the end of its playlist under its own
+            # steam, so this is end-of-stream: report it and let LMS advance.
+            # Verified live: state goes 2 -> 0 when the last track finishes.
+            #
+            # With a pre-queued track this is end of PLAYLIST rather than end
+            # of track - the hand-over between tracks never reaches state 0 at
+            # all, and is picked up by _handedOver instead.
             $self->hqStarted( 0 );
 
             main::INFOLOG && $log->is_info && $log->info(
@@ -1403,10 +1874,17 @@ sub songElapsedSeconds {
 # reached 0, `_onStatus` never reported end-of-track, and LMS never sent the
 # next track: a full LMS queue played its FIRST TRACK on repeat forever.
 #
-# Repeat is asserted OFF instead.  LMS owns the playlist; HQPlayer is a
-# one-track renderer here, and end-of-track has to be observable as state 0 or
-# the bridge cannot advance.  Asserting it also stops a user's own HQPlayer
-# repeat setting from silently breaking the advance.
+# Repeat is asserted OFF instead.  LMS owns the playlist, and the END of that
+# playlist has to be observable as state 0 or the bridge can never stop.
+# Asserting it also stops a user's own HQPlayer repeat setting from silently
+# breaking the advance.
+#
+# NOTE since gapless: HQPlayer's playlist now holds up to TWO items, so a
+# track boundary is no longer an end of playlist and no longer reaches
+# GetAlbumGain at all - the advance the note below describes only happens once
+# per run rather than once per track.  Repeat is still asserted off, for the
+# same reason and with more force: with it on the playlist would never end and
+# _onStatus would never see the state 0 that stops the player.
 #
 # AND THE OVERRUN NO LONGER HAPPENS.  Verified live 2026-08-28 against engine
 # 6.0.4, repeat off, a complete 13.5s track played to its natural end:

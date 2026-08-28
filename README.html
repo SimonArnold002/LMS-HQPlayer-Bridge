@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
   <div class="badges">
-    <span class="badge accent">v0.2.16</span>
+    <span class="badge accent">v0.2.19</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No audio through the plugin</span>
@@ -208,9 +208,9 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 </li>
 <li><strong>A silent output-format mismatch is HQPlayer's to report, not the plugin's.</strong> If HQPlayer's output format is set to something your endpoint can't accept, it reports itself as playing and answers every command normally while rendering nothing at all. There's no way to detect that from the control API — the evidence is only in HQPlayer's own log (<code>NAA output requested format not available!</code>). If a track looks like it's playing but you hear nothing, check the output format there first.
 </li>
-<li><strong>Not gapless.</strong> The next track is handed over when the current one ends, so there's a brief gap between tracks. Pre-queuing isn't implemented.
+<li><strong>Gapless on local files, not on streaming services.</strong> The next track is handed to HQPlayer's own playlist while the current one is still playing, so HQPlayer makes the transition itself with no gap. That needs each track to have its own URL, which is true of your local library but not of Qobuz, Tidal or radio — those all come through one LMS stream URL, so a streaming track is loaded when the previous one ends and there's a brief gap before it.
 </li>
-<li><strong>HQPlayer's repeat setting is turned off while the bridge is connected.</strong> LMS owns the queue, so the plugin hands HQPlayer one track at a time and needs to see it end in order to send the next. With repeat on, HQPlayer loops that single track instead and the queue never advances — so the plugin asserts repeat off whenever the control link comes up. Set repeat and shuffle in LMS, as you would for any other player.
+<li><strong>HQPlayer's repeat setting is turned off while the bridge is connected.</strong> LMS owns the queue, and the plugin needs to see HQPlayer's playlist actually end in order to stop. With repeat on it never ends, so the queue never advances — the plugin asserts repeat off whenever the control link comes up. Set repeat and shuffle in LMS, as you would for any other player.
 </li>
 <li><strong>HQPlayer's DSP settings aren't exposed.</strong> Filter, shaper, modulator, output mode and rate are set in HQPlayer, as before — the plugin doesn't change them and can't select them.
 </li>
