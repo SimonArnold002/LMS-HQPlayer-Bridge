@@ -715,14 +715,45 @@ sub _replayGain {
     # note on asserting below.
     $gain = 0 unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
 
-    # STRICT CEILING: WE NEVER BOOST.  Simon's call 2026-08-30, and it is not
-    # hypothetical - Qobuz's album gain for The Dark Side Of The Moon (50th
-    # Anniversary) is +6.68 dB, because the album is mastered quietly and
-    # ReplayGain normalises UP towards -18 LUFS as readily as down. 0.2.38 sent
-    # that figure verbatim. A boost into HQPlayer's modulator is a clipping
-    # risk for no benefit, so positive gains are floored at unity and only
-    # attenuation is ever passed on.
-    $gain = 0 if $gain > 0;
+    # A BOOST IS ALLOWED, BUT ONLY AS FAR AS THE PEAK PERMITS.
+    #
+    # ReplayGain normalises UP as readily as down: Qobuz's album gain for The
+    # Dark Side Of The Moon (50th Anniversary) is +6.68 dB because the album is
+    # mastered quietly, and -18 LUFS is a target rather than a maximum. 0.2.38
+    # sent that verbatim and HQPlayer applied `6.68 dB (2.15774)` - a 2.16x
+    # multiplier. 0.2.39 answered that by refusing every positive gain, which
+    # was over-cautious: it throws away legitimate headroom on quiet masters,
+    # and HQPlayer registered NO clipping through that playback (`clips="0"`,
+    # `apod="0"`).
+    #
+    # The right rule is the one ReplayGain already defines: the largest safe
+    # boost is -20*log10(peak), which is exactly Slim::Player::ReplayGain's
+    # preventClipping. Apply it ourselves rather than trusting it has been
+    # applied upstream - it demonstrably had not been, or +6.68 could not have
+    # reached us with an album peaking anywhere near full scale.
+    #
+    # NO PEAK MEANS NO BOOST. Without a peak there is no way to know what a
+    # boost would do, and guessing wrong clips. Attenuation is always safe and
+    # is never touched by any of this.
+    my $peak = eval { $track->replay_peak };
+    $peak = undef unless defined $peak && $peak =~ /^\s*[0-9]*\.?[0-9]+\s*$/ && $peak > 0;
+
+    if ( $gain > 0 ) {
+        $gain = defined $peak
+            ? Slim::Player::ReplayGain::preventClipping( $gain, $peak )
+            : 0;
+
+        # preventClipping only ever LOWERS a gain, but it hands back the
+        # original when the peak leaves room, so re-check rather than assume.
+        $gain = 0 if !defined $gain || $gain !~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+    }
+
+    # Logged whether or not it mattered: the peak is the one input to this we
+    # cannot see from outside LMS (the CLI exposes no peak for a remote track),
+    # so this line is how we learn which services populate it.
+    main::INFOLOG && $log->is_info && $log->info( $self->name
+        . ': replay gain ' . $gain . ' dB'
+        . ( defined $peak ? " (peak $peak)" : ' (no peak)' ) . " for $url" );
 
     # ...AND WE ALWAYS SAY SO, rather than omitting the attribute when there is
     # nothing to apply.  Omitting it relies on HQPlayer defaulting each item to
@@ -732,9 +763,6 @@ sub _replayGain {
     # internally.  It costs one attribute and removes a whole class of
     # question.  A streaming file has no tags of its own for a 0.00 to
     # override; a LOCAL track never reaches here at all.
-    main::INFOLOG && $log->is_info && $log->info(
-        $self->name . ": replay gain $gain dB for $url" );
-
     return $gain;
 }
 

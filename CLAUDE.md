@@ -499,29 +499,47 @@ min="-100"/>`), which is why local files were already being normalised.
 as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
 moving it would move the Eversolo's own volume.
 
-### The ceiling: we never boost, and unity is asserted
+### The ceiling: a boost is allowed only as far as the peak permits
 
-**ReplayGain normalises UP as readily as down, and 0.2.38 shipped without a
-ceiling.** Caught live: Qobuz's album gain for *The Dark Side Of The Moon (50th
-Anniversary)* is **+6.68 dB** — the album is mastered quietly and −18 LUFS is a
-target, not a maximum — and 0.2.38 put `album_gain="6.68"` on the wire. A boost
-into HQPlayer's modulator is a clipping risk for no benefit.
+**ReplayGain normalises UP as readily as down.** Qobuz's album gain for *The Dark
+Side Of The Moon (50th Anniversary)* is **+6.68 dB** — the album is mastered
+quietly and −18 LUFS is a target, not a maximum. 0.2.38 sent it verbatim and
+HQPlayer applied `6.68 dB (2.15774)`, a **2.16× multiplier**.
 
-**Positive gains are floored at unity (0.2.39). Only attenuation is ever passed
-on.** Simon's call, and it was asked for at the design stage — it was written
-into the abandoned volume-shift plan and lost when the mechanism changed to
-`album_gain`. Do not remove it to "respect the tags".
+**0.2.39 answered that by refusing every positive gain. That was over-cautious
+and is superseded.** It throws away legitimate headroom on quiet masters, and
+HQPlayer registered no clipping through that playback at all (`clips="0"`,
+`apod="0"`). Simon's call, 2026-08-30: *"the positive gains are fine if they dont
+make HQPlayer overall output go into clipping so peaking at 0db"*.
 
-**And unity is ASSERTED, never omitted.** A track with no gain, an unreadable
-figure and a clamped positive all send `album_gain="0.00"` rather than nothing.
-Omitting relies on HQPlayer defaulting each item to unity by itself; saying so
-means nothing can carry over from the previous track however the daemon handles
-an internal hand-over. It costs one attribute and removes a whole class of
-question. A streaming file has no tags of its own for a 0.00 to override — and
-a **local** track never reaches `_replayGain` at all.
+**0.2.40 applies the rule ReplayGain already defines**: the largest safe boost is
+`-20*log10(peak)`, which is exactly `Slim::Player::ReplayGain::preventClipping`.
+We call it ourselves rather than trusting it upstream — it demonstrably had not
+been applied, or +6.68 could not have reached us.
 
-**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38, ceiling
-added in 0.2.39. Local
+**NO PEAK MEANS NO BOOST.** Without a peak there is no way to know what a boost
+would do, and guessing wrong clips. **Attenuation is never touched by any of
+this** — the peak only ever limits a boost.
+
+**THE PEAK IS THE ONE INPUT WE CANNOT SEE FROM OUTSIDE.** `songinfo` on a remote
+track exposes no gain and no peak (`album, artist, bitrate, duration, samplerate,
+samplesize, title, tracknum, type, url` and nothing else), so whether a service
+populates `$track->replay_peak` can only be learned from inside. `_replayGain`
+logs `(peak N)` or `(no peak)` on every track for exactly that reason — read it
+before assuming which services can be boosted.
+
+### Unity is asserted, never omitted
+
+A track with no gain, an unreadable figure and a refused boost all send
+`album_gain="0.00"` rather than nothing. Omitting relies on HQPlayer defaulting
+each item to unity by itself; saying so means nothing can carry over from the
+previous track however the daemon handles an internal hand-over. It costs one
+attribute and removes a whole class of question. A streaming file has no tags of
+its own for a 0.00 to override — and a **local** track never reaches
+`_replayGain` at all.
+
+**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38; the
+peak-aware ceiling in 0.2.40. Local
 tracks send nothing, and that gate is now load-bearing rather than merely tidy:
 `album_gain` OVERRIDES the file's own tags, so sending ours on a local track
 would replace a right answer with a round-tripped one.

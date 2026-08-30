@@ -77,6 +77,7 @@ print "-- DIDL-Lite metadata (the only channel that reaches HQPlayer) --\n";
     sub secs       { $_[0]->{secs} }
     sub content_type { $_[0]->{ct} }
     sub url        { $_[0]->{url} }
+    sub replay_peak { $_[0]->{peak} }
     package FakeSong;
     sub new { bless { t => $_[1] }, $_[0] }
     sub currentTrack { $_[0]->{t} }
@@ -275,11 +276,42 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     # The Dark Side Of The Moon (50th Anniversary) is +6.68 dB, and 0.2.38 sent
     # it verbatim. A boost into the modulator is a clipping risk for no gain.
     my $up = $c->_metadata( FakeSong->new($qt)->_rg(6.68) );
-    ok(scalar($up =~ m{\balbum_gain="0\.00"}), 'a POSITIVE gain is floored at unity, never boosted');
-    ok(scalar($up !~ m{\balbum_gain="6}), 'and the boost figure never reaches the wire');
+    ok(scalar($up =~ m{\balbum_gain="0\.00"}), 'a POSITIVE gain with no peak known is floored at unity');
+    ok(scalar($up !~ m{\balbum_gain="6}), 'and that unchecked boost never reaches the wire');
 
+    # A BOOST IS ALLOWED AS FAR AS THE PEAK PERMITS - the ReplayGain rule, not
+    # a blanket refusal. Simon's call 2026-08-30: "positive gains are fine if
+    # they dont make HQPlayer overall output go into clipping so peaking at
+    # 0db". The largest safe boost is -20*log10(peak).
+    my $qp = FakeTrack->new({ title=>'Speak to Me', id=>-1, secs=>71,
+                              url=>'qobuz://193171335.flac', peak=>0.5 });
+    # -20*log10(0.5) = +6.02, so +6.68 is trimmed to the headroom that exists
+    my $room = $c->_metadata( FakeSong->new($qp)->_rg(6.68) );
+    ok(scalar($room =~ m{\balbum_gain="6\.02"}),
+       'a boost is allowed up to what the peak permits, not refused outright');
+
+    my $qf = FakeTrack->new({ title=>'Loud', id=>-2, secs=>60,
+                              url=>'qobuz://2.flac', peak=>1.0 });
+    my $full = $c->_metadata( FakeSong->new($qf)->_rg(6.68) );
+    ok(scalar($full =~ m{\balbum_gain="0\.00"}),
+       'a track already peaking at full scale gets no boost at all');
+
+    # room to spare: the figure passes through untouched
+    my $qr = FakeTrack->new({ title=>'Quiet', id=>-3, secs=>60,
+                              url=>'qobuz://3.flac', peak=>0.25 });
+    my $pass = $c->_metadata( FakeSong->new($qr)->_rg(2) );
+    ok(scalar($pass =~ m{\balbum_gain="2\.00"}),
+       'and a boost well inside the headroom is passed through unchanged');
+
+    # ATTENUATION IS NEVER TOUCHED, whatever the peak says.
+    my $cutf = $c->_metadata( FakeSong->new($qf)->_rg(-7.43) );
+    ok(scalar($cutf =~ m{\balbum_gain="-7\.43"}),
+       'attenuation is never trimmed - the peak only ever limits a BOOST');
+
+    # NO PEAK MEANS NO BOOST: without one there is no way to know what a boost
+    # would do, and guessing wrong clips.
     my $tiny = $c->_metadata( FakeSong->new($qt)->_rg(0.4) );
-    ok(scalar($tiny =~ m{\balbum_gain="0\.00"}), 'a small positive gain is floored too');
+    ok(scalar($tiny =~ m{\balbum_gain="0\.00"}), 'no peak means no boost, however small');
 
     my $cut = $c->_metadata( FakeSong->new($qt)->_rg(-0.4) );
     ok(scalar($cut =~ m{\balbum_gain="-0\.40"}), 'but a small ATTENUATION is passed through');
