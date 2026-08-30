@@ -733,9 +733,12 @@ sub _replayGain {
     # REPLAYGAIN tag with unity - silently disabling HQPlayer's own
     # `playlist_album_gain` for a user who never asked LMS to do this at all.
     # Omitting restores exactly the pre-0.2.44 behaviour for that user.
+    my $known = 1;
+
     if ( !defined $gain || $gain !~ /^\s*-?[0-9]*\.?[0-9]+\s*$/ ) {
         return undef unless Slim::Music::Info::isRemoteURL($url);
-        $gain = 0;
+        $gain  = 0;
+        $known = 0;
     }
 
     # A BOOST IS TRIMMED INTO THE HEADROOM HQPLAYER IS HOLDING BACK.
@@ -838,10 +841,30 @@ sub _replayGain {
         $maxCombined = $noclip if $noclip < $maxCombined;
     }
 
-    $gain += $room;
+    # NO FIGURE MEANS NO GAIN - NOT A BOOST INTO THE HEADROOM.
+    #
+    # The compensation below only makes sense when there is a ReplayGain TARGET
+    # to land on. With no figure at all there is no target, and adding the
+    # headroom back turns "we know nothing" into a +3 dB boost that eats exactly
+    # the room HQPlayer reserved for its DSP.
+    #
+    # SHIPPED THAT WAY IN 0.2.44-0.2.46 AND IT IS A REAL FAULT. Reported by
+    # Simon 2026-08-30 - "no replaygain no adaptive volume" - and visible at both
+    # ends on a Qobuz album that publishes no gain:
+    #
+    #   LMS        replay gain none -> 3.01 dB (headroom -3.01, peak none)
+    #   hqplayerd  Adaptive transport gain: 3.01 dB (1.41416)
+    #
+    # A 1.41x multiplier on material nobody asked to be normalised. Note the
+    # distinction this keeps: a track whose ReplayGain figure IS 0.00 dB has a
+    # target of unity and still gets the compensation, because landing on that
+    # target is the whole point. Only the absence of a figure is inert.
+    if ($known) {
+        $gain += $room;
 
-    my $maxSend = $maxCombined + $room;
-    $gain = $maxSend if $gain > $maxSend;
+        my $maxSend = $maxCombined + $room;
+        $gain = $maxSend if $gain > $maxSend;
+    }
 
     # LOGGED IN FULL, BECAUSE THE PEAK IS THE ONE INPUT WE CANNOT SEE FROM
     # OUTSIDE LMS - `songinfo` on a remote track exposes neither gain nor peak.
@@ -849,9 +872,10 @@ sub _replayGain {
     # it shows the raw figure beside the trimmed one so a trim is never mistaken
     # for a service publishing something different.
     main::INFOLOG && $log->is_info && $log->info( $self->name
-        . sprintf( ': replay gain %s -> %.2f dB (headroom %s, peak %s) for %s',
+        . sprintf( ': replay gain %s -> %.2f dB%s (headroom %s, peak %s) for %s',
             ( defined $raw ? $raw : 'none' ),
             $gain,
+            ( $known ? '' : ' [no figure - not compensated]' ),
             ( defined $self->hqHeadroom ? sprintf( '%.2f', $self->hqHeadroom ) : 'unknown' ),
             ( defined $peak ? $peak : 'none' ),
             $url ) );

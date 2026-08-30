@@ -291,6 +291,22 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $none = $c->_metadata( FakeSong->new($qt) );
     ok(scalar($none =~ m{\balbum_gain="0\.00"}), 'and so is no value at all');
 
+    # NO FIGURE IS NOT COMPENSATED. The headroom is added back to land a track on
+    # its ReplayGain TARGET; with no figure there is no target, and compensating
+    # turns "we know nothing" into a +3 dB boost into the room HQPlayer reserved.
+    # Shipped that way in 0.2.44-0.2.46: a Qobuz album publishing no gain logged
+    # `replay gain none -> 3.01 dB` and hqplayerd applied `3.01 dB (1.41416)`.
+    $c->hqHeadroom(-3.01);
+    my $noneH = $c->_metadata( FakeSong->new($qt) );
+    ok(scalar($noneH =~ m{\balbum_gain="0\.00"}),
+       'no figure stays 0.00 even with headroom known - it is NOT boosted to 3.01');
+
+    # ...but a REAL figure of 0 dB is a target, and still gets the compensation.
+    my $realZero = $c->_metadata( FakeSong->new($qt)->_rg(0) );
+    ok(scalar($realZero =~ m{\balbum_gain="3\.01"}),
+       'a track whose figure IS 0 dB still cancels the headroom - that is its target');
+    $c->hqHeadroom(undef);
+
     # ...BUT ONLY FOR A REMOTE TRACK. `album_gain` OVERRIDES a file's own tags,
     # and LMS hands back no figure at all when the user has replay gain switched
     # OFF. Asserting 0.00 there would override a good REPLAYGAIN tag with unity

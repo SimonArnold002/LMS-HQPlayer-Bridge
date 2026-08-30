@@ -25,6 +25,7 @@ declined.
 | A boost must be trimmed against the room between the current volume and `_volMax`, because that room is the headroom (`Player.pm`, `_replayGain`) | **WRONG** 2026-08-30, shipped in 0.2.41 and reversed in 0.2.44 | It measured the wrong domain. **With hardware volume enabled the level is the endpoint's ANALOGUE preamp**, downstream of where digital clipping happens, so it buys no digital headroom at all in the path `album_gain` is applied in. hqplayerd splits the level and says so, measured across a whole session: `Set volume: -38 -> hardware: -34 software: -4`, `-33 -> hardware: -29 software: -4`, and hardware taking every bit of the movement (−30/−35/−39/−41/−43/−47) while **software stayed −4 throughout**. A different configuration splits differently again (`hardware: 0 software: -18` is in the same log), so the split must not be modelled either. **THE VOLUME MUST NOT ENTER THIS CALCULATION.** The real ceiling is HQPlayer's configured headroom, read from its log. |
 | Local tiers must not send `album_gain`, because HQPlayer reads the file's own REPLAYGAIN tags and ours would be applied twice | **WRONG** 2026-08-30, fixed in 0.2.44 | The first half is true and the second is not. **`album_gain` REPLACES the tag, it does not add to it** — proven by isolating one local FLAC tagged −8.61 dB, sending `album_gain="-15"`, and watching it play at −15, not −23.61. And deferring to HQPlayer **loses the gain outright on a fresh load**: it applies the figure at Play time from tags it has already parsed, and the bridge goes Stop → PlaylistClear → PlaylistAdd → Play in ~300ms, so playback starts before the file has been fetched. Live on a fully-tagged album (`album_replay_gain -9.6`): three adds all played `0 dB (1)` and the −9.6 arrived only when the playlist next changed — **a whole album unnormalised**. It is also the better answer, because LMS has already chosen album vs track gain and HQPlayer only does album gain. Reported by Simon as a regression, and it was one. |
 | A raw function's response needs no explicit status code — LMS fills one in (`Stream.pm`, `_downloadHandler`) | **WRONG** 2026-08-30, fixed in 0.2.45 | It does not, and the omission broke **every m4a, ALAC and AAC track** from 0.2.32 to 0.2.45. LMS builds the status line as `sprintf("%s %s %s", protocol, code, status_message(code))`, and a raw function is handed the response object "almost unmodified" — its own dispatcher comment is `$rawFunc shall call addHTTPResponse`. `downloadMusicFile` sets a code only on its ERROR paths (406, 400), so a successful tier 3 download went out as literally `HTTP/1.1  ` — protocol, two spaces, no code. HQPlayer said so precisely and nobody read it as a status line: `clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''`. `_handler` (tier 4) and `_fail` both set a code, which is exactly why tier 4 and our 404s worked throughout. **Invisible to the offline suite because it stubs `downloadMusicFile` and never sees a socket** — the test now asserts the code on the response object itself. |
+| The headroom should be added back to every figure, so a track always lands on its ReplayGain target (`Player.pm`, `_replayGain`) | **WRONG for the NO-FIGURE case** 2026-08-30, shipped 0.2.44-0.2.46, fixed in 0.2.47 | Compensation only means something when there is a TARGET to land on. With no figure at all there is no target, and adding the headroom back turned "we know nothing" into a **+3.01 dB boost** that ate exactly the room HQPlayer reserves for its DSP. Reported by Simon — *"no replaygain no adaptive volume"* — and visible at both ends on a Qobuz album that publishes no gain: `replay gain none -> 3.01 dB` in the bridge's log, `Adaptive transport gain: 3.01 dB (1.41416)` in hqplayerd's. A 1.41× multiplier on material nobody asked to be normalised. **The distinction that survives:** a track whose figure IS `0.00` dB has a target of unity and still gets the compensation. Only the ABSENCE of a figure is inert. The unity assertion for a remote track stays — it just sends a flat `0.00` now instead of a compensated one. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -524,6 +525,7 @@ everything:
 | −3.01 | +6.68 | **+3.01** | 0.00 | trimmed, not refused — the largest thing sendable is the headroom's own magnitude |
 | unknown | −10.03 | −10.03 | — | nothing to compensate |
 | unknown | +6.68 | 0.00 | — | nothing to boost into, so a boost IS refused here |
+| −3.01 | **no figure** | **0.00** | — | no target, so NOTHING is applied — not a boost |
 
 **ReplayGain normalises UP as readily as down.** Qobuz's album gain for *The Dark
 Side Of The Moon (50th Anniversary)* is **+6.68 dB** — the album is mastered
@@ -658,7 +660,9 @@ and **8088** (log) and nothing else.
 ### Unity is asserted for streaming, and OMITTED for local
 
 A **streaming** track with no gain, an unreadable figure or a refused boost
-sends `album_gain="0.00"` rather than nothing. Omitting relies on HQPlayer
+sends a flat `album_gain="0.00"` rather than nothing — **flat, meaning NOT
+headroom-compensated**. Compensation applies only where there is a ReplayGain
+target to land on; see the ledger row for the build that got this wrong. Omitting relies on HQPlayer
 defaulting each item to unity by itself; saying so means nothing can carry over
 from the previous track however the daemon handles an internal hand-over. It
 costs one attribute and removes a whole class of question, and a streaming file
@@ -1821,10 +1825,14 @@ HTTP played correctly:
   302 s track, boundary at 22:44:35 — to the second. So both "still unverified"
   bullets that used to sit here are closed, and `_armNextTrack` genuinely does
   keep two `/hqp3/` transcodes open at once.
-* **THE POSITIVE-GAIN PATH FIRED, AND TRIMMED** — 2026-08-30:
-  `Adaptive transport gain: 3.01 dB (1.41416)`. That is a boost clamped to
-  exactly the headroom's own magnitude, which is the design: the combined figure
-  lands at 0 dBFS and no further. First live confirmation of the trim.
+* **NOT VERIFIED, AND THE ENTRY THAT USED TO SIT HERE WAS WRONG.** A
+  `Adaptive transport gain: 3.01 dB (1.41416)` was recorded here as the
+  positive-gain trim firing. **It was the no-figure bug** (see the ledger):
+  +3.01 is what BOTH paths produce with a −3.01 headroom, and the LMS log line
+  that would have separated them — `replay gain none` vs `replay gain 6.68` —
+  was not checked. **The trim has still never been seen fire live.** Lesson:
+  when two code paths produce the same number, the daemon's log cannot tell you
+  which one ran; go to the line that carries the input.
 * **hqplayerd confirms the switch we depend on** — `Playlist uses album gain`
   in its log, i.e. `playlist_album_gain="1"`. If `album_gain` ever stops
   working, that line is the first thing to look for.
