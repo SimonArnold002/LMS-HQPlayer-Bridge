@@ -276,11 +276,11 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     ok(scalar($lg =~ m{\balbum_gain="-6\.31"}),
        'a LOCAL track carries the gain too - it is no longer streaming-only');
 
-    $c->hqHeadroom(-3.01);
+    $c->hqConvGain(-3.01);
     my $lgh = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
     ok(scalar($lgh =~ m{\balbum_gain="-3\.30"}),
        'and is headroom-compensated exactly like a streaming one');
-    $c->hqHeadroom(undef);
+    $c->hqConvGain(undef);
 
     # UNITY IS ASSERTED, NOT OMITTED. Omitting relies on HQPlayer defaulting
     # each item to unity by itself; saying 0.00 means nothing can carry over
@@ -296,7 +296,7 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     # turns "we know nothing" into a +3 dB boost into the room HQPlayer reserved.
     # Shipped that way in 0.2.44-0.2.46: a Qobuz album publishing no gain logged
     # `replay gain none -> 3.01 dB` and hqplayerd applied `3.01 dB (1.41416)`.
-    $c->hqHeadroom(-3.01);
+    $c->hqConvGain(-3.01);
     my $noneH = $c->_metadata( FakeSong->new($qt) );
     ok(scalar($noneH =~ m{\balbum_gain="0\.00"}),
        'no figure stays 0.00 even with headroom known - it is NOT boosted to 3.01');
@@ -305,7 +305,7 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $realZero = $c->_metadata( FakeSong->new($qt)->_rg(0) );
     ok(scalar($realZero =~ m{\balbum_gain="3\.01"}),
        'a track whose figure IS 0 dB still cancels the headroom - that is its target');
-    $c->hqHeadroom(undef);
+    $c->hqConvGain(undef);
 
     # ...BUT ONLY FOR A REMOTE TRACK. `album_gain` OVERRIDES a file's own tags,
     # and LMS hands back no figure at all when the user has replay gain switched
@@ -329,7 +329,7 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $qnp = FakeTrack->new({ title=>'Speak to Me', id=>-1, secs=>71,
                                url=>'qobuz://193171335.flac' });
 
-    $c->hqHeadroom(-3.01);
+    $c->hqConvGain(-3.01);
 
     my $cutM = $c->_metadata( FakeSong->new($qnp)->_rg(-10.03) );
     ok(scalar($cutM =~ m{\balbum_gain="-7\.02"}),
@@ -356,14 +356,14 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     $c->hqVolDb(-38);
 
     # NO HEADROOM KNOWN: nothing to compensate, nothing to boost into.
-    $c->hqHeadroom(undef);
+    $c->hqConvGain(undef);
     my $unknown = $c->_metadata( FakeSong->new($qnp)->_rg(-10.03) );
     ok(scalar($unknown =~ m{\balbum_gain="-10\.03"}),
        'with no headroom known the figure goes out untouched');
     my $unkBoost = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
     ok(scalar($unkBoost =~ m{\balbum_gain="0\.00"}),
        'and a boost is refused - we do not know what HQPlayer is holding back');
-    $c->hqHeadroom(-3.01);
+    $c->hqConvGain(-3.01);
 
     # THE PEAK now binds only for a source ALREADY past full scale: peak 1.05
     # gives -20*log10(1.05) = -0.42, so the combined must sit there, not at 0.
@@ -372,45 +372,70 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $hotm = $c->_metadata( FakeSong->new($hot)->_rg(6.68) );
     ok(scalar($hotm =~ m{\balbum_gain="2\.59"}),
        'a source past full scale trims further - combined lands below 0, not at it');
-    $c->hqHeadroom(-3.01);
+    $c->hqConvGain(-3.01);
 
-    # PARSING hqplayerd's LOG. `Volume scaler` is the precise figure and wins;
-    # `Convolution gain compensation` is the whole-dB fallback. The LAST match
-    # is the current setting - the log is oldest-first, so a config change
-    # leaves stale values behind it.
+    # PARSING hqplayerd's LOG. The value is `Convolution gain compensation`, and
+    # it is read from the NEWEST engine-init block only - `Playback engine
+    # ratio:` opens the DSP section of every one.
+    #
+    # `Volume scaler` IS NOT THIS VALUE and is not consulted at all. 0.2.44
+    # preferred it because 20*log10(0.707107) = -3.01 happened to match the
+    # compensation of the day. Simon set the compensation to 0 and the scaler
+    # did not move - it is 0.707107 in all 21 occurrences across a log spanning
+    # the change, and it sits in the OUTPUT section, after `Network endpoint has
+    # volume range`.
     {
-        my $tmp = "/tmp/hqpb-headroom-$$.txt";
+        my $tmp = "/tmp/hqpb-convgain-$$.txt";
         my $wr  = sub {
             open my $fh, '>', $tmp or die $!;
             print $fh $_[0];
             close $fh;
         };
 
-        $wr->( "Convolution gain compensation: -6\nVolume scaler: 0.707107\nblah\n" );
-        $c->hqHeadroom(undef);
-        $c->_headroomFromFile($tmp);
-        ok(scalar( sprintf('%.2f', $c->hqHeadroom) eq '-3.01' ),
-           'Volume scaler is read as dB and preferred over the rounded compensation');
+        $wr->( "Playback engine ratio: 117.6\nConvolution gain compensation: -3\n"
+             . "Convolution engine ready and enabled\n"
+             . "Network endpoint has volume range: -100 - 0\nVolume scaler: 0.707107\n" );
+        $c->hqConvGain(undef);
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, '-3', 'the compensation is read from the newest init block' );
 
-        $wr->( "Volume scaler: 0.707107\nlater...\nVolume scaler: 0.5\n" );
-        $c->_headroomFromFile($tmp);
-        ok(scalar( sprintf('%.2f', $c->hqHeadroom) eq '-6.02' ),
-           'the LAST match wins - a config change leaves stale values behind it');
+        # THE BUG THIS REPLACES: the scaler is a constant and must not be used.
+        $wr->( "Playback engine ratio: 117.6\nConvolution gain compensation: 0\n"
+             . "Convolution engine ready and enabled\n"
+             . "Network endpoint has volume range: -100 - 0\nVolume scaler: 0.707107\n" );
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, 0,
+            'compensation 0 reads as 0 even though Volume scaler still says 0.707107' );
 
+        # A LATER BLOCK WINS - the log is oldest-first.
+        $wr->( "Playback engine ratio: 100\nConvolution gain compensation: -6\n"
+             . "Playback engine ratio: 117.6\nConvolution gain compensation: -3\n" );
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, '-3', 'the NEWEST init block wins, not the last match in the file' );
+
+        # CONVOLUTION SWITCHED OFF: the newest block carries no compensation
+        # line, and a stale one further back must NOT be picked up.
+        $wr->( "Playback engine ratio: 100\nConvolution gain compensation: -3\n"
+             . "Playback engine ratio: 117.6\nModulator: whatever\nRate: 96000\n" );
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, 0,
+            'a newest block with no compensation means convolution is off - 0, not the stale -3' );
+
+        # No init block at all: fall back to the last compensation in the tail.
         $wr->( "nothing here\nConvolution gain compensation: -3\n" );
-        $c->hqHeadroom(undef);
-        $c->_headroomFromFile($tmp);
-        is( $c->hqHeadroom, '-3', 'the compensation line is the fallback when there is no scaler' );
+        $c->hqConvGain(undef);
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, '-3', 'with no init block in the tail the last compensation is used' );
 
-        $wr->( "no headroom line at all\n" );
-        $c->hqHeadroom(undef);
-        $c->_headroomFromFile($tmp);
-        ok(scalar( !defined $c->hqHeadroom ),
-           'a log with neither leaves the headroom unknown, so no boost is sent');
+        $wr->( "no relevant line at all\n" );
+        $c->hqConvGain(undef);
+        $c->_convGainFromFile($tmp);
+        ok(scalar( !defined $c->hqConvGain ),
+           'a log with nothing readable leaves it unknown, so no boost is sent');
 
-        $wr->( "Volume scaler: 2.0\n" );
-        $c->_headroomFromFile($tmp);
-        is( $c->hqHeadroom, 0, 'a POSITIVE figure is not headroom - nothing is being held back' );
+        $wr->( "Playback engine ratio: 1\nConvolution gain compensation: 2\n" );
+        $c->_convGainFromFile($tmp);
+        is( $c->hqConvGain, 0, 'a POSITIVE compensation reserves nothing - clamped to 0' );
 
         unlink $tmp;
     }
@@ -423,7 +448,7 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     {
         my @reads;
         no warnings 'redefine';
-        local *Plugins::HQPlayerBridge::Player::readHeadroom = sub { push @reads, $_[1] ? 'forced' : 'throttled' };
+        local *Plugins::HQPlayerBridge::Player::readConvGain = sub { push @reads, $_[1] ? 'forced' : 'throttled' };
 
         my $a = { active_filter=>'poly-sinc-gauss-long', active_shaper=>'ASDM7EC-light',
                   active_mode=>'2', active_rate=>'11289600', correction=>'0',
@@ -457,10 +482,10 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
         open my $pm, '<', 'Plugins/HQPlayerBridge/Player.pm' or die $!;
         my $mod = do { local $/; <$pm> };
         close $pm;
-        my ($rh) = $mod =~ /\nsub readHeadroom \{(.*?)\n\}/s;
+        my ($rh) = $mod =~ /\nsub readConvGain \{(.*?)\n\}/s;
         ok(scalar($rh && $rh =~ /if \( !\$force \)/),
-           'readHeadroom skips a routine re-read while the value is still fresh');
-        ok(scalar($rh && $rh =~ /HEADROOM_MAX_AGE/),
+           'readConvGain skips a routine re-read while the value is still fresh');
+        ok(scalar($rh && $rh =~ /CONVGAIN_MAX_AGE/),
            'and the age floor is a named constant, not a bare number');
 
         # ...and the watcher has to actually BE on the status path. Calling

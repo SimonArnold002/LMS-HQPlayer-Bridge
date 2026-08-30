@@ -40,7 +40,7 @@ use Plugins::HQPlayerBridge::UPnP;
 # per-player state has to be a declared accessor.  ('rw' switches on argument
 # count, @_ == 2, so storing 0 and undef both work correctly.)
 __PACKAGE__->mk_accessor( 'rw', qw(
-    hqControl hqUPnP hqInstance hqHeadroom hqDspSig hqHeadroomAt
+    hqControl hqUPnP hqInstance hqConvGain hqDspSig hqConvGainAt
     hqTier hqRate hqBits hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
@@ -829,7 +829,7 @@ sub _replayGain {
     my $peak = eval { $track->replay_peak };
     $peak = undef unless defined $peak && $peak =~ /^\s*[0-9]*\.?[0-9]+\s*$/ && $peak > 0;
 
-    my $head = $self->hqHeadroom;
+    my $head = $self->hqConvGain;
     $head = 0 unless defined $head && $head =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
     my $room = abs($head);
 
@@ -876,7 +876,7 @@ sub _replayGain {
             ( defined $raw ? $raw : 'none' ),
             $gain,
             ( $known ? '' : ' [no figure - not compensated]' ),
-            ( defined $self->hqHeadroom ? sprintf( '%.2f', $self->hqHeadroom ) : 'unknown' ),
+            ( defined $self->hqConvGain ? sprintf( '%.2f', $self->hqConvGain ) : 'unknown' ),
             ( defined $peak ? $peak : 'none' ),
             $url ) );
 
@@ -1191,6 +1191,11 @@ sub _handOver {
 # would kill the track that is playing.
 sub _appendTrack {
     my ( $self, $url, $song ) = @_;
+
+    # Throttled, and async: this load uses the figure we already have and the
+    # NEXT one gets the fresh value. That is the whole reason the throttle is
+    # short - see CONVGAIN_MAX_AGE.
+    $self->readConvGain;
 
     my $e    = \&Plugins::HQPlayerBridge::Control::escape;
     my $meta = $self->_metadata($song);
@@ -2715,7 +2720,7 @@ sub assertRepeatOff {
 # Has HQPlayer's processing changed under us?
 #
 # THE HEADROOM IS NOT IN THE CONTROL API - 24 live probes for it, all
-# `Unknown command` (see readHeadroom) - so we cannot ask for the new value when
+# `Unknown command` (see readConvGain) - so we cannot ask for the new value when
 # the user changes it. But we do not have to: every <Status/> push ALREADY
 # carries the processing chain, and the headroom is derived from it. On this
 # instance `Volume scaler: 0.707107` is the `Convolution gain compensation: -3`
@@ -2727,7 +2732,7 @@ sub assertRepeatOff {
 # a level, which is why the value itself still has to come from the log.
 #
 # A pure headroom change with no DSP change would not be caught by this, which
-# is what the age check in readHeadroom is for.
+# is what the age check in readConvGain is for.
 use constant DSP_FIELDS => qw(
     active_filter active_shaper active_mode active_rate
     correction filter_20k filter_junk
@@ -2762,7 +2767,7 @@ sub _watchDsp {
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ": HQPlayer's processing changed - re-reading the headroom" );
 
-    $self->readHeadroom(1);
+    $self->readConvGain(1);
 
     return;
 }
@@ -2786,11 +2791,33 @@ sub _watchDsp {
 #
 # So it is read from hqplayerd's own log, which :8088/log serves unauthenticated:
 #
-#   Volume scaler: 0.707107              -> 20*log10(0.707107) = -3.01 dB
-#   Convolution gain compensation: -3    -> the rounded form, used as fallback
+#   Convolution gain compensation: -3    <- THIS ONE. It is the user's setting.
 #
-# `Volume scaler` is preferred because it is the precise figure; the
-# compensation line is rounded to whole dB.
+# `Volume scaler: 0.707107` IS NOT THE HEADROOM AND MUST NOT BE USED. 0.2.44
+# preferred it, on the reasoning that 20*log10(0.707107) = -3.01 dB is the same
+# figure in a more precise form. It is not the same figure - it only looked
+# like one because the compensation happened to be -3 at the time. Simon set the
+# compensation to 0, played a fresh track, and the plugin went on compensating:
+#
+#   23:35:15  Convolution gain compensation: 0        <- moved
+#   23:35:15  Volume scaler: 0.707107                 <- did NOT
+#
+# Across a whole log: `Volume scaler` appears 21 times and is 0.707107 EVERY
+# time, spanning a change of the compensation from -3 to 0; the compensation
+# line moved with the setting (18 x -3, then 5 x 0). It is also in a different
+# section - it follows `Network endpoint has volume range: ... -> hardware
+# volume enabled`, in the OUTPUT stage, whereas the compensation sits in the DSP
+# init between `Playback engine ratio:` and the filter loading. 0.707107 is
+# 1/sqrt(2) exactly, which is the SDM/DSD full-scale convention; that reading is
+# a hypothesis, but its being a CONSTANT unrelated to the setting is measured.
+#
+# THE NEWEST ENGINE-INIT BLOCK IS THE ONLY ONE THAT COUNTS, and "last match in
+# the tail" is not the same thing. If convolution is switched OFF entirely, the
+# newest block carries NO compensation line and the last match in the tail is a
+# stale one from when it was on. So the parse anchors on the last
+# `Playback engine ratio:` - which opens the DSP section of every init block -
+# and reads only what follows it. A newest block with no compensation line means
+# no convolution and so no reserved room: headroom 0.
 #
 # WHY IT IS SAVED TO A FILE AND NOT BUFFERED. The endpoint supports neither
 # ranges nor a tail parameter - `Range:` is ignored (200, not 206), HEAD answers
@@ -2800,11 +2827,19 @@ sub _watchDsp {
 # Slim::Networking::Async::HTTP) so none of it is held in memory, and only the
 # TAIL is then read back - which is what makes the value current rather than
 # whatever was true when the log began.
-use constant HEADROOM_TAIL => 262144;
+use constant LOG_TAIL => 262144;
 
-use constant HEADROOM_MAX_AGE => 900;   # 15 minutes
+# A CHANGE TO THE COMPENSATION MOVES NO FIELD WE ARE PUSHED. `<Status/>` carries
+# active_filter/active_shaper/active_mode/active_rate/correction, and `<State/>`
+# carries `convolution="1"` - enabled or not, never the figure. So _watchDsp
+# cannot see this particular change and the age check is the only net under it.
+# 15 minutes was far too long: Simon changed the setting, played a fresh track,
+# and got the old figure. The log is ~300 KB and the read is async and streamed
+# straight to disk, so once a minute - in practice once per track, since
+# readConvGain is called from the load path - costs nothing worth counting.
+use constant CONVGAIN_MAX_AGE => 60;
 
-sub readHeadroom {
+sub readConvGain {
     my ( $self, $force ) = @_;
 
     # Throttled unless something told us it actually changed. There is no range
@@ -2813,11 +2848,11 @@ sub readHeadroom {
     # the whole file - so each read costs the entire log. Cheap enough on an
     # event, wasteful on a timer.
     if ( !$force ) {
-        my $at = $self->hqHeadroomAt;
-        return if $at && ( Time::HiRes::time() - $at ) < HEADROOM_MAX_AGE;
+        my $at = $self->hqConvGainAt;
+        return if $at && ( Time::HiRes::time() - $at ) < CONVGAIN_MAX_AGE;
     }
 
-    $self->hqHeadroomAt( Time::HiRes::time() );
+    $self->hqConvGainAt( Time::HiRes::time() );
 
     my $inst = $self->hqInstance or return;
     my $ip   = $inst->{ip}       or return;
@@ -2827,7 +2862,7 @@ sub readHeadroom {
 
     Slim::Networking::SimpleAsyncHTTP->new(
         sub {
-            my $ok = eval { $self->_headroomFromFile($file) };
+            my $ok = eval { $self->_convGainFromFile($file) };
             $log->error( $self->name . ": headroom read failed - $@" ) if $@;
             unlink $file;
             return $ok;
@@ -2839,7 +2874,7 @@ sub readHeadroom {
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ": could not read hqplayerd's log for the headroom - $error" );
             unlink $file;
-            $self->hqHeadroom(undef);
+            $self->hqConvGain(undef);
             return;
         },
         { saveAs => $file, timeout => 30 },
@@ -2848,7 +2883,7 @@ sub readHeadroom {
     return;
 }
 
-sub _headroomFromFile {
+sub _convGainFromFile {
     my ( $self, $file ) = @_;
 
     open my $fh, '<', $file or return;
@@ -2856,7 +2891,7 @@ sub _headroomFromFile {
 
     # Only the tail matters: the newest engine init is the current setting.
     my $size = -s $fh;
-    seek( $fh, $size > HEADROOM_TAIL ? $size - HEADROOM_TAIL : 0, 0 );
+    seek( $fh, $size > LOG_TAIL ? $size - LOG_TAIL : 0, 0 );
     my $tail = do { local $/; <$fh> };
     close $fh;
 
@@ -2864,14 +2899,17 @@ sub _headroomFromFile {
 
     my $db;
 
-    # Last match wins - the log is oldest-first.
-    while ( $tail =~ /Volume scaler:\s*([0-9.]+)/g ) {
-        my $scale = $1;
-        next unless $scale > 0;
-        $db = 20 * ( log($scale) / log(10) );
-    }
+    # The newest engine-init block, and only that block. `Playback engine ratio:`
+    # opens the DSP section of every one - see the note above on why the last
+    # match in the whole tail is the wrong answer when convolution is off.
+    if ( $tail =~ /.*Playback engine ratio:/s ) {
+        my $block = substr( $tail, $+[0] );
 
-    if ( !defined $db ) {
+        $db = $block =~ /Convolution gain compensation:\s*(-?[0-9.]+)/ ? $1 : 0;
+    }
+    else {
+        # No init block in the tail at all - fall back to the last compensation
+        # anywhere in it rather than reporting nothing.
         while ( $tail =~ /Convolution gain compensation:\s*(-?[0-9.]+)/g ) {
             $db = $1;
         }
@@ -2883,7 +2921,7 @@ sub _headroomFromFile {
     # can be boosted into it.
     $db = 0 if $db > 0;
 
-    $self->hqHeadroom($db);
+    $self->hqConvGain($db);
 
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . sprintf( ': HQPlayer is holding %.2f dB of headroom', $db ) );
@@ -2899,7 +2937,7 @@ sub refreshInfo {
     # is a UPnP action, and it works - see refreshVolumeRange.
     $self->refreshVolumeRange;
 
-    $self->readHeadroom;
+    $self->readConvGain;
 
     $self->assertRepeatOff;
 

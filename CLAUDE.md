@@ -26,6 +26,7 @@ declined.
 | Local tiers must not send `album_gain`, because HQPlayer reads the file's own REPLAYGAIN tags and ours would be applied twice | **WRONG** 2026-08-30, fixed in 0.2.44 | The first half is true and the second is not. **`album_gain` REPLACES the tag, it does not add to it** — proven by isolating one local FLAC tagged −8.61 dB, sending `album_gain="-15"`, and watching it play at −15, not −23.61. And deferring to HQPlayer **loses the gain outright on a fresh load**: it applies the figure at Play time from tags it has already parsed, and the bridge goes Stop → PlaylistClear → PlaylistAdd → Play in ~300ms, so playback starts before the file has been fetched. Live on a fully-tagged album (`album_replay_gain -9.6`): three adds all played `0 dB (1)` and the −9.6 arrived only when the playlist next changed — **a whole album unnormalised**. It is also the better answer, because LMS has already chosen album vs track gain and HQPlayer only does album gain. Reported by Simon as a regression, and it was one. |
 | A raw function's response needs no explicit status code — LMS fills one in (`Stream.pm`, `_downloadHandler`) | **WRONG** 2026-08-30, fixed in 0.2.45 | It does not, and the omission broke **every m4a, ALAC and AAC track** from 0.2.32 to 0.2.45. LMS builds the status line as `sprintf("%s %s %s", protocol, code, status_message(code))`, and a raw function is handed the response object "almost unmodified" — its own dispatcher comment is `$rawFunc shall call addHTTPResponse`. `downloadMusicFile` sets a code only on its ERROR paths (406, 400), so a successful tier 3 download went out as literally `HTTP/1.1  ` — protocol, two spaces, no code. HQPlayer said so precisely and nobody read it as a status line: `clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''`. `_handler` (tier 4) and `_fail` both set a code, which is exactly why tier 4 and our 404s worked throughout. **Invisible to the offline suite because it stubs `downloadMusicFile` and never sees a socket** — the test now asserts the code on the response object itself. |
 | The headroom should be added back to every figure, so a track always lands on its ReplayGain target (`Player.pm`, `_replayGain`) | **WRONG for the NO-FIGURE case** 2026-08-30, shipped 0.2.44-0.2.46, fixed in 0.2.47 | Compensation only means something when there is a TARGET to land on. With no figure at all there is no target, and adding the headroom back turned "we know nothing" into a **+3.01 dB boost** that ate exactly the room HQPlayer reserves for its DSP. Reported by Simon — *"no replaygain no adaptive volume"* — and visible at both ends on a Qobuz album that publishes no gain: `replay gain none -> 3.01 dB` in the bridge's log, `Adaptive transport gain: 3.01 dB (1.41416)` in hqplayerd's. A 1.41× multiplier on material nobody asked to be normalised. **The distinction that survives:** a track whose figure IS `0.00` dB has a target of unity and still gets the compensation. Only the ABSENCE of a figure is inert. The unity assertion for a remote track stays — it just sends a flat `0.00` now instead of a compensated one. |
+| `Volume scaler` is the headroom, in a more precise form than `Convolution gain compensation` (`Player.pm`, `_convGainFromFile`) | **WRONG** 2026-08-30, shipped 0.2.44-0.2.47, fixed in 0.2.48 | Two different numbers that coincided. `20*log10(0.707107) = -3.01` matched the compensation of the day, and that was taken as confirmation. Simon set the compensation to **0**, played a fresh track, and the plugin kept compensating — because the scaler had not moved. Across a whole log it appears **21 times, 0.707107 every time**, spanning the change, while the compensation tracked the setting (18 × −3, then 5 × 0). They live in different sections of the init: the compensation after `Playback engine ratio:` in the DSP block, the scaler after `Network endpoint has volume range` in the OUTPUT stage. 0.707107 = 1/√2, the SDM/DSD full-scale convention (hypothesis; the constancy is measured). **Two lessons.** The value is now read from the NEWEST init block only, because "last match in the tail" picks up a stale compensation when convolution is switched off. And the wrong NAME caused this: hunting for something called "headroom" is what made a −3.01-looking constant persuasive — Simon: *"its called convolution gain compensation not headroom"*. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -557,9 +558,18 @@ applies `preventClipping` before we ever see the figure. `_replayGain` logs the
 raw figure, the sent one, the headroom and the peak on every track, which is the
 only way to learn which sources populate it.
 
-### Reading the headroom: it is in hqplayerd's log and nowhere else
+### Reading it: the value is CONVOLUTION GAIN COMPENSATION, and it is in the log
 
-**HQPlayer does not report its headroom over the control API.** Probed
+**Call it by its name.** It is HQPlayer's **convolution gain compensation** — a
+setting the user chooses — not "headroom". Simon, 2026-08-30: *"its called
+convolution gain compensation not headroom for reference."* The loose name is
+not cosmetic: looking for something called headroom is exactly how `Volume
+scaler` got picked up instead, because it *looked* like one. The accessors are
+`hqConvGain` / `readConvGain` / `_convGainFromFile` for the same reason.
+"Headroom" below means only the general idea of room before clipping, which is
+what the compensation creates.
+
+**HQPlayer does not report it over the control API.** Probed
 thoroughly 2026-08-30 — `Meters`, `GetMeters`, `Level`, `GetLevel`, `Analysis`,
 `GetAnalysis`, `Meter`, `OutputLevel`, `GetVolume`, `VolumeGet` and `Limits` all
 answer `Unknown command`; `<VolumeRange/>` carries only `adaptive enabled max
@@ -576,31 +586,60 @@ BEFORE the track starts, which is what the configured headroom is.
 **It appears in exactly one place: hqplayerd's own log at `:8088/log`.**
 
 ```
-Convolution gain compensation: -3
-Volume scaler: 0.707107            (= -3.01 dB)
+Playback engine ratio: 117.6
+Convolution engine: overlap-save
+Convolution gain compensation: 0            <- THIS. It is the user's setting.
+...
+Network endpoint has volume range: -100 - 0 -> hardware volume enabled
+Volume scaler: 0.707107                     <- NOT this. A constant.
 ```
 
-`readHeadroom` fetches that log with `SimpleAsyncHTTP`'s `saveAs`, which streams
+**`Volume scaler` IS NOT THE VALUE, and 0.2.44–0.2.47 read it.** It was
+preferred on the reasoning that `20*log10(0.707107) = -3.01 dB` is the same
+figure more precisely. It is not the same figure — it only looked like one
+because the compensation happened to be −3 at the time. Simon set the
+compensation to 0, played a fresh track, and the plugin went on compensating:
+
+```
+23:35:15  Convolution gain compensation: 0        <- moved
+23:35:15  Volume scaler: 0.707107                 <- did NOT
+```
+
+Across a whole log `Volume scaler` appears **21 times and is 0.707107 every
+time**, spanning the change, while the compensation moved with the setting
+(18 × −3, then 5 × 0). They are also in different sections: the compensation
+sits in the DSP init after `Playback engine ratio:`, the scaler in the OUTPUT
+stage after `Network endpoint has volume range`. 0.707107 is 1/√2 exactly, which
+is the SDM/DSD full-scale convention — that reading is a hypothesis, but its
+being a constant unrelated to the setting is measured.
+
+`readConvGain` fetches the log with `SimpleAsyncHTTP`'s `saveAs`, which streams
 the body **straight to a file** (`Slim::Networking::Async::HTTP`: *"Writing
-response directly to ..."*) — the log runs to megabytes and must never be
-buffered in memory. `_headroomFromFile` then seeks to the last 256 KB and takes
-the **LAST** match: the log is oldest-first, so a config change leaves stale
-values behind it. `Volume scaler` is the precise figure and wins;
-`Convolution gain compensation` is the whole-dB fallback. A **positive** scaler
-is not headroom — nothing is being held back — and reads as 0.
+response directly to ..."*) — it can run to megabytes and must never be buffered
+in memory. `_convGainFromFile` seeks to the last 256 KB and reads **only the
+newest engine-init block**, anchored on the last `Playback engine ratio:`.
+
+**"Last match in the tail" is NOT the same thing, and the difference matters
+when convolution is switched off**: the newest block then carries no
+compensation line at all, and the last match in the tail is a stale one from
+when it was on. A newest block with no compensation line means no convolution
+and so nothing reserved — 0. A **positive** compensation reserves nothing
+either, and clamps to 0.
 
 **This was NOT made a preference.** Simon, 2026-08-30: *"WHY DO YOU NEED PREFS"*
 / *"we know the headroom as this is direct from HQPlayer its in the logs"*. A
 pref would go stale the moment the user changed a filter, which is the whole
 failure mode being avoided.
 
-**And it is re-read when HQPlayer's processing changes.** `Volume scaler` is
-derived from the convolution gain, so a DSP change is exactly the event that
-moves the headroom. `_watchDsp` hashes the DSP fields every `<Status/>` push
-already carries — `active_filter active_shaper active_mode active_rate
-correction filter_20k filter_junk` — and forces a re-read when the signature
-moves. Otherwise the read is throttled to `HEADROOM_MAX_AGE` (15 minutes), and
-`refreshInfo` asks for one too.
+**NOTHING PUSHES US WHEN IT CHANGES.** `<Status/>` carries `active_filter
+active_shaper active_mode active_rate correction filter_20k filter_junk` and
+`<State/>` carries `convolution="1"` — enabled or not, never the figure. So
+`_watchDsp` catches a filter/mode/rate change but **cannot** see the
+compensation being edited. The age check is the only net under that, and at 15
+minutes it was far too slack — which is precisely how Simon saw a fresh track
+still compensating. `CONVGAIN_MAX_AGE` is now **60 s** and `_queueTrack` asks
+for a read on every load, so in practice it is re-read once per track. The read
+is async, so a change lands on the NEXT track rather than the current one.
 
 ### CORRECTED: there IS a live meter, on control port + 1
 
