@@ -396,6 +396,24 @@ ok(scalar($attrSub && $attrSub =~ /freewheel="' \. HQP_FREEWHEEL/), 'one builder
 ok(scalar($src =~ /use constant HQP_FREEWHEEL => 1;/), 'and it is on');
 ok(scalar($src !~ /PlaylistAdd uri=/), 'no hand-built PlaylistAdd attribute list is left behind');
 
+# `gain` is PROVEN IGNORED on input - 0.2.36 put gain="-4.07" on the wire on
+# every PlaylistAdd and HQPlayer answered gain="0" throughout. album_gain and
+# track_gain are hqplayerd's OWN names (it reports both on a saved playlist's
+# <track/> entries), so they are the last naming worth trying.
+my ($metaSub) = $src =~ /\nsub _metadata \{(.*?)\n\}/s;
+ok(scalar($metaSub && $metaSub =~ /album_gain\s*=>/ && $metaSub =~ /track_gain\s*=>/),
+   "the gain sidecar also carries hqplayerd's own album_gain/track_gain names");
+ok(scalar($metaSub && $metaSub =~ /\$gain\b/),
+   'and all of them come from the one figure LMS already chose');
+
+# The baseline guard: 0 is not a playlist position, and must not be stored or
+# judged against. See the 0 -> 1 block below.
+ok(scalar($src =~ /hqTrackNo\(\$track\)\s*\n?\s*if defined \$track && \$track =~ .+ && \$track > 0;/s),
+   'track="0" is refused as a baseline at the point it would be stored');
+my ($handedSub2) = $src =~ /\nsub _handedOver \{(.*?)\n\}/s;
+ok(scalar($handedSub2 && $handedSub2 =~ /\$seen > 0/),
+   'and _handedOver refuses to measure an advance from it');
+
 my ($appendSub) = $src =~ /\nsub _appendTrack \{(.*?)\n\}/s;
 ok($appendSub && $appendSub !~ /<Stop\/>|<PlaylistClear\/>/,
    'the hand-over never sends Stop or PlaylistClear - either would kill the playing track');
@@ -1469,6 +1487,50 @@ print "-- tier 5: the hand-over when HQPlayer strips the query string --\n";
     status( $lp, 2, 'http://s/music/1/download.flac', 3, 2 );
     is( $lp->hqURL, 'http://s/music/1/download.flac',
         'a LOCAL track still vetoes on the url - an index jump alone is not enough there' );
+
+    # THE 0 -> 1 BASELINE, AND WHY IT IS NOT AN ADVANCE.
+    #
+    # HQPlayer reports track="0" whenever it is not playing - INCLUDING in the
+    # push that lands between the <Play/> ack and its index catching up, where
+    # `state` already reads as playing. Storing that 0 made the next push
+    # (track="1") an increase, and the ambiguous-url path fires on exactly
+    # that. Live 2026-08-30 on a fresh Qobuz load:
+    #
+    #   12:47:07.7074  _onStatus     HQPlayer is playing        <- track="0"
+    #   12:47:07.7078  _armNextTrack asking LMS for the next track
+    #   12:47:08.0498  _handedOver   track=1 seen=0 -> ADVANCED <- WRONG
+    #   12:47:08.0502  _armNextTrack asking LMS for the next track
+    #
+    # LMS advanced into a track HQPlayer was not playing, armed a SECOND time
+    # and queued a third track, then stayed exactly one ahead for the rest of
+    # the album with its counter running out on every track. The `>` test was
+    # already there to stop a STOP reading as an advance; it cannot help when
+    # 0 is the baseline, because 0 -> 1 is an increase.
+    my ( $zp, $zc ) = $mk->('02:aa:bb:cc:dd:e4');
+    $zp->hqURL($q1);
+    $zp->hqNext({ mode=>'queue', url=>$q2, acked=>1 });
+
+    status( $zp, 2, $base, 1, 0 );
+    is( $zp->hqTrackNo, undef, 'track="0" is never stored as the baseline' );
+    is( $zp->hqURL, $q1,       'and it is not itself an advance' );
+
+    status( $zp, 2, $base, 2, 1 );
+    is( $zp->hqURL, $q1,
+        '1 AFTER a 0 is not an advance - this is the bug that put LMS a track ahead' );
+    is( $zp->hqTrackNo, 1, 'and 1 does become the baseline' );
+
+    status( $zp, 2, $base, 3, 2 );
+    is( $zp->hqURL, $q2, 'a real 1 -> 2 advance from that baseline still fires' );
+
+    # A STOP mid-run must not poison the baseline either: 0 is refused, so the
+    # index we last really saw survives and the advance is still judged
+    # against it rather than against nothing.
+    my ( $sp, $sc ) = $mk->('02:aa:bb:cc:dd:e5');
+    $sp->hqURL($q1); $sp->hqTrackNo(1);
+    $sp->hqNext({ mode=>'queue', url=>$q2, acked=>1 });
+    status( $sp, 2, $base, 5, 0 );
+    is( $sp->hqTrackNo, 1, 'a 0 mid-run leaves the last real index in place' );
+    is( $sp->hqURL, $q1,   'and is not an advance' );
 }
 
 print "-- tier 5: direct from the service --\n";

@@ -20,6 +20,7 @@ declined.
 | HQPlayer cannot fetch a URL containing a `?`, so everything must be path-only (the rule the whole tier structure was built on) | **WRONG** 2026-08-28, acted on 2026-08-30 | Disproven on the wire: HQPlayer sends query strings verbatim, `&`s and all, and plays the track. Two artefacts faked it — HQPlayer **strips the query from everything it reports** (`<Status/>` and its own log), and the one confirming probe was measuring **LMS returning 400 for any query string on that path**, not HQPlayer. It also proves the opposite: LMS could only answer 400 if it received the query string. Tier 2 was retired for this non-reason, and `Stream.pm` exists because of it. Only the **no-302** half survives. Superseded by tier 5 (0.2.33). **Lesson: read the wire, not the daemon's rendering of it.** |
 | The hand-over is safe to gate on the uri, because on tier 1 every track has a url of its own | **WRONG for tier 5** 2026-08-30, fixed same day | HQPlayer STRIPS THE QUERY STRING from every uri it reports — the same display quirk that faked the no-query-string rule. On tier 5 the whole identity of a track is in that query string, so every Qobuz track reports the identical `.../file` and the uri carries zero discriminating information. As a veto that made the hand-over **undetectable**: live, `track` went 1→2 and every check said "not yet", so LMS never advanced, the next track was never armed, and HQPlayer ran out of playlist and stopped mid-album with time still on the counter. `_handedOver` now compares the query-stripped form on both sides; identical stripped urls fall through to the index test that already existed for the ambiguous case. **Local tiers are unaffected — no query string, so the veto still applies.** |
 | HQPlayer's playlist should show the whole LMS queue, as Roon and HQPlayer's own library do — or at least be trimmed so it is not a list of finished tracks | **DECLINED** 2026-08-30, Simon's call: "stick with it as is" | Both halves were understood and neither is being changed. **All at once is not possible**: `_NextIfMore` caps LMS's song queue at two (`scalar @{$self->{songqueue}} < 2`), so only two URLs ever exist — LMS mints them lazily because service URLs are signed and time-limited and the queue is mutable. Roon differs because Roon OWNS the queue; here LMS does and we model a Squeezebox, which is also two-deep. **The growth is ours**: `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer accumulates a HISTORY of the run while LMS stays at two. Trimming with `PlaylistRemove` was offered and declined. So the list is expected to grow, and only its LAST entry is "next". |
+| `track` only ever needs an INCREASE to count as a hand-over, because HQPlayer reports `track="0"` when it is not playing and `>` already rejects that | **WRONG** 2026-08-30, fixed same day in 0.2.37 | `>` rejects an advance *into* 0; it does nothing about 0 being the **BASELINE**, and 0 → 1 is an increase. HQPlayer reports `track="0"` in the push that lands between the `<Play/>` ack and its index catching up — `state` already says playing — so that 0 got stored as `hqTrackNo` and the very next push read as an advance into the pre-queued track. Live: `12:47:07.7074 HQPlayer is playing` (track 0) → `12:47:08.0498 track=1 seen=0 -> ADVANCED` → a SECOND `_armNextTrack` 4ms later. LMS moved to Movement 6 while HQPlayer played Movement 5, queued a third track (`tracks_total="3"` where two was right), and stayed **exactly one track ahead for the rest of the album**, its counter running out on every track. This is the spurious advance the `_handedOver` comment already calls the worst failure in the file — it just came in by a route nobody had covered. Fixed at BOTH ends: 0 is refused where it would be stored, and `_handedOver` requires `$seen > 0`. **Whether it fires is a race on how fast HQPlayer's index catches up**, which is why identical code was clean on the three loads before it. Arrived with 0.2.35's index fallback; not a 0.2.36 regression. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -462,9 +463,20 @@ On this player it is doubly inert: `canDoReplayGain` returns 0, so LMS computes
 the figure, stores it on the Song, passes it to `play()` — and we are the only
 thing that ever looks at it.
 
-### OPEN: does hqplayerd honour `gain` on `PlaylistAdd`?
+### ANSWERED, NEGATIVE: hqplayerd IGNORES `gain` on `PlaylistAdd`
 
-**Unproven as of 0.2.36.** The read side is certain — `<Status/>`'s
+**Settled 2026-08-30 against 0.2.36: it is ignored.** We sent it, verbatim on the wire, on every `PlaylistAdd` of a three-track Qobuz queue —
+
+```
+<metadata song="Points: Movement 5 - Pandora's Creation" artist="Floating Points"
+          album="Mere Mortals" cover="…" length="402.441" gain="-4.07"/>
+```
+
+— and `<Status/>` answered `gain="0"` throughout, with every log line still `Adaptive transport gain: 0 dB (1)`. So `gain` is **decoder-derived, like `bits` and `bitrate`**, not an input field. **Do not re-propose it under that name.**
+
+0.2.37 sends `album_gain` and `track_gain` alongside it — hqplayerd's own names, which it reports on a SAVED playlist's `<track/>` entries. LMS has already chosen album vs track, so the one figure goes in both. **If that build also reports `gain="0"`, all three attributes come out and the idea is closed for good.**
+
+The read side is certain — `<Status/>`'s
 `<metadata/>` carries a `gain` attribute, and the vendor client parses it
 (`ControlInterface.cpp:2288`). The write side is not:
 

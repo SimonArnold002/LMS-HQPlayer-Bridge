@@ -618,7 +618,21 @@ sub _metadata {
         # Guarded rather than defaulted: a zero length is worse than none - it
         # is what the UI was already showing.
         ( $secs && $secs > 0 ? ( length => $secs ) : () ),
-        ( defined $gain ? ( gain => sprintf( '%.2f', $gain ) ) : () ),
+        # THREE NAMES FOR ONE FIGURE, DELIBERATELY. `gain` is what <Status/>
+        # reports, and it is PROVEN IGNORED on input (0.2.36 sent gain="-4.07"
+        # on every PlaylistAdd, verbatim on the wire, and HQPlayer answered
+        # gain="0" with `Adaptive transport gain: 0 dB (1)` throughout).
+        # `album_gain` and `track_gain` are hqplayerd's OWN names - it reports
+        # both on a SAVED playlist's <track/> entries - so they are the only
+        # naming left that is worth trying. LMS has already chosen album vs
+        # track for us, so the one figure goes in both: whichever HQPlayer
+        # prefers, it gets the number LMS settled on. If this build also comes
+        # back gain="0", all three come out and the idea is closed.
+        ( defined $gain
+            ? ( gain       => sprintf( '%.2f', $gain ),
+                album_gain => sprintf( '%.2f', $gain ),
+                track_gain => sprintf( '%.2f', $gain ) )
+            : () ),
     );
 
     my $meta = '<metadata';
@@ -2072,8 +2086,12 @@ sub _handedOver {
         # Nothing to judge by but the index, so only an INCREASE counts:
         # HQPlayer reports track="0" whenever it is not playing, so "changed"
         # reads an ordinary stop as an advance.
+        # `$seen > 0` is belt and braces for the same thing: a baseline of 0
+        # means "HQPlayer was not playing when we last looked", which is not a
+        # position to measure an advance from. See the note at hqTrackNo.
         $moved = ( defined $track && defined $seen
                    && $track =~ /^\d+$/ && $seen =~ /^\d+$/
+                   && $seen > 0
                    && $track > $seen );
     }
 
@@ -2180,7 +2198,26 @@ sub _onStatus {
 
     $self->_handedOver( $track, $meta ) if $self->hqNext;
 
-    $self->hqTrackNo($track) if defined $track;
+    # ZERO IS NOT A PLAYLIST POSITION, AND MUST NEVER BECOME THE BASELINE.
+    # HQPlayer numbers its playlist from 1 and reports track="0" whenever it is
+    # not playing - including in the push that arrives between the <Play/> ack
+    # and its index catching up, where `state` already reads as playing.
+    # Storing that 0 makes the NEXT push (track="1") look like an increase, and
+    # the ambiguous-url path fires on exactly that. Live 2026-08-30:
+    #
+    #   12:47:07.7074  _onStatus     HQPlayer is playing        <- track="0"
+    #   12:47:07.7078  _armNextTrack asking LMS for the next track
+    #   12:47:08.0498  _handedOver   track=1 seen=0 -> ADVANCED <- WRONG
+    #   12:47:08.0502  _armNextTrack asking LMS for the next track
+    #
+    # LMS advanced into a track HQPlayer was not playing, armed again, and
+    # queued a THIRD track. It stayed exactly one track ahead for the rest of
+    # the album. The `>` test was already there to stop a STOP reading as an
+    # advance; it does not help when 0 is the baseline, because 0 -> 1 is an
+    # increase. Whether it happens is a race on how fast HQPlayer's index
+    # catches up, which is why identical code was clean on earlier loads.
+    $self->hqTrackNo($track)
+        if defined $track && $track =~ /^\d+$/ && $track > 0;
 
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );
