@@ -253,14 +253,14 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
                               url=>'qobuz://420452060.flac' });
 
     my $g = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
-    ok(scalar($g =~ m{\bgain="-4\.07"}), 'a streaming track carries the gain LMS computed');
+    ok(scalar($g =~ m{\balbum_gain="-4\.07"}), 'a streaming track carries the gain LMS computed');
 
     # A local file must NOT: HQPlayer already applied -6.31 dB off the file's
     # own tags with nothing sent from here (verified live 2026-08-30).
     my $lt = FakeTrack->new({ title=>'Local', artist=>'A', album=>'B', coverid=>'c',
                               id=>5, secs=>100, ct=>'flc', url=>'file:///x.flac' });
     my $lg = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
-    ok(scalar($lg !~ m{\bgain=}), 'a local track sends none - HQPlayer reads its tags itself');
+    ok(scalar($lg !~ m{\bgain=}), 'a local track sends none - our album_gain would OVERRIDE its tags');
 
     # Unity is what HQPlayer does anyway, so saying so is noise.
     my $zero = $c->_metadata( FakeSong->new($qt)->_rg(0) );
@@ -276,12 +276,12 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     # needs - this is also why the figure is never cached against the track.
     Slim::Player::ReplayGain->_setTestGain(-8.97);
     my $armed = $c->_metadata( FakeSong->new($qt) );
-    ok(scalar($armed =~ m{\bgain="-8\.97"}), 'a pre-queued track falls back to fetchGainMode');
+    ok(scalar($armed =~ m{\balbum_gain="-8\.97"}), 'a pre-queued track falls back to fetchGainMode');
 
     # The song's own value wins when it has one - it is the figure LMS is
     # actually about to play with.
     my $both = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
-    ok(scalar($both =~ m{\bgain="-4\.07"}), 'the song wins over the fallback when set');
+    ok(scalar($both =~ m{\balbum_gain="-4\.07"}), 'the song wins over the fallback when set');
 
     # A handler that hands back junk must not reach the wire as gain="junk".
     Slim::Player::ReplayGain->_setTestGain('n/a');
@@ -396,15 +396,25 @@ ok(scalar($attrSub && $attrSub =~ /freewheel="' \. HQP_FREEWHEEL/), 'one builder
 ok(scalar($src =~ /use constant HQP_FREEWHEEL => 1;/), 'and it is on');
 ok(scalar($src !~ /PlaylistAdd uri=/), 'no hand-built PlaylistAdd attribute list is left behind');
 
-# `gain` is PROVEN IGNORED on input - 0.2.36 put gain="-4.07" on the wire on
-# every PlaylistAdd and HQPlayer answered gain="0" throughout. album_gain and
-# track_gain are hqplayerd's OWN names (it reports both on a saved playlist's
-# <track/> entries), so they are the last naming worth trying.
+# ISOLATED AGAINST THE LIVE DAEMON 2026-08-30, one local FLAC whose own tag is
+# -8.61 dB, watching what HQPlayer actually applied:
+#
+#   album_gain="-15"                  -> -15 dB   (OVERRODE the file's tag)
+#   track_gain="-11"                  -> -8.61 dB (ignored, the tag won)
+#   album_gain="-15" track_gain="-11" -> -15 dB   (album_gain wins)
+#   gain="-4.07"                      -> ignored  (0.2.36, verbatim on the wire)
+#   adaptive_volume="-20", as a metadata AND as a PlaylistAdd attribute
+#                                     -> ignored
+#
+# album gain is HQPlayer's ONLY replaygain mode (`playlist_album_gain`, read by
+# clPlaylist::GetAlbumGain - see assertRepeatOff), so there is no track-gain
+# path for a track_gain attribute to feed. `gain` is a REPORT: <Status/> echoes
+# what HQPlayer read out of the file, which is why it looked settable.
 my ($metaSub) = $src =~ /\nsub _metadata \{(.*?)\n\}/s;
-ok(scalar($metaSub && $metaSub =~ /album_gain\s*=>/ && $metaSub =~ /track_gain\s*=>/),
-   "the gain sidecar also carries hqplayerd's own album_gain/track_gain names");
-ok(scalar($metaSub && $metaSub =~ /\$gain\b/),
-   'and all of them come from the one figure LMS already chose');
+ok(scalar($metaSub && $metaSub =~ /album_gain\s*=>/),
+   'the gain sidecar goes out as album_gain - the one attribute HQPlayer honours');
+ok(scalar($metaSub && $metaSub !~ /\btrack_gain\s*=>/ && $metaSub !~ /\bgain\s*=>/),
+   'and NOT as track_gain or gain, both proven ignored on the wire');
 
 # The baseline guard: 0 is not a playlist position, and must not be stored or
 # judged against. See the 0 -> 1 block below.

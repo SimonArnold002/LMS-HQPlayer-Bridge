@@ -618,21 +618,44 @@ sub _metadata {
         # Guarded rather than defaulted: a zero length is worse than none - it
         # is what the UI was already showing.
         ( $secs && $secs > 0 ? ( length => $secs ) : () ),
-        # THREE NAMES FOR ONE FIGURE, DELIBERATELY. `gain` is what <Status/>
-        # reports, and it is PROVEN IGNORED on input (0.2.36 sent gain="-4.07"
-        # on every PlaylistAdd, verbatim on the wire, and HQPlayer answered
-        # gain="0" with `Adaptive transport gain: 0 dB (1)` throughout).
-        # `album_gain` and `track_gain` are hqplayerd's OWN names - it reports
-        # both on a SAVED playlist's <track/> entries - so they are the only
-        # naming left that is worth trying. LMS has already chosen album vs
-        # track for us, so the one figure goes in both: whichever HQPlayer
-        # prefers, it gets the number LMS settled on. If this build also comes
-        # back gain="0", all three come out and the idea is closed.
-        ( defined $gain
-            ? ( gain       => sprintf( '%.2f', $gain ),
-                album_gain => sprintf( '%.2f', $gain ),
-                track_gain => sprintf( '%.2f', $gain ) )
-            : () ),
+        # `album_gain` IS THE ONE, AND IT IS THE ONLY ONE.  Isolated against
+        # the live daemon 2026-08-30 by playing ONE local FLAC whose own tag
+        # is -8.61 dB and watching what HQPlayer actually applied:
+        #
+        #   album_gain="-15"                 -> -15 dB   (OVERRODE the tag)
+        #   track_gain="-11"                 -> -8.61 dB (ignored, tag won)
+        #   album_gain="-15" track_gain="-11"-> -15 dB   (album_gain wins)
+        #   gain="-4.07"                     -> ignored  (0.2.36, on the wire)
+        #   adaptive_volume="-20", both as a metadata attribute AND as a
+        #     PlaylistAdd attribute          -> ignored
+        #
+        # So `gain` is a REPORT, not an input: <Status/> echoes back whatever
+        # HQPlayer read out of the file, which is why it looked settable.
+        # <SetAdaptiveVolume> cannot carry a figure either - it answered
+        # `clString::ToUInt(): not an integer '-4.07'`.
+        #
+        # AND THE REASON track_gain IS IGNORED IS NOT AN API QUIRK: album gain
+        # is HQPlayer's ONLY replaygain mode.  See assertRepeatOff below -
+        # `playlist_album_gain` in ~/.hqplayer/hqplayerd.xml is the single
+        # switch, and `clPlaylist::GetAlbumGain()` is the only reader.  There
+        # is no track-gain path for a track_gain attribute to feed.
+        #
+        # IT THEREFORE DEPENDS ON THAT SWITCH BEING ON.  It is on by default and
+        # a user wanting replaygain has it on, but if album_gain is ever
+        # observed doing nothing, check `playlist_album_gain="1"` before
+        # looking anywhere else.
+        #
+        # LMS has already decided album vs track (Smart Gain compares playlist
+        # neighbours; a service handler's trackGain does its own equivalent),
+        # so whichever kind of figure it settled on goes in album_gain - that
+        # is simply the channel HQPlayer listens to, not a claim about which
+        # kind of gain it is.
+        #
+        # THIS OVERRIDES THE FILE'S OWN TAGS, which is exactly why _replayGain
+        # refuses to answer for a local track: HQPlayer already reads those
+        # correctly and sending ours would replace a right answer with a
+        # round-tripped one.
+        ( defined $gain ? ( album_gain => sprintf( '%.2f', $gain ) ) : () ),
     );
 
     my $meta = '<metadata';

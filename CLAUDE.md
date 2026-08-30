@@ -21,6 +21,7 @@ declined.
 | The hand-over is safe to gate on the uri, because on tier 1 every track has a url of its own | **WRONG for tier 5** 2026-08-30, fixed same day | HQPlayer STRIPS THE QUERY STRING from every uri it reports — the same display quirk that faked the no-query-string rule. On tier 5 the whole identity of a track is in that query string, so every Qobuz track reports the identical `.../file` and the uri carries zero discriminating information. As a veto that made the hand-over **undetectable**: live, `track` went 1→2 and every check said "not yet", so LMS never advanced, the next track was never armed, and HQPlayer ran out of playlist and stopped mid-album with time still on the counter. `_handedOver` now compares the query-stripped form on both sides; identical stripped urls fall through to the index test that already existed for the ambiguous case. **Local tiers are unaffected — no query string, so the veto still applies.** |
 | HQPlayer's playlist should show the whole LMS queue, as Roon and HQPlayer's own library do — or at least be trimmed so it is not a list of finished tracks | **DECLINED** 2026-08-30, Simon's call: "stick with it as is" | Both halves were understood and neither is being changed. **All at once is not possible**: `_NextIfMore` caps LMS's song queue at two (`scalar @{$self->{songqueue}} < 2`), so only two URLs ever exist — LMS mints them lazily because service URLs are signed and time-limited and the queue is mutable. Roon differs because Roon OWNS the queue; here LMS does and we model a Squeezebox, which is also two-deep. **The growth is ours**: `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer accumulates a HISTORY of the run while LMS stays at two. Trimming with `PlaylistRemove` was offered and declined. So the list is expected to grow, and only its LAST entry is "next". |
 | `track` only ever needs an INCREASE to count as a hand-over, because HQPlayer reports `track="0"` when it is not playing and `>` already rejects that | **WRONG** 2026-08-30, fixed same day in 0.2.37 | `>` rejects an advance *into* 0; it does nothing about 0 being the **BASELINE**, and 0 → 1 is an increase. HQPlayer reports `track="0"` in the push that lands between the `<Play/>` ack and its index catching up — `state` already says playing — so that 0 got stored as `hqTrackNo` and the very next push read as an advance into the pre-queued track. Live: `12:47:07.7074 HQPlayer is playing` (track 0) → `12:47:08.0498 track=1 seen=0 -> ADVANCED` → a SECOND `_armNextTrack` 4ms later. LMS moved to Movement 6 while HQPlayer played Movement 5, queued a third track (`tracks_total="3"` where two was right), and stayed **exactly one track ahead for the rest of the album**, its counter running out on every track. This is the spurious advance the `_handedOver` comment already calls the worst failure in the file — it just came in by a route nobody had covered. Fixed at BOTH ends: 0 is refused where it would be stored, and `_handedOver` requires `$seen > 0`. **Whether it fires is a race on how fast HQPlayer's index catches up**, which is why identical code was clean on the three loads before it. Arrived with 0.2.35's index fallback; not a 0.2.36 regression. |
+| hqplayerd ignores a gain figure on `PlaylistAdd`, so there is no control-API route for streaming ReplayGain | **WRONG** 2026-08-30, corrected same day | The evidence was real — `gain="-4.07"` went over verbatim and was ignored — but the CONCLUSION generalised from one attribute name to the whole channel. `album_gain` works, overrides the file's own tags, and is stored per playlist item. Two things made the wrong reading look safe: `<Status/>` reports `gain="…"`, which is HQPlayer echoing what it read out of the FILE and not an input field; and the live queue's `<PlaylistItem>` carries no gain attribute, which was taken as proof the daemon holds no per-item gain when it simply does not report one. **The lesson is the probe, not the finding:** the whole matrix (`album_gain`, `track_gain`, `gain`, `adaptive_volume`, both as metadata and as PlaylistAdd attributes) was settled in minutes over port 4321 — append with `queued="0"`, `SelectTrack`, `Play`, read `:8088/log`, `Stop`, `PlaylistRemove` — against ONE local file with a known tag. Two builds were spent guessing at what one probe answered. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -463,41 +464,45 @@ On this player it is doubly inert: `canDoReplayGain` returns 0, so LMS computes
 the figure, stores it on the Song, passes it to `play()` — and we are the only
 thing that ever looks at it.
 
-### ANSWERED, NEGATIVE: hqplayerd IGNORES `gain` on `PlaylistAdd`
+### ANSWERED: `album_gain` WORKS. `gain`, `track_gain` and `adaptive_volume` do not
 
-**Settled 2026-08-30 against 0.2.36: it is ignored.** We sent it, verbatim on the wire, on every `PlaylistAdd` of a three-track Qobuz queue —
+**Isolated live 2026-08-30** by appending ONE local FLAC whose own tag is
+−8.61 dB and watching what HQPlayer actually applied:
 
-```
-<metadata song="Points: Movement 5 - Pandora's Creation" artist="Floating Points"
-          album="Mere Mortals" cover="…" length="402.441" gain="-4.07"/>
-```
+| sent on `<metadata/>` | applied |
+|---|---|
+| `album_gain="-15"` | **−15 dB** — overrode the file's own tag |
+| `track_gain="-11"` | −8.61 dB — ignored, the file's tag won |
+| `album_gain="-15" track_gain="-11"` | −15 dB — `album_gain` wins |
+| `gain="-4.07"` | ignored |
+| `adaptive_volume="-20"` (metadata **and** `PlaylistAdd` attribute) | ignored |
 
-— and `<Status/>` answered `gain="0"` throughout, with every log line still `Adaptive transport gain: 0 dB (1)`. So `gain` is **decoder-derived, like `bits` and `bitrate`**, not an input field. **Do not re-propose it under that name.**
+**`gain` is a REPORT, not an input.** `<Status/>` echoes back whatever HQPlayer
+read out of the file — with that FLAC loaded it answered `gain="-8.61"`. That is
+what made it look settable, and it is why 0.2.36 (which put `gain="-4.07"` on the
+wire verbatim) changed nothing.
 
-0.2.37 sends `album_gain` and `track_gain` alongside it — hqplayerd's own names, which it reports on a SAVED playlist's `<track/>` entries. LMS has already chosen album vs track, so the one figure goes in both. **If that build also reports `gain="0"`, all three attributes come out and the idea is closed for good.**
+**And `track_gain` is ignored for a structural reason, not an API quirk: album
+gain is HQPlayer's ONLY replaygain mode.** `playlist_album_gain` in
+`~/.hqplayer/hqplayerd.xml` is the single switch and `clPlaylist::GetAlbumGain()`
+the only reader — see the note on `assertRepeatOff`. There is no track-gain path
+for a `track_gain` attribute to feed. **The feature therefore depends on that
+switch being on**; if `album_gain` is ever seen doing nothing, check
+`playlist_album_gain="1"` before looking anywhere else.
 
-The read side is certain — `<Status/>`'s
-`<metadata/>` carries a `gain` attribute, and the vendor client parses it
-(`ControlInterface.cpp:2288`). The write side is not:
+**The volume commands cannot carry it either.** `<SetAdaptiveVolume>` parses an
+unsigned int — it answered `clString::ToUInt(): not an integer '-4.07'` — so it
+is a bool toggle and nothing more. Adaptive volume was already ON throughout
+(`<State adaptive="1"/>`, `<VolumeRange adaptive="1" enabled="1" max="0"
+min="-100"/>`), which is why local files were already being normalised.
+`<Volume>` is the endpoint's HARDWARE level (hqplayerd logs it splitting a level
+as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
+moving it would move the Eversolo's own volume.
 
-* `clControlInterface::playlistAdd` builds `<metadata/>` by iterating a
-  free-form `QVariantHash` and writing **every key verbatim**, so there is no
-  client-side schema to satisfy — any attribute name is legal on the wire.
-  Whether the daemon *honours* one is a separate question.
-* **The live queue has no gain field.** `<PlaylistGet picture="0"/>` returns
-  `<PlaylistItem>` elements, and a queued Qobuz track came back with no
-  `track_gain`/`album_gain`. Those two names belong to `PlaylistGetSingle` /
-  `PlaylistGetAll`, which return **saved** playlists as
-  `<Playlist><track/></Playlist>` — a different schema. Do not chase them for
-  the live queue.
-* So `gain` may well be decoder-derived like `bits` and `bitrate`, in which
-  case streaming cannot be normalised through this route at all.
-
-**The one-shot test:** play a streaming track on 0.2.36 and read `<Status/>`.
-`gain="-4.07"` plus the log moving off `0 dB (1)` means it works. Still
-`gain="0"` means it is decoder-only — remove the attribute and close the idea.
-**Judge it by hqplayerd's log, never by `state`** — see the tier 3 row in the
-Review Ledger.
+**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38. Local
+tracks send nothing, and that gate is now load-bearing rather than merely tidy:
+`album_gain` OVERRIDES the file's own tags, so sending ours on a local track
+would replace a right answer with a round-tripped one.
 
 ## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
 
