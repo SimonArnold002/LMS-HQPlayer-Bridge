@@ -23,6 +23,7 @@ use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 use Slim::Music::Info;
 use Slim::Player::ProtocolHandlers;
+use Slim::Player::ReplayGain;
 use Slim::Utils::Network;
 use Slim::Web::HTTP;          # forgetClient, for closeStream below
 use Time::HiRes ();
@@ -607,6 +608,7 @@ sub _metadata {
     # takes a stream whose row title is populated to show it. _handlerMeta
     # returns {} for a local track, so the library path is untouched.
     my $meta = $self->_handlerMeta($track);
+    my $gain = $self->_replayGain( $song, $track );
 
     my @f = (
         song   => $meta->{title}  || eval { $track->title }      || '',
@@ -616,6 +618,7 @@ sub _metadata {
         # Guarded rather than defaulted: a zero length is worse than none - it
         # is what the UI was already showing.
         ( $secs && $secs > 0 ? ( length => $secs ) : () ),
+        ( defined $gain ? ( gain => sprintf( '%.2f', $gain ) ) : () ),
     );
 
     my $meta = '<metadata';
@@ -626,6 +629,60 @@ sub _metadata {
     }
 
     return $meta . '/>';
+}
+
+# The ReplayGain figure to hand HQPlayer, or undef to send nothing.
+#
+# STREAMING ONLY, AND DELIBERATELY GATED ON THE TRACK, NOT ON hqTier.  HQPlayer
+# reads a local file's own REPLAYGAIN tags itself - verified live 2026-08-30,
+# an album tagged REPLAYGAIN_ALBUM_GAIN=-6.31 dB produced `Adaptive transport
+# gain: -6.31 dB (0.483615)` with nothing sent from here.  Sending ours as well
+# would risk applying it twice.  A service CDN file carries no tags at all,
+# which is why every streamed track logged `Adaptive transport gain: 0 dB (1)`.
+#
+# Gating on the track rather than the tier also keeps this independent of
+# whether _resolveURL has run yet on a given path - _appendTrack and
+# _queueTrack reach _metadata by different routes.
+#
+# WHY THE VALUE IS READ PER QUEUE EVENT AND NEVER CACHED AGAINST THE TRACK.
+# LMS's "Smart Gain" is context-sensitive: Slim::Player::ReplayGain decides
+# album vs track gain by comparing a song's PLAYLIST NEIGHBOURS, and a service
+# handler's own trackGain does the same thing with its own metadata.  The same
+# track legitimately gets one figure inside its album and another in a mixed
+# playlist, so it has to be asked for again every time we queue.
+#
+# $song->replayGain is already populated for the track being STARTED -
+# StreamingController computes it and stores it just before calling play().  A
+# track being PRE-QUEUED has not reached that point, so ask for it directly;
+# by arm time the playlist neighbours are known, which is all the album/track
+# decision needs.
+#
+# Which of album or track gain comes back is NOT our decision and must not be
+# reimplemented here: for a remote track fetchGainMode hands straight off to
+# the service plugin's trackGain before any of LMS's own mode logic runs.
+# Qobuz supplies both album and track figures, so its choice is a real one;
+# a service that only publishes track gain simply yields a track figure.
+sub _replayGain {
+    my ( $self, $song, $track ) = @_;
+
+    my $url = eval { $track->url } || '';
+
+    return undef unless $url && Slim::Music::Info::isRemoteURL($url);
+
+    my $gain = eval { $song->replayGain };
+
+    $gain = eval { Slim::Player::ReplayGain->fetchGainMode( $self, $song ) }
+        if !defined $gain;
+
+    return undef unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+
+    # Unity is what HQPlayer already does; saying so adds nothing.
+    return undef if abs($gain) < 0.005;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ": replay gain $gain dB for $url" );
+
+    return $gain;
 }
 
 # What the protocol handler knows about a remote track, normalised.
@@ -1971,12 +2028,45 @@ sub _handedOver {
     # well as after.  That fires instantly: observed live with the same track
     # twice in a row, two advances 0.2s apart, and LMS skipped an entry.
     # A duplicate in the queue and repeat-one both produce it.
-    my $ambiguous = ( $want ne '' && $want eq ( $self->hqURL || '' ) );
+    # ...AND UNLESS HQPLAYER HAS STRIPPED THE PART THAT MADE THEM DIFFERENT.
+    #
+    # HQPlayer removes the QUERY STRING from every uri it reports - the same
+    # display quirk that faked the old "it cannot fetch a `?` url" rule. On
+    # tier 5 the whole identity of a track is in that query string, so every
+    # Qobuz track comes back as the identical `.../file` and the uri carries
+    # ZERO discriminating information:
+    #
+    #   uri =.../file                                  <- reported, every track
+    #   want=.../file?uid=355122&eid=193171336&hmac=..  <- what we queued
+    #
+    # Treating that as a veto meant the hand-over could NEVER be detected on a
+    # streaming service: LIVE 2026-08-30, `track` went 1 -> 2 (the advance
+    # demonstrably happened, and it sounded gapless) while every check said
+    # "not yet". LMS never advanced, the next track was never armed, and
+    # HQPlayer ran out of playlist and stopped mid-album with time still on the
+    # counter.
+    #
+    # So compare like for like, on the stripped form. When the two tracks are
+    # indistinguishable once stripped, the uri cannot tell them apart and this
+    # is exactly the ambiguous case already handled below - fall through to the
+    # index. Local tiers have no query string, so nothing changes for them.
+    my $strip = sub {
+        my $u = shift;
+        return '' unless defined $u;
+        $u =~ s/\?.*\z//s;
+        return $u;
+    };
+
+    my $wantBase = $strip->($want);
+    my $prevBase = $strip->( $self->hqURL || '' );
+
+    my $ambiguous = ( $wantBase ne '' && $wantBase eq $prevBase );
 
     my $moved;
 
     if ( !$ambiguous && defined $uri && $uri ne '' ) {
-        $moved = ( $uri eq $want );
+        # Both sides stripped: what HQPlayer reports never has a query string.
+        $moved = ( $strip->($uri) eq $wantBase );
     }
     else {
         # Nothing to judge by but the index, so only an INCREASE counts:

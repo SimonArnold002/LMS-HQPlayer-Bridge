@@ -83,6 +83,9 @@ print "-- DIDL-Lite metadata (the only channel that reaches HQPlayer) --\n";
 
     # The direct-streaming half: Song::open sets these when canDirectStream
     # returns a url, and _resolveURL reads them back.
+    sub replayGain          { $_[0]->{rg} }
+    sub _rg { $_[0]->{rg} = $_[1]; $_[0] }
+
     sub directstream        { $_[0]->{direct} }
     sub streamUrl           { $_[0]->{streamUrl} }
     sub currentTrackHandler { $_[0]->{handler} }
@@ -232,6 +235,69 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
     sub getMetadataFor { return { icon => 'https://static.qobuz.com/direct.jpg' } }
 }
+
+# -- replay gain rides on <metadata/>, and ONLY for streaming ------------------
+#
+# LMS decides album-vs-track gain upstream (Smart Gain compares a song's
+# playlist neighbours; a service handler's trackGain does its own equivalent),
+# so the only job here is to carry the figure it settled on. The gate is the
+# TRACK being remote, not hqTier: HQPlayer reads a local file's own REPLAYGAIN
+# tags itself, and sending ours as well would apply it twice.
+{
+    no warnings qw(redefine once);
+    local *Slim::Music::Info::isRemoteURL = sub { $_[0] && $_[0] =~ m{^\w+://} && $_[0] !~ m{^file://} };
+    local *Slim::Player::ProtocolHandlers::handlerForURL = sub { undef };
+
+    my $qt = FakeTrack->new({ title=>'Movement 1 - Fire', artist=>'Floating Points',
+                              album=>'Mere Mortals', id=>-949079, secs=>326,
+                              url=>'qobuz://420452060.flac' });
+
+    my $g = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
+    ok(scalar($g =~ m{\bgain="-4\.07"}), 'a streaming track carries the gain LMS computed');
+
+    # A local file must NOT: HQPlayer already applied -6.31 dB off the file's
+    # own tags with nothing sent from here (verified live 2026-08-30).
+    my $lt = FakeTrack->new({ title=>'Local', artist=>'A', album=>'B', coverid=>'c',
+                              id=>5, secs=>100, ct=>'flc', url=>'file:///x.flac' });
+    my $lg = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
+    ok(scalar($lg !~ m{\bgain=}), 'a local track sends none - HQPlayer reads its tags itself');
+
+    # Unity is what HQPlayer does anyway, so saying so is noise.
+    my $zero = $c->_metadata( FakeSong->new($qt)->_rg(0) );
+    ok(scalar($zero !~ m{\bgain=}), 'a gain of 0 dB is left off');
+
+    # No value at all must not emit gain="" or gain="0.00".
+    my $none = $c->_metadata( FakeSong->new($qt) );
+    ok(scalar($none !~ m{\bgain=}), 'no value means no attribute, not an empty one');
+
+    # A PRE-QUEUED track has not reached StreamingController yet, so the song
+    # carries nothing and the value has to be asked for directly. By arm time
+    # the playlist neighbours are known, which is what the album/track decision
+    # needs - this is also why the figure is never cached against the track.
+    Slim::Player::ReplayGain->_setTestGain(-8.97);
+    my $armed = $c->_metadata( FakeSong->new($qt) );
+    ok(scalar($armed =~ m{\bgain="-8\.97"}), 'a pre-queued track falls back to fetchGainMode');
+
+    # The song's own value wins when it has one - it is the figure LMS is
+    # actually about to play with.
+    my $both = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
+    ok(scalar($both =~ m{\bgain="-4\.07"}), 'the song wins over the fallback when set');
+
+    # A handler that hands back junk must not reach the wire as gain="junk".
+    Slim::Player::ReplayGain->_setTestGain('n/a');
+    my $junk = $c->_metadata( FakeSong->new($qt) );
+    ok(scalar($junk !~ m{\bgain=}), 'a non-numeric gain is dropped, not forwarded');
+
+    Slim::Player::ReplayGain->_setTestGain(undef);
+
+    # It must not disturb what was already going out.
+    my $still = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
+    ok(scalar($still =~ m{\bsong="Movement 1 - Fire"}), 'song still sent alongside gain');
+    ok(scalar($still =~ m{\blength="326"}),             'and length');
+    ok(scalar($still =~ m{^<metadata\b}) && scalar($still =~ m{/>$}),
+       'the element is still well formed');
+}
+
 {
     no warnings 'redefine';
     *Slim::Music::Info::isRemoteURL = sub { $_[0] && $_[0] =~ m{^qobuz://} };
@@ -1347,6 +1413,62 @@ print "-- the stale suppression is bounded --\n";
     is( $sp2->hqPrevURL, '(undef)', 'and the bad previous-track marker is cleared' );
     ok( scalar( grep { $_ eq 'playerStatusHeartbeat' } @{ $sc->{calls} } ),
         'the status stream reaches the controller again' );
+}
+
+print "-- tier 5: the hand-over when HQPlayer strips the query string --\n";
+{
+    # LIVE FAILURE 2026-08-30, Qobuz. HQPlayer removes the query string from
+    # every uri it REPORTS, and on tier 5 the whole identity of a track is in
+    # that query string - so both tracks come back as the identical base url:
+    #
+    #   uri =.../file                                    <- reported, every track
+    #   want=.../file?uid=355122&eid=193171336&hmac=...   <- what we queued
+    #
+    # The uri was a veto, so the hand-over could never be detected. `track`
+    # went 1 -> 2 and every check still said "not yet": LMS never advanced, the
+    # next track was never armed, and HQPlayer ran out of playlist and STOPPED
+    # MID-ALBUM with time still on the counter.
+    my $base = 'https://cdn.example.com/file';
+    my $q1   = $base . '?uid=1&eid=100&hmac=aaa';
+    my $q2   = $base . '?uid=1&eid=200&hmac=bbb';
+
+    my $mk = sub {
+        my $pl = Plugins::HQPlayerBridge::Player->new( shift, 'paddr', 1.0, undef, 12, undef );
+        my $cc = LoadController->new($one);
+        $pl->controller($cc);
+        $pl->hqControl( bless {}, 'FakeCtl' );
+        $pl->hqStarted(1); $pl->hqPlayAck(1); $pl->hqWanted('play');
+        return ( $pl, $cc );
+    };
+
+    # HQPlayer reports the STRIPPED url and an index that has moved on
+    my ( $qp, $qc ) = $mk->('02:aa:bb:cc:dd:e1');
+    $qp->hqURL($q1); $qp->hqTrackNo(1);
+    $qp->hqNext({ mode=>'queue', url=>$q2, acked=>1 });
+    $qc->{calls} = [];
+    status( $qp, 2, $base, 3, 2 );
+
+    is( $qp->hqURL, $q2,
+        'the hand-over IS detected even though the reported uri lost its query string' );
+    ok( scalar( grep { $_ eq 'playerTrackStarted' } @{ $qc->{calls} } ),
+        'and LMS is told the track started, so the counter advances' );
+
+    # ...and it must NOT fire early, while the index still names track one
+    my ( $ep, $ec ) = $mk->('02:aa:bb:cc:dd:e2');
+    $ep->hqURL($q1); $ep->hqTrackNo(1);
+    $ep->hqNext({ mode=>'queue', url=>$q2, acked=>1 });
+    status( $ep, 2, $base, 3, 1 );
+    is( $ep->hqURL, $q1,
+        'a stripped uri with the index STILL on track one is not an advance' );
+
+    # a local pair has no query string, so the url still discriminates and an
+    # index jump alone must NOT be trusted - the original veto is intact
+    my ( $lp, $lc ) = $mk->('02:aa:bb:cc:dd:e3');
+    $lp->hqURL('http://s/music/1/download.flac'); $lp->hqTrackNo(1);
+    $lp->hqNext({ mode=>'queue', url=>'http://s/music/2/download.flac', acked=>1 });
+    status( $lp, 2, 'http://s/music/1/download.flac', 3, 2 );
+    is( $lp->hqURL, 'http://s/music/1/download.flac',
+        'a LOCAL track still vetoes on the url - an index jump alone is not enough there' );
 }
 
 print "-- tier 5: direct from the service --\n";

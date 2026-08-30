@@ -18,6 +18,7 @@ declined.
 | An endpoint re-registering can jump the output +21 dB, so an increase just after a link-up should be refused and pulled back (`Player.pm`, `_followVolume`) | **REVERSED** 2026-08-30 | Shipped in 0.2.31, removed in 0.2.32. The event is real, but the guard's trigger was `transport_serial`, which **increments at every track boundary** (measured 4→5→6→7→8→9 across five boundaries of one album). So it armed for 10s after every track change and pulled back the user's own volume changes. Simon's call: the volume is the user's. Do not re-propose without a trigger that means "the endpoint re-registered" and nothing else. |
 | Tier 3 must go on the tier 4 player-stream endpoint, because that is the only unchunked route | **WRONG** 2026-08-30 | It is not the only one. `downloadMusicFile` chunks **only** when `$response->request->protocol eq 'HTTP/1.1'`; declaring the request `HTTP/1.0` gets LMS's own transcode with raw close-delimited framing. Routing tier 3 through the player stream fixed the framing and silently cost gapless, because that endpoint draws on the single per-player `$client->chunks`. Fixed in 0.2.32 with `/hqp3/`. **The lesson: "one player, one stream" was our own constraint, not LMS's** — check whether a limit is imposed or inherited before designing around it. |
 | HQPlayer cannot fetch a URL containing a `?`, so everything must be path-only (the rule the whole tier structure was built on) | **WRONG** 2026-08-28, acted on 2026-08-30 | Disproven on the wire: HQPlayer sends query strings verbatim, `&`s and all, and plays the track. Two artefacts faked it — HQPlayer **strips the query from everything it reports** (`<Status/>` and its own log), and the one confirming probe was measuring **LMS returning 400 for any query string on that path**, not HQPlayer. It also proves the opposite: LMS could only answer 400 if it received the query string. Tier 2 was retired for this non-reason, and `Stream.pm` exists because of it. Only the **no-302** half survives. Superseded by tier 5 (0.2.33). **Lesson: read the wire, not the daemon's rendering of it.** |
+| The hand-over is safe to gate on the uri, because on tier 1 every track has a url of its own | **WRONG for tier 5** 2026-08-30, fixed same day | HQPlayer STRIPS THE QUERY STRING from every uri it reports — the same display quirk that faked the no-query-string rule. On tier 5 the whole identity of a track is in that query string, so every Qobuz track reports the identical `.../file` and the uri carries zero discriminating information. As a veto that made the hand-over **undetectable**: live, `track` went 1→2 and every check said "not yet", so LMS never advanced, the next track was never armed, and HQPlayer ran out of playlist and stopped mid-album with time still on the counter. `_handedOver` now compares the query-stripped form on both sides; identical stripped urls fall through to the index test that already existed for the ambiguous case. **Local tiers are unaffected — no query string, so the veto still applies.** |
 | HQPlayer's playlist should show the whole LMS queue, as Roon and HQPlayer's own library do — or at least be trimmed so it is not a list of finished tracks | **DECLINED** 2026-08-30, Simon's call: "stick with it as is" | Both halves were understood and neither is being changed. **All at once is not possible**: `_NextIfMore` caps LMS's song queue at two (`scalar @{$self->{songqueue}} < 2`), so only two URLs ever exist — LMS mints them lazily because service URLs are signed and time-limited and the queue is mutable. Roon differs because Roon OWNS the queue; here LMS does and we model a Squeezebox, which is also two-deep. **The growth is ours**: `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer accumulates a HISTORY of the run while LMS stays at two. Trimming with `PlaylistRemove` was offered and declined. So the list is expected to grow, and only its LAST entry is "next". |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -404,6 +405,88 @@ device path rather than a display name in any case. `GetInputs` lists sources
 reachable from another host. The status page therefore reports the transport id
 and says plainly that the name is unavailable.
 
+## ReplayGain — local is HQPlayer's job, streaming is ours
+
+**HQPlayer reads a local file's own tags and needs nothing from us.** Verified
+live 2026-08-30: an album carrying `REPLAYGAIN_ALBUM_GAIN=-6.31 dB`
+(`REPLAYGAIN_REFERENCE_LOUDNESS=-18.00 LUFS`) produced exactly
+
+```
+Adaptive transport gain: -6.31 dB (0.483615)
+```
+
+with nothing sent from the bridge. **So local tiers must NOT send a gain** —
+it would be applied twice. `_replayGain` gates on the TRACK being remote for
+this reason, not on `hqTier`.
+
+**A service CDN file carries no ReplayGain tags at all.** Every streamed track
+logged `Adaptive transport gain: 0 dB (1)`, and `<Status/>` for a playing
+24/96 Qobuz FLAC reported `gain="0"`. That is the gap this section is about.
+
+**LMS HAS the number, and getting it costs one accessor.** With Smart Gain on
+(`replayGainMode = 3`) the bridge player's `status` answers:
+
+```
+"replay_gain": -4.07,
+"remoteMeta": { "url": "qobuz://420452060.flac", "bitrate": "2493kbps" }
+```
+
+`StreamingController` computes it via `Slim::Player::ReplayGain::fetchGainMode`
+and stores it on the Song ("store this for status queries") before calling
+`play()`. **No per-service code is needed.** Earlier plans to read Qobuz's
+`audio_info`, Tidal's `replay_gain`/`peak` and Deezer's `gain` out of the
+plugins' own caches are unnecessary — do not build them.
+
+**The album-vs-track decision is NOT ours and must not be reimplemented.** For
+a remote track `fetchGainMode` hands straight off to the service plugin's
+`trackGain` *before* any of LMS's own mode logic runs. Qobuz publishes both
+album and track figures so its choice is a real one; a service that publishes
+only track gain simply yields a track figure. **And because the choice is
+context-sensitive** — Smart Gain compares a song's playlist neighbours, so the
+same track is legitimately −4.07 inside its album and something else in a
+mixed queue — **the value is read per queue event and never cached against the
+track.** `$song->replayGain` for the track being started, `fetchGainMode` at
+arm time for a pre-queued one.
+
+### SETTLED: enabling replay gain does NOT cause a transcode
+
+Checked against the 9.1 source, because the premise was that turning it on
+would put LMS in the audio path. It does not. `Slim/Player/TranscodingHelper.pm`
+and `Slim/Player/Source.pm` contain **zero** occurrences of "gain" or "replay" —
+there is no gain stage anywhere in the transcode pipeline. The only consumer is
+`Slim::Player::Squeezebox::stream_s`, which does
+`$client->canDoReplayGain($params->{replay_gain})` and packs the result into the
+`strm` command as a 16.16 fixed-point multiplier, applied **by the player**.
+
+On this player it is doubly inert: `canDoReplayGain` returns 0, so LMS computes
+the figure, stores it on the Song, passes it to `play()` — and we are the only
+thing that ever looks at it.
+
+### OPEN: does hqplayerd honour `gain` on `PlaylistAdd`?
+
+**Unproven as of 0.2.36.** The read side is certain — `<Status/>`'s
+`<metadata/>` carries a `gain` attribute, and the vendor client parses it
+(`ControlInterface.cpp:2288`). The write side is not:
+
+* `clControlInterface::playlistAdd` builds `<metadata/>` by iterating a
+  free-form `QVariantHash` and writing **every key verbatim**, so there is no
+  client-side schema to satisfy — any attribute name is legal on the wire.
+  Whether the daemon *honours* one is a separate question.
+* **The live queue has no gain field.** `<PlaylistGet picture="0"/>` returns
+  `<PlaylistItem>` elements, and a queued Qobuz track came back with no
+  `track_gain`/`album_gain`. Those two names belong to `PlaylistGetSingle` /
+  `PlaylistGetAll`, which return **saved** playlists as
+  `<Playlist><track/></Playlist>` — a different schema. Do not chase them for
+  the live queue.
+* So `gain` may well be decoder-derived like `bits` and `bitrate`, in which
+  case streaming cannot be normalised through this route at all.
+
+**The one-shot test:** play a streaming track on 0.2.36 and read `<Status/>`.
+`gain="-4.07"` plus the log moving off `0 dB (1)` means it works. Still
+`gain="0"` means it is decoder-only — remove the attribute and close the idea.
+**Judge it by hqplayerd's log, never by `state`** — see the tier 3 row in the
+Review Ledger.
+
 ## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
 
 **Isolated live 2026-08-28, engine 6.0.4, four controlled runs.** This is the
@@ -689,23 +772,52 @@ MP3 is already cleared by `initBitrateLimit`.
 answer is genuinely yes: `https://www.signalyst.com` returned a real 404 over
 TLS.
 
-**UNVERIFIED, and the things to watch on the first listen:**
+**VERIFIED LIVE 2026-08-30 on Qobuz.** `canDirectStream` returned the signed
+Akamai URL, `_resolveURL` reported tier 5, the next track was pre-queued, and
+the hand-over was clean:
 
-* **Seek.** Tier 5 seeks like tier 1 — `<Seek>` after `Play`, because LMS is not
-  in the byte path. Whether the service's CDN honours a range request is
-  untested. If it does not, hqplayerd logs
-  `clStreamReaderHTTP::Skip(): not seekable!` and starts from zero.
-* **Scrobbling and play counts.** We already report `playerTrackStarted` and
-  end-of-stream ourselves, so this *should* be unaffected, but it rides a path
-  LMS normally drives from the stream socket.
-* **URL lifetime.** A signed CDN URL expires. Pre-queuing hands it over a whole
-  track early, which is minutes — well inside any sane expiry, but it is a new
-  exposure that tier 4 did not have.
+```
+canDirectStream: qobuz://193171335.flac -> https://streaming-qobuz-std.akamaized.net/file?uid=355122&eid=193171335&fmt=7&profile=raw
+11:34:13  Playlist add URI: ...qobuz...      <- track
+11:34:13  Playlist add URI: ...qobuz...      <- pre-queued
+11:35:24  End of track at 71/71/0            <- tail exact
+11:35:24  Next (0)                           <- no Playlist clear, no Play, no Idle request
+```
 
-Range support matters for tiers 1 and 3: HQPlayer logs
-`clStreamReaderHTTP::Skip(): not seekable!` against servers that lack it
-(Python's `http.server` does). LMS's download route supports ranges on a native
-passthrough, which is why seek is a tier 1 capability only.
+Note the URL carries a query string with `&`s — the thing the retired rule above
+said was impossible. **Streaming is now pre-queued gapless, not the
+buffer-margin kind.**
+
+**VERIFIED ACROSS ALL THREE SERVICES 2026-08-30 (0.2.35):**
+
+| | tier | gapless | concurrent | seek |
+|---|---|---|---|---|
+| Qobuz | 5 direct | yes, pre-queued | yes | yes |
+| Tidal | 5 direct | yes, pre-queued | yes | yes |
+| Deezer | **4 fallback** | buffer-margin only | yes | yes |
+
+**Deezer declines the hook** and falls back to tier 4 — the safety net working,
+not a failure. Its gapless is therefore the `output_delay` margin, not a real
+hand-over, so a sample-rate change WILL be audible there. Which of the three
+gates it fails (no hook / `handlesStreamHeaders` / returns false) is not yet
+established.
+
+**The two services differ in where a track's identity lives, and it matters.**
+Qobuz puts it in the QUERY STRING, Tidal in the PATH. Since HQPlayer strips the
+query from every uri it reports, only Qobuz hit the hand-over bug — see the
+Review Ledger row. Tidal would have worked either way.
+
+**A SEEK ON TIER 5 DROPS TO TIER 4, AUTOMATICALLY AND CORRECTLY.** `canDirectStream`
+is not even consulted: LMS will not take the direct branch when it has to open
+the source at a byte offset, so it keeps the seek on its own stream and
+`Stream.pm` serves it, with `_flacPrelude` synthesising the header a seeked FLAC
+lacks. Verified on both Qobuz and Tidal. **Consequence: the track you seek into
+is NOT pre-queued, so the boundary after a seek is buffer-margin rather than
+true gapless.** It recovers on the following track.
+
+**STILL UNVERIFIED:** scrobbling and play counts on tier 5 (they normally ride
+the stream socket), and signed-URL expiry, since pre-queuing hands the url over
+a whole track early.
 
 ### TRAP: a transcode is served CHUNKED, and HQPlayer does not de-chunk
 
