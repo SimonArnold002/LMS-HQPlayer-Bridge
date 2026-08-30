@@ -40,8 +40,16 @@ my $S = 'Plugins::HQPlayerBridge::Stream';
     package FakeRequest;
     sub new { my ($c,%a)=@_; bless {%a}, $c }
     sub method { $_[0]->{method} }
-    sub uri    { $_[0] }
     sub path   { $_[0]->{path} }
+
+    # uri() is both a getter (returning something with ->path) and a setter -
+    # the tier 3 handler rewrites it to the canonical /music/<id>/download.<ext>
+    sub uri { my $s = shift; if (@_) { $s->{path} = shift } return $s }
+
+    # The whole of the tier 3 fix turns on this: downloadMusicFile chunks for
+    # HTTP/1.1 and does not for anything else.  Defaults to 1.1, which is what
+    # HQPlayer actually asks with.
+    sub protocol { my $s = shift; $s->{protocol} = shift if @_; $s->{protocol} // 'HTTP/1.1' }
 
     package FakeResponse;
     sub new { my ($c,$req)=@_; bless { req=>$req, h=>{} }, $c }
@@ -74,7 +82,13 @@ sub call {
     Slim::Web::HTTP::_reset();
     my $sock = FakeSocket->new;
     my $res  = FakeResponse->new( FakeRequest->new( method => $method, path => $path ) );
-    Plugins::HQPlayerBridge::Stream::_handler( $sock, $res );
+    # Dispatch the way LMS's two registered raw functions do, on the path.
+    if ( $path =~ m{^/hqp3/} ) {
+        Plugins::HQPlayerBridge::Stream::_downloadHandler( $sock, $res );
+    }
+    else {
+        Plugins::HQPlayerBridge::Stream::_handler( $sock, $res );
+    }
     return ( $sock, $res );
 }
 
@@ -304,6 +318,52 @@ my $dead = FakeSocket->new; $dead->{up} = 0;
 Plugins::HQPlayerBridge::Stream::_handler( $dead, FakeResponse->new( FakeRequest->new( method=>'GET', path=>'/hqp/02-ab-88-42-4c-69/1.flac' ) ) );
 is( scalar @Slim::Web::HTTP::STREAMS, '0', 'a socket that has already gone is left alone' );
 is( scalar @Slim::Web::HTTP::SENT, '0', 'and not written to' );
+
+# ---------------------------------------------------------------------------
+print "-- tier 3: the unchunked download route --\n";
+# ---------------------------------------------------------------------------
+# A local file HQPlayer cannot decode has to be transcoded, and LMS already
+# does that correctly at /music/<id>/download.<ext>.  The ONLY thing wrong with
+# it is the framing: downloadMusicFile chunks for an HTTP/1.1 client, and
+# HQPlayer does not de-chunk.  So say HTTP/1.0 on the request's behalf and let
+# LMS do the rest.
+is( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303, 'flac' ),
+    'http://s:9000/hqp3/303/download.flac', 'the tier 3 url is path-only and carries download.<ext>' );
+
+ok( scalar( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303, 'flac' ) !~ /\?/ ),
+    'and no query string - HQPlayer silently refuses those' );
+
+is( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303 ),
+    'http://s:9000/hqp3/303/download.flac', 'the extension defaults to flac' );
+
+Slim::Web::HTTP::_reset();
+call( 'GET', '/hqp3/303/download.flac' );
+is( scalar @Slim::Web::HTTP::DOWNLOADS, '1', 'a tier 3 request is delegated to downloadMusicFile' );
+is( $Slim::Web::HTTP::DOWNLOADS[0]{id}, '303', 'with the track id out of the path' );
+is( $Slim::Web::HTTP::DOWNLOADS[0]{protocol}, 'HTTP/1.0',
+    'AND THE REQUEST DECLARED HTTP/1.0 - this is the whole fix, it stops LMS chunking' );
+is( $Slim::Web::HTTP::DOWNLOADS[0]{uri}, '/music/303/download.flac',
+    'the uri is rewritten to the canonical route downloadMusicFile parses' );
+is( scalar @Slim::Web::HTTP::STREAMS, '0',
+    'and NOTHING is attached to the player stream - that is what makes it pre-queueable' );
+
+# a HEAD is HQPlayer's first request for every item, and downloadMusicFile
+# handles it itself
+Slim::Web::HTTP::_reset();
+call( 'HEAD', '/hqp3/303/download.flac' );
+is( scalar @Slim::Web::HTTP::DOWNLOADS, '1', 'a HEAD is delegated too - HQPlayer HEADs before it GETs' );
+
+Slim::Web::HTTP::_reset();
+call( 'GET', '/hqp3/notanumber/download.flac' );
+is( $Slim::Web::HTTP::SENT[0]{code}, '404', 'a malformed tier 3 path is a 404' );
+is( scalar @Slim::Web::HTTP::DOWNLOADS, '0', 'and is not delegated' );
+
+Slim::Web::HTTP::_reset();
+$Slim::Web::HTTP::NOT_LOCAL{999} = 1;
+call( 'GET', '/hqp3/999/download.flac' );
+is( $Slim::Web::HTTP::SENT[0]{code}, '404',
+    'a track downloadMusicFile will not serve still gets a response - it writes nothing on a false return' );
+delete $Slim::Web::HTTP::NOT_LOCAL{999};
 
 printf "\n%d passed, %d failed\n", $pass, $fail;
 exit( $fail ? 1 : 0 );

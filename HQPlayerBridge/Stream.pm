@@ -62,6 +62,11 @@ my $log = logger('plugin.hqplayerbridge');
 
 use constant PATH_PREFIX => '/hqp/';
 
+# TIER 3 - a local file HQPlayer cannot decode, transcoded by LMS.  A separate
+# path because it is served a completely different way: see the tier 3 section
+# at the bottom of this file.
+use constant DOWNLOAD_PREFIX => '/hqp3/';
+
 # HTTP wants CRLF regardless of what the platform thinks a newline is.
 use constant CRLF => "\015\012";
 
@@ -72,9 +77,12 @@ use constant FALLBACK_TYPE => 'audio/x-flac';
 my %SEQ;
 
 sub init {
-    Slim::Web::Pages->addRawFunction( qr{^/hqp/}, \&_handler );
+    Slim::Web::Pages->addRawFunction( qr{^/hqp/},  \&_handler );
+    Slim::Web::Pages->addRawFunction( qr{^/hqp3/}, \&_downloadHandler );
 
-    main::INFOLOG && $log->is_info && $log->info( 'tier 4 stream endpoint registered at ' . PATH_PREFIX );
+    main::INFOLOG && $log->is_info && $log->info(
+        'stream endpoints registered at ' . PATH_PREFIX . ' (tier 4) and '
+            . DOWNLOAD_PREFIX . ' (tier 3)' );
 
     return;
 }
@@ -383,6 +391,95 @@ sub _fail {
     Slim::Web::HTTP::addHTTPResponse( $httpClient, $response, \$text );
 
     return;
+}
+
+# ---------------------------------------------------------------------------
+# TIER 3 - a local file in a format HQPlayer cannot decode
+# ---------------------------------------------------------------------------
+#
+# HQPlayer's mime table has no m4a/mp4/aac/alac entry, so those have to be
+# transcoded on the way out.  LMS already does that, correctly and without
+# blocking, at /music/<id>/download.<ext> - and 0.2.31 moved this tier OFF that
+# url because the transcode arrived `Transfer-Encoding: chunked` and HQPlayer
+# DOES NOT DE-CHUNK: it reads the chunk-size lines as audio and its FLAC
+# decoder tears itself apart on them (lost sync / unparseable stream / CRC
+# error).  That was the garbled-mp4 report.
+#
+# THE CHUNKING IS THE ONLY THING WRONG, AND IT IS ONE `if`.  From LMS's own
+# Slim::Web::HTTP::downloadMusicFile:
+#
+#     my $is11 = $response->request->protocol eq 'HTTP/1.1';
+#     if ($is11) {
+#         # Use chunked TE for HTTP/1.1 clients
+#         $response->header( 'Transfer-Encoding' => 'chunked' );
+#     }
+#
+# and `$is11` is what every write in its non-blocking writer then branches on -
+# false means raw bytes and close-at-EOF, which is exactly the framing tier 4
+# hand-rolls and HQPlayer is happy with.  Confirmed against the live server:
+# the same url over HTTP/1.0 answers with no Transfer-Encoding and a valid
+# body; over HTTP/1.1 it chunks.  HQPlayer asks in 1.1, which is why it broke.
+#
+# So: take the request, say HTTP/1.0 on its behalf, and hand it to LMS.
+#
+# WHY THIS AND NOT THE TIER 4 ENDPOINT.  0.2.31 routed tier 3 through the
+# player stream above, which fixed the framing but cost gapless: that endpoint
+# IS the player stream, it draws on $client->chunks, and there is one of those
+# per player - so a pre-queued second track would fight the one playing (and
+# _handler would close its socket outright).  This route touches none of that.
+# Every request is an independent transcode of a numbered track, so two can be
+# open at once and tier 3 can be pre-queued exactly like tier 1.  Gapless is
+# back and the audio is still correctly framed.
+#
+# NOT SEEKABLE - a transcode has no length, so LMS answers `Accept-Ranges:
+# none`.  Same as before; _queueTrack does not send <Seek> for this tier.
+
+# The url HQPlayer is given.  It has to contain `download.<ext>` because that
+# is the regex downloadMusicFile reads the output format out of, and no `?`
+# because HQPlayer will not fetch one (see the header).
+sub downloadUrlFor {
+    my ( $class, $base, $id, $ext ) = @_;
+
+    return $base . DOWNLOAD_PREFIX . $id . '/download.' . ( $ext || 'flac' );
+}
+
+sub _downloadHandler {
+    my ( $httpClient, $response ) = @_;
+
+    return unless $httpClient && $httpClient->connected;
+
+    my $request = $response->request;
+    my $path    = eval { $request->uri->path } || '';
+
+    my ($id) = $path =~ m{^/hqp3/(\d+)/download\.};
+
+    if ( !$id ) {
+        $log->warn("malformed tier 3 download request $path");
+        return _fail( $httpClient, $response, 404, 'no such track' );
+    }
+
+    # THE WHOLE FIX.  downloadMusicFile reads the request's protocol to decide
+    # whether to chunk, and nothing else in it cares - the transcode, the
+    # non-blocking writer and the headers are identical either way.
+    $request->protocol('HTTP/1.0');
+
+    # downloadMusicFile matches `download\.([^\?]+)` against the request uri to
+    # pick the output format, and our path already carries it - but point the
+    # uri at the canonical route as well so anything it logs reads sensibly and
+    # any future parsing of that uri finds what it expects.
+    my $ext = $path =~ m{download\.([^/?]+)$} ? $1 : 'flac';
+    eval { $request->uri( '/music/' . $id . '/download.' . $ext ) };
+
+    main::INFOLOG && $log->is_info && $log->info(
+        "tier 3 download: track $id as $ext, unchunked" );
+
+    # Returns a false value when the id is not a local song, in which case
+    # nothing has been written to the socket yet and we still owe a response.
+    return if Slim::Web::HTTP::downloadMusicFile( $httpClient, $response, $id );
+
+    $log->warn("tier 3 download: track $id is not a local file");
+
+    return _fail( $httpClient, $response, 404, 'not a local track' );
 }
 
 1;

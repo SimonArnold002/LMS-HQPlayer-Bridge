@@ -80,6 +80,28 @@ print "-- DIDL-Lite metadata (the only channel that reaches HQPlayer) --\n";
     package FakeSong;
     sub new { bless { t => $_[1] }, $_[0] }
     sub currentTrack { $_[0]->{t} }
+
+    # The direct-streaming half: Song::open sets these when canDirectStream
+    # returns a url, and _resolveURL reads them back.
+    sub directstream        { $_[0]->{direct} }
+    sub streamUrl           { $_[0]->{streamUrl} }
+    sub currentTrackHandler { $_[0]->{handler} }
+    sub _direct { my ($s,$u,$h)=@_; $s->{direct}=1; $s->{streamUrl}=$u; $s->{handler}=$h; $s }
+
+    # Stand-ins for LMS protocol handlers, which differ in which hook they
+    # offer and whether they need the directHeaders callback we cannot make.
+    package FakeHandlerSong;   # Qobuz-shaped: canDirectStreamSong
+    sub new { bless { u => $_[1] }, $_[0] }
+    sub canDirectStreamSong { $_[0]->{u} }
+
+    package FakeHandlerUrl;    # older shape: canDirectStream($client,$url)
+    sub new { bless { u => $_[1] }, $_[0] }
+    sub canDirectStream { $_[0]->{u} }
+
+    package FakeHandlerRadio;  # parses response headers itself - must be refused
+    sub new { bless { u => $_[1] }, $_[0] }
+    sub canDirectStream    { $_[0]->{u} }
+    sub handlesStreamHeaders { 1 }
 }
 my $tr = FakeTrack->new({ title=>'Colony & "Collapse"', artist=>'Johanna <Warren>',
     album=>'Gemini I', coverid=>'abc123', id=>447812, secs=>107, ct=>'flc' });
@@ -294,10 +316,19 @@ ok($handedSub && $handedSub !~ /playerEndOfStream|playerStopped/,
    'a hand-over reports Started ONLY - an end-of-stream there would reload the track being played');
 
 my ($armSub) = $src =~ /\nsub _armNextTrack \{(.*?)\n\}/s;
-ok($armSub && $armSub =~ /return unless \$tier == 1;/,
-   '_armNextTrack pre-queues ONLY tier 1 - tiers 3 and 4 are both the player stream');
+ok(scalar($armSub && $armSub =~ /return unless \$tier == 1 \|\| \$tier == 3 \|\| \$tier == 5;/),
+   '_armNextTrack pre-queues tiers 1, 3 and 5 - none of them is the player stream');
+ok(scalar($armSub && $armSub !~ /\$tier == 4/),
+   'but never tier 4 - that one IS the player stream, and there is one per player');
 ok($armSub && $armSub =~ /hqArmNext\(\s*1\s*\).*?playerReadyToStream/s,
    'and arms the flag BEFORE the call - LMS re-enters play() synchronously for a local track');
+
+# The hand-over append goes through the same attribute builder, so it carries
+# freewheel too - a pre-queued track is fetched the same way as a loaded one.
+my ($attrSub) = $src =~ /\nsub _addAttrs \{(.*?)\n\}/s;
+ok(scalar($attrSub && $attrSub =~ /freewheel="' \. HQP_FREEWHEEL/), 'one builder writes freewheel for BOTH the load and the hand-over');
+ok(scalar($src =~ /use constant HQP_FREEWHEEL => 1;/), 'and it is on');
+ok(scalar($src !~ /PlaylistAdd uri=/), 'no hand-built PlaylistAdd attribute list is left behind');
 
 my ($appendSub) = $src =~ /\nsub _appendTrack \{(.*?)\n\}/s;
 ok($appendSub && $appendSub !~ /<Stop\/>|<PlaylistClear\/>/,
@@ -366,8 +397,10 @@ $c->hqPosition(3); $c->hqSeekOffset(10);
 is($c->songElapsedSeconds, '0', 'a position behind the seek point clamps at zero, never negative');
 
 my ($queueSub) = $src =~ /\nsub _queueTrack \{(.*?)\n\}/s;
-ok($queueSub && $queueSub =~ /hqTier[^;]*==\s*1[^;]*\{[^}]*Seek/s,
-   'Seek is sent on tier 1 only - tier 4 bytes already start at the offset');
+ok(scalar($queueSub && $queueSub =~ /\$seekTier == 1 \|\| \$seekTier == 5.*?Seek/s),
+   'Seek is sent on tiers 1 and 5 - the two where LMS is not in the byte path');
+ok(scalar($queueSub && $queueSub !~ /seekTier == 4/),
+   'and never on tier 4 - those bytes already start at the offset, so it would double it');
 ok($queueSub && $queueSub =~ /hqSeekOffset\(/,
    'and the offset we asked HQPlayer to skip is recorded');
 
@@ -585,69 +618,53 @@ is(scalar(@sent), '0', 'and the track-start re-assert does not drag it back');
 $c->volume(58);
 is(join(',', @sent), '<Volume value="-42"/>', 'a real slider move is still sent');
 
-# HEARING PROTECTION. When an endpoint re-registers, HQPlayer re-splits the
-# level between the endpoint's hardware volume and its own software attenuator,
-# and the endpoint announces whatever level it had stored. That arrives on the
-# same channel as the endpoint's own remote, so the ordinary follow path reads
-# it as intent. LIVE 2026-08-28, an Eversolo NAA re-registering, 600ms apart:
-#   volume changed outside LMS to -39dB - following
-#   volume changed outside LMS to -18dB - following      <- +21dB, in a room
-print "-- an endpoint re-registering must not turn the volume UP --\n";
+# A LEVEL SET OUTSIDE LMS IS ALWAYS FOLLOWED - THE USER OWNS THE VOLUME.
+#
+# 0.2.31 shipped a guard that refused an INCREASE for ten seconds after a
+# "link-up", because a re-registering endpoint announces its own stored level
+# and once jumped the output +21dB unasked (LIVE 2026-08-28, an Eversolo NAA,
+# two pushes 600ms apart: -39dB then -18dB).
+#
+# It was removed 2026-08-30: its trigger, `transport_serial`, turns over at
+# EVERY TRACK BOUNDARY - measured 4->5->6->7->8->9 across five boundaries in
+# one album - so the guard was armed for ten seconds after every track change
+# and pulled back the user's own volume changes. These tests pin the removal:
+# nothing may second-guess a level that arrives from the endpoint.
+print "-- a level set outside LMS is always followed --\n";
 {
     my $sp2 = Slim::Utils::Prefs::preferences('server');
 
-    # settle on -40dB (LMS 60) with the link long since up
-    $c->hqLinkAt(0);
+    # settle on -40dB (LMS 60)
     @sent = (); @ex = ();
     $c->_onStatus({ state => 2, position => 8, volume => -40 }, '');
     $sp2->client($c)->set('volume', 60);
     $c->hqVolDb(-40);
 
-    # ...the link comes up, and the endpoint announces its own stored level
-    $c->hqLinkAt( Time::HiRes::time() );
+    # a big jump UP is followed, and nothing is sent back to pull it down
     @sent = (); @ex = ();
     $c->_onStatus({ state => 2, position => 9, volume => -18 }, '');
+    is(join(',', @ex), 'mixer volume 82', 'a +22dB jump is followed into LMS');
+    is(scalar(@sent), '0', 'and nothing is sent back to pull it down');
 
-    is(scalar(@ex), '0', 'a +22dB jump just after link-up is NOT followed into LMS');
-    is(join(',', @sent), '<Volume value="-40"/>',
-       "and LMS's own level is re-asserted, pulling the endpoint back down");
-
-    # a DECREASE in the same window still follows - the guard can only quieten
+    # a drop is followed too
+    $sp2->client($c)->set('volume', 60);
     $c->hqVolDb(-40);
     @sent = (); @ex = ();
     $c->_onStatus({ state => 2, position => 10, volume => -60 }, '');
-    is(join(',', @ex), 'mixer volume 40', 'a drop in the same window follows immediately');
+    is(join(',', @ex), 'mixer volume 40', 'a drop is followed');
+    is(scalar(@sent), '0', 'and is not echoed back either');
 
-    # a small nudge up is still the user, not the device describing itself
+    # THE REGRESSION THIS REPLACES: transport_serial changes at every track
+    # boundary, so a volume change that happens to land next to one must still
+    # be honoured.
     $sp2->client($c)->set('volume', 60);
     $c->hqVolDb(-40);
-    @sent = (); @ex = ();
-    $c->_onStatus({ state => 2, position => 11, volume => -38 }, '');
-    is(join(',', @ex), 'mixer volume 62', 'a small increase inside the window is still followed');
-
-    # ...and once the window has passed, the endpoint's remote is honoured again
-    $sp2->client($c)->set('volume', 60);
-    $c->hqVolDb(-40);
-    $c->hqLinkAt( Time::HiRes::time() - 60 );
-    @sent = (); @ex = ();
-    $c->_onStatus({ state => 2, position => 12, volume => -18 }, '');
-    is(join(',', @ex), 'mixer volume 82',
-       'the same jump outside the window IS followed - the remote still works');
-
-    # THE OTHER TRIGGER: the NAA can drop and return while our link to HQPlayer
-    # never bounces, so refreshInfo never runs. transport_serial changing is
-    # HQPlayer saying the output transport was rebuilt.
-    $sp2->client($c)->set('volume', 60);
-    $c->hqVolDb(-40);
-    $c->hqLinkAt( Time::HiRes::time() - 60 );
-    $c->hqTransSerial(7);
     @sent = (); @ex = ();
     $c->_onStatus({ state => 2, position => 13, volume => -18, transport_serial => 8 }, '');
-    is(scalar(@ex), '0', 'a transport_serial change re-arms the guard on its own');
-    is(join(',', @sent), '<Volume value="-40"/>', 'and that jump is pulled back too');
+    is(join(',', @ex), 'mixer volume 82',
+       'a jump alongside a transport_serial change is STILL followed');
+    is(scalar(@sent), '0', 'and is not pulled back');
 
-    $c->hqLinkAt(0);
-    $c->hqTransSerial(undef);
     $sp2->client($c)->set('volume', 60);
     $c->hqVolDb(-40);
 }
@@ -808,6 +825,7 @@ sub status {
 $p->play({ controller => $lc });
 
 my ($addCmd) = grep { /^<PlaylistAdd\b/ } @sent;
+print "  >> EMITTED: $addCmd\n" if $ENV{SHOWCMD};
 my ($url1)   = $addCmd ? $addCmd =~ m{\buri="([^"]+)"} : ();
 
 ok($url1 && $url1 =~ m{/music/101/download\.flac}, 'play() hands HQPlayer the tier-1 URL');
@@ -828,10 +846,18 @@ is(join(',', grep { !/^<Seek/ } @sent),
 # so HQPlayer can never be told to play a queue it has not confirmed loading.
 ok(scalar(!grep { $_ eq '<Play/>' } @sent), 'and Play waits for PlaylistAdd to be acknowledged');
 
-# TRAP: clear="1" is IGNORED by engine 6.0.4 - PlaylistAdd answers OK and
-# APPENDS anyway, which is why the explicit <PlaylistClear/> above is load
-# bearing.  The attribute is still sent as the documented spelling.
-ok(scalar($addCmd =~ m{\bclear="1"}), 'PlaylistAdd still carries the documented clear="1"');
+# EVERY ATTRIBUTE IS WRITTEN, as Signalyst's own client does - it always emits
+# uri/queued/clear/start/freewheel, defaults included.  An omitted attribute has
+# cost this repo before (the <Status/> subscribe flag), so nothing is left to
+# HQPlayer's own defaults.
+#
+# clear is 0, not 1: it is IGNORED by engine 6.0.4 - PlaylistAdd answers OK and
+# APPENDS anyway - which is why the explicit <PlaylistClear/> above is load
+# bearing.  Sending it as 1 asked for something we know is not honoured.
+ok(scalar($addCmd =~ m{\bclear="0"}), 'clear is written explicitly as 0 - the explicit PlaylistClear does the work');
+ok(scalar($addCmd =~ m{\bstart="0"}), 'start is written explicitly as 0 - the separate <Play/> starts playback');
+ok(scalar($addCmd =~ m{\bfreewheel="1"}), 'freewheel is ON - fetch the track rather than pull it at playback rate');
+ok(scalar($addCmd =~ m{\bqueued="0"}), 'and queued stays 0 - queued="1" kills the daemon');
 
 # The artwork lever.  cover= takes a PLAIN url and HQPlayer base64-encodes it
 # into the item's `picture` itself - verified byte-identical to the DIDL path
@@ -1323,6 +1349,69 @@ print "-- the stale suppression is bounded --\n";
         'the status stream reaches the controller again' );
 }
 
+print "-- tier 5: direct from the service --\n";
+{
+    # THE OLD REASON NOT TO DO THIS WAS WRONG. "HQPlayer cannot fetch a url
+    # with a query string" was disproven on the wire 2026-08-28 - it fetches
+    # them verbatim and merely strips them from what it REPORTS. So a signed
+    # CDN url can go straight over, and the service no longer has to be proxied
+    # through LMS's single player stream.
+    my $signed = 'https://cdn.example.com/x.flac?uid=355122&fmt=7&hmac=abc123';
+
+    my $qobuz = FakeSong->new( FakeTrack->new(
+        { title=>'Remote', id=>-1, ct=>'flc', secs=>200, url=>'qobuz://1234.flac' } ) );
+
+    # --- the hook itself ---
+    is( $c->canDirectStream( 'qobuz://1234.flac', undef ), '0',
+        'no song means no direct streaming' );
+
+    $qobuz->_direct( $signed, FakeHandlerSong->new($signed) );
+    is( $c->canDirectStream( 'qobuz://1234.flac', $qobuz ), $signed,
+        'canDirectStreamSong is preferred, and its url is returned verbatim' );
+
+    my $older = FakeSong->new( FakeTrack->new(
+        { title=>'Remote', id=>-1, ct=>'flc', secs=>200, url=>'x://1.flac' } ) );
+    $older->_direct( $signed, FakeHandlerUrl->new($signed) );
+    is( $c->canDirectStream( 'x://1.flac', $older ), $signed,
+        'a handler with only canDirectStream is used too' );
+
+    # --- what must be REFUSED, because there is no fallback after Song::open ---
+    my $radio = FakeSong->new( FakeTrack->new(
+        { title=>'Station', id=>-1, ct=>'mp3', secs=>0, url=>'r://1' } ) );
+    $radio->_direct( $signed, FakeHandlerRadio->new($signed) );
+    is( $c->canDirectStream( 'r://1', $radio ), '0',
+        'a handler that parses its own response headers is refused - we cannot call directHeaders back' );
+
+    my $rel = FakeSong->new( FakeTrack->new(
+        { title=>'Odd', id=>-1, ct=>'flc', secs=>10, url=>'x://2' } ) );
+    $rel->_direct( '/not/absolute.flac', FakeHandlerSong->new('/not/absolute.flac') );
+    is( $c->canDirectStream( 'x://2', $rel ), '0',
+        'a non-http url is refused - HQPlayer will not follow a redirect to find the real one' );
+
+    my $none = FakeSong->new( FakeTrack->new(
+        { title=>'Plain', id=>-1, ct=>'flc', secs=>10, url=>'x://3' } ) );
+    $none->_direct( '', FakeHandlerSong->new('') );
+    is( $c->canDirectStream( 'x://3', $none ), '0',
+        'a handler that declines gets no direct stream' );
+
+    # --- and the url that reaches HQPlayer ---
+    my $u = $c->_resolveURL($qobuz);
+    is( $u, $signed, 'a direct song is handed the service url unchanged' );
+    is( $c->hqTier, '5', 'and is tier 5' );
+    ok( scalar( $u =~ /\?/ ),
+        'THE QUERY STRING SURVIVES - that is the whole point of tier 5' );
+
+    # a remote song LMS did NOT take direct still goes on the player stream
+    # qobuz:// because an earlier block redefines isRemoteURL to that scheme
+    my $proxied = FakeSong->new( FakeTrack->new(
+        { title=>'Remote', id=>-1, ct=>'flc', secs=>200, url=>'qobuz://9.flac' } ) );
+    my $u4 = $c->_resolveURL($proxied);
+    is( $c->hqTier, '4', 'a song LMS did not take direct falls back to tier 4' );
+    ok( scalar( $u4 =~ m{/hqp/} ), 'on the plugin player-stream endpoint, as before' );
+
+    is( $c->canHTTPS, '1', 'we tell LMS we can do HTTPS - Qobuz and Tidal are' );
+}
+
 print "-- tier 3: a local file HQPlayer cannot decode --\n";
 {
     # HQPlayer CANNOT FETCH A URL WITH A QUERY STRING.  Isolated live
@@ -1337,16 +1426,25 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
     my $alac = FakeSong->new( FakeTrack->new(
         { title=>'Lossless', id=>303, ct=>'alc', secs=>200, url=>'file:///x.m4a' } ) );
 
-    # NOT /music/<id>/download.flac. A transcode has no length, so LMS sends it
-    # `Transfer-Encoding: chunked`, and HQPLAYER DOES NOT DE-CHUNK: it reads the
-    # chunk-size lines as audio and its decoder throws `lost sync` / `CRC error`
-    # on every frame. Reported live 2026-08-28 as garbled mp4 playback. The
-    # plugin's own endpoint writes raw bytes with no chunking.
+    # NOT /music/<id>/download.flac EITHER. A transcode has no length, so for
+    # an HTTP/1.1 client LMS sends it `Transfer-Encoding: chunked`, and
+    # HQPLAYER DOES NOT DE-CHUNK: it reads the chunk-size lines as audio and
+    # its decoder throws `lost sync` / `CRC error` on every frame. Reported
+    # live 2026-08-28 as garbled mp4 playback.
+    #
+    # 0.2.31 dodged that by routing this tier through the tier 4 player-stream
+    # endpoint, which cost it gapless - there is one player stream per player,
+    # so a pre-queued track fights the one playing. It goes on its own download
+    # route instead, which is LMS's OWN download path with the request declared
+    # HTTP/1.0 so the one `if` that chunks it does not fire. Independent per
+    # request, so it CAN be pre-queued.
     my $u = $c->_resolveURL($alac);
-    ok( scalar( $u =~ m{^http://127\.0\.0\.1:9000/hqp/02-ab-88-42-4c-69/\d+\.} ),
-        'a local file HQPlayer cannot decode is served on the PLUGIN endpoint' );
-    ok( scalar( $u !~ m{/download\.flac} ),
-        'NOT the LMS download route - that answers chunked and breaks the decoder' );
+    ok( scalar( $u =~ m{^http://127\.0\.0\.1:9000/hqp3/303/download\.flac$} ),
+        'a local file HQPlayer cannot decode is served on the tier 3 download route' );
+    ok( scalar( $u !~ m{^http://127\.0\.0\.1:9000/hqp/} ),
+        'NOT the tier 4 player-stream endpoint - that cannot be pre-queued' );
+    ok( scalar( $u =~ m{/download\.} ),
+        'the url carries download.<ext> - downloadMusicFile reads the output format out of it' );
     is( $c->hqTier, '3', 'and is tier 3' );
     ok( scalar( $u !~ /\?/ ),
         'the url carries NO query string - HQPlayer silently refuses those' );

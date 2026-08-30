@@ -48,6 +48,24 @@ sub _stringifyHeaders {
 
 sub closeHTTPSocket {}
 
+# LMS's own transcoding download path, which the tier 3 route delegates to.
+# The real one decides whether to chunk from $response->request->protocol, so
+# the stub records what it was handed.  Returns false for a track that is not a
+# local song, exactly as the real one does.
+our @DOWNLOADS;
+our %NOT_LOCAL;
+sub downloadMusicFile {
+    my ( $httpClient, $response, $id ) = @_;
+    push @DOWNLOADS, {
+        socket   => $httpClient,
+        id       => $id,
+        protocol => $response->request->protocol,
+        uri      => $response->request->uri->path,
+    };
+    return 0 if $NOT_LOCAL{$id};
+    return 1;
+}
+
 # The tier 4 endpoint closes a player's previous stream connection itself,
 # because the two places LMS would do it are both gated on the player being a
 # Slim::Player::Squeezebox.
@@ -68,6 +86,6 @@ sub forgetClient {
     return;
 }
 
-sub _reset { @SENT = (); @STREAMS = (); @CLOSED = (); %peerclient = (); %keepAlives = (); %metaDataBytes = () }
+sub _reset { @SENT = (); @STREAMS = (); @CLOSED = (); @DOWNLOADS = (); %peerclient = (); %keepAlives = (); %metaDataBytes = () }
 
 1;
