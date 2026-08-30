@@ -563,10 +563,13 @@ thoroughly 2026-08-30 — `Meters`, `GetMeters`, `Level`, `GetLevel`, `Analysis`
 answer `Unknown command`; `<VolumeRange/>` carries only `adaptive enabled max
 min`; `<ConfigurationGet/>` returns a profile name; and a **subscribed**
 `<Status/>` stream carries no level, peak or rms field. The `peak`/`rms`/`lufs`
-fields in Signalyst's own client belong to `LibraryFile`/`LibraryDirectory` — its
-library ANALYSIS, not a live meter — and the web UI's "Limits / Apod" is a
-clipping COUNTER, not a level. Signalyst publish no API spec; the 6.0.1 client
-source is the reference and it has no metering command.
+fields on `LibraryFile`/`LibraryDirectory` are its library ANALYSIS, not a live
+meter, and the web UI's "Limits / Apod" is a clipping COUNTER.
+
+**BUT A LIVE METER DOES EXIST — see the next section. It is not on 4321 and it
+is not XML, which is why a command-name sweep could not find it.** It does not
+change any of this: a meter is retrospective and the ceiling has to be known
+BEFORE the track starts, which is what the configured headroom is.
 
 **It appears in exactly one place: hqplayerd's own log at `:8088/log`.**
 
@@ -596,6 +599,55 @@ already carries — `active_filter active_shaper active_mode active_rate
 correction filter_20k filter_junk` — and forces a re-read when the signature
 moves. Otherwise the read is throttled to `HEADROOM_MAX_AGE` (15 minutes), and
 `refreshInfo` asks for one too.
+
+### CORRECTED: there IS a live meter, on control port + 1
+
+**Recorded here as "the client source has no metering command" and that was
+wrong.** Simon said twice that the levels are visible in the desktop client's
+meters and therefore available; the sweep that "disproved" it only ever looked
+for an XML command name on 4321. **The metering channel is a SECOND SOCKET
+carrying PACKED BINARY, so no command sweep could ever have found it** —
+[[exhaust-the-api-reference]], read the client's classes, not just its verbs.
+
+`clMeterInterface` in Signalyst's own `ControlInterface.cpp`:
+
+```cpp
+void clMeterInterface::setServer (QString hostname, quint16 hostport)
+{
+    serverHost = hostname;
+    serverPort = hostport + 1;          // <- control port + 1, so 4322
+}
+```
+
+Connecting **is** the subscribe (hqplayerd logs `Meter connection from …` /
+`Metering enabled`); disconnecting unsubscribes. The stream is a repeating
+header plus per-channel data, `#pragma pack`, little-endian:
+
+```c
+typedef struct { unsigned version, channels, xformLength;
+                 int xformBits;                       // negative = float
+                 float bandwidth, xformTime, xformGain, reserved2; } head_t;   // 32 bytes
+typedef struct { float peakMax, peak, rms, rmsMax; } data_t;                   // per channel
+```
+
+then `xformLength` floats twice per channel — the spectrum. So one frame is
+`32 + channels * (16 + xformLength*4*2)` bytes.
+
+**Verified on the wire 2026-08-30** against the live daemon while playing:
+
+```
+version=1 channels=2 xformLength=1025 xformBits=16 bandwidth=22050.0 xformGain=2.0
+  ch0: peakMax=-10.15882  peak=-14.84330  rms=-24.17408  rmsMax=-18.65369
+  ch1: peakMax=-10.09222  peak=-16.54959  rms=-26.51343  rmsMax=-17.58654
+```
+
+Levels are already in **dB**. One frame is 65,792 bytes at these settings and
+they arrive continuously, so anything reading this must be prepared to drop
+frames rather than queue them.
+
+**Nothing uses it today**, and it must not be pressed into the ReplayGain
+calculation — see above. It is the obvious source for a level display if one is
+ever wanted.
 
 **Do NOT probe port 8019 to find any of this.** A bare `GET /` on hqplayerd's
 UPnP port spins its log at ~68k lines/sec — `clUPnP::OnRequest():
@@ -1754,7 +1806,28 @@ HTTP played correctly:
   as `mime="audio/x-flac"`, playback advances, and the gain the bridge computed
   (`-8.23 -> -5.22 dB`, headroom −3.01, `peak 0.985198`) arrives at hqplayerd as
   `Adaptive transport gain: -5.22 dB (0.548277)` with `Set volume` unmoved.
-  ALAC takes the identical code path; it has not been watched play.
+* **TIER 3 IS GAPLESS ACROSS A TRACK BOUNDARY, AAC and ALAC** — 2026-08-30,
+  reported by Simon and matched in hqplayerd's log. The signature is exactly the
+  one this file predicted: an add with **no `Playlist clear` and no `Play`**.
+
+  ```
+  22:39:33  Playlist clear
+  22:39:33  Playlist add URI: .../hqp3/473567/download.flac    <- load
+  22:39:33  Playlist add URI: .../hqp3/473568/download.flac    <- armed
+  22:44:35  Adaptive transport gain: -5.22 dB
+  22:44:36  Playlist add URI: .../hqp3/473569/download.flac    <- HAND-OVER, no clear
+  ```
+
+  302 s track, boundary at 22:44:35 — to the second. So both "still unverified"
+  bullets that used to sit here are closed, and `_armNextTrack` genuinely does
+  keep two `/hqp3/` transcodes open at once.
+* **THE POSITIVE-GAIN PATH FIRED, AND TRIMMED** — 2026-08-30:
+  `Adaptive transport gain: 3.01 dB (1.41416)`. That is a boost clamped to
+  exactly the headroom's own magnitude, which is the design: the combined figure
+  lands at 0 dBFS and no further. First live confirmation of the trim.
+* **hqplayerd confirms the switch we depend on** — `Playlist uses album gain`
+  in its log, i.e. `playlist_album_gain="1"`. If `album_gain` ever stops
+  working, that line is the first thing to look for.
 
 **Watch for a silent output-format mismatch.** When HQPlayer's output format
 exceeds what the endpoint accepts, it reports `state=2` and returns OK to
@@ -2304,14 +2377,6 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Still unverified
 
-* **Whether an mp4/ALAC track sounds right on 0.2.32.** The tier 3 route is
-  reasoned from LMS's own `$is11` branch and confirmed at the HTTP level (the
-  same URL over HTTP/1.0 answers unchunked and valid), but the build has not
-  been listened to. Check `:8088/log` for `ReadFLACErrorCB` lines, not `state`.
-* **Whether tier 3 pre-queues cleanly in practice.** `_armNextTrack` now arms
-  it, so two `/hqp3/` transcodes can be open at once. Expect `Playlist add URI`
-  at each boundary with **no** `Playlist clear` and no `Play` — that is the
-  signature of a real hand-over in hqplayerd's log.
 * **How HQPlayer presents fixed volume.** Now has an obvious answer to test:
   `enabled` on `<VolumeRange/>`. Flip the setting on a live instance and read
   it back. Detection currently assumes a zero-width range, and falls back to
