@@ -499,34 +499,57 @@ min="-100"/>`), which is why local files were already being normalised.
 as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
 moving it would move the Eversolo's own volume.
 
-### The ceiling: a boost is allowed only as far as the peak permits
+### The ceiling: a boost is TRIMMED to the threshold, never refused
 
 **ReplayGain normalises UP as readily as down.** Qobuz's album gain for *The Dark
 Side Of The Moon (50th Anniversary)* is **+6.68 dB** — the album is mastered
 quietly and −18 LUFS is a target, not a maximum. 0.2.38 sent it verbatim and
-HQPlayer applied `6.68 dB (2.15774)`, a **2.16× multiplier**.
+HQPlayer applied `6.68 dB (2.15774)`, a 2.16× multiplier.
 
-**0.2.39 answered that by refusing every positive gain. That was over-cautious
-and is superseded.** It throws away legitimate headroom on quiet masters, and
-HQPlayer registered no clipping through that playback at all (`clips="0"`,
-`apod="0"`). Simon's call, 2026-08-30: *"the positive gains are fine if they dont
-make HQPlayer overall output go into clipping so peaking at 0db"*.
+**Two wrong answers came before the right one, and both failed the same way — by
+declining instead of trimming.** 0.2.39 refused every positive gain; 0.2.40
+refused any it could not check against a peak. Simon's rule, 2026-08-30: a
+positive gain is fine unless it takes HQPlayer's overall output past 0 dB full
+scale, and where it would, *"it should apply what it needs to not go over the
+threshold not just not apply it at all"*.
 
-**0.2.40 applies the rule ReplayGain already defines**: the largest safe boost is
-`-20*log10(peak)`, which is exactly `Slim::Player::ReplayGain::preventClipping`.
-We call it ourselves rather than trusting it upstream — it demonstrably had not
-been applied, or +6.68 could not have reached us.
+**So every limit TRIMS. Nothing can turn a boost into silence.**
 
-**NO PEAK MEANS NO BOOST.** Without a peak there is no way to know what a boost
-would do, and guessing wrong clips. **Attenuation is never touched by any of
-this** — the peak only ever limits a boost.
+**The dominant term is the VOLUME, and we always know it.** Output tops out at
+`_volMax` (0 dB, from `<VolumeRange max="0"/>`) and sits at `hqVolDb`, so the room
+above the current level is the threshold:
 
-**THE PEAK IS THE ONE INPUT WE CANNOT SEE FROM OUTSIDE.** `songinfo` on a remote
-track exposes no gain and no peak (`album, artist, bitrate, duration, samplerate,
-samplesize, title, tracknum, type, url` and nothing else), so whether a service
-populates `$track->replay_peak` can only be learned from inside. `_replayGain`
-logs `(peak N)` or `(no peak)` on every track for exactly that reason — read it
-before assuming which services can be boosted.
+| volume | gain in | sent | why |
+|---|---|---|---|
+| −38 dB | +6.68 | **+6.68** | 38 dB of room — applied in full |
+| −3 dB | +6.68 | **+3.00** | trimmed to the 3 dB that exists |
+| 0 dB | +6.68 | 0.00 | no room at all |
+| any | −7.43 | −7.43 | attenuation is never touched |
+
+At any real listening level the trim never fires — it only engages above about
+−7 dB. This is why HQPlayer logged `clips="0"` through the +6.68 playback.
+
+**The track's peak is a SECOND limit, applied only when we have one** —
+`-20*log10(peak)`, i.e. `Slim::Player::ReplayGain::preventClipping`. We call it
+ourselves rather than assume it ran upstream: it demonstrably had not, or +6.68
+could not have reached us. **Its absence is not a reason to refuse the boost**;
+the volume headroom still bounds it. `songinfo` exposes no peak for a remote
+track, so `_replayGain` logs `(peak N)` / `(no peak)` on every track — that line
+is the only way to learn which services populate it.
+
+**AND HQPLAYER'S OWN HEADROOM IS ON TOP OF THIS, NOT INSIDE IT.** It already
+reserves room for conversion and DSP, and reports doing so:
+
+```
+Convolution gain compensation: -3
+Volume scaler: 0.707107            (= -3.01 dB)
+```
+
+Its adaptive volume very likely compensates further. **We deliberately do NOT
+model any of it.** It depends on the filter, the modulator, the matrix profile
+and whether convolution is enabled — none of it ours to track, all of it able to
+change without us hearing. Subtracting a guess would only make us wrong in a new
+way. **The volume headroom is the floor of what is safe, not the ceiling.**
 
 ### Unity is asserted, never omitted
 
@@ -539,7 +562,7 @@ its own for a 0.00 to override — and a **local** track never reaches
 `_replayGain` at all.
 
 **So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38; the
-peak-aware ceiling in 0.2.40. Local
+threshold trim in 0.2.41. Local
 tracks send nothing, and that gate is now load-bearing rather than merely tidy:
 `album_gain` OVERRIDES the file's own tags, so sending ours on a local track
 would replace a right answer with a round-tripped one.

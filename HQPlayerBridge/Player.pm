@@ -715,37 +715,68 @@ sub _replayGain {
     # note on asserting below.
     $gain = 0 unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
 
-    # A BOOST IS ALLOWED, BUT ONLY AS FAR AS THE PEAK PERMITS.
+    # A BOOST IS TRIMMED TO THE THRESHOLD, NEVER REFUSED.
     #
     # ReplayGain normalises UP as readily as down: Qobuz's album gain for The
     # Dark Side Of The Moon (50th Anniversary) is +6.68 dB because the album is
     # mastered quietly, and -18 LUFS is a target rather than a maximum. 0.2.38
-    # sent that verbatim and HQPlayer applied `6.68 dB (2.15774)` - a 2.16x
-    # multiplier. 0.2.39 answered that by refusing every positive gain, which
-    # was over-cautious: it throws away legitimate headroom on quiet masters,
-    # and HQPlayer registered NO clipping through that playback (`clips="0"`,
-    # `apod="0"`).
+    # sent it verbatim, HQPlayer applied `6.68 dB (2.15774)`; 0.2.39 then
+    # refused every positive gain and 0.2.40 refused any it could not check
+    # against a peak. Both were wrong in the same way.
     #
-    # The right rule is the one ReplayGain already defines: the largest safe
-    # boost is -20*log10(peak), which is exactly Slim::Player::ReplayGain's
-    # preventClipping. Apply it ourselves rather than trusting it has been
-    # applied upstream - it demonstrably had not been, or +6.68 could not have
-    # reached us with an album peaking anywhere near full scale.
+    # SIMON'S RULE, 2026-08-30: a positive gain is fine unless it takes
+    # HQPlayer's overall output past 0 dB full scale, and when it would, we
+    # "apply what it needs to not go over the threshold" - we do NOT decline it.
+    # So every limit below TRIMS. Nothing here can turn a boost into silence.
     #
-    # NO PEAK MEANS NO BOOST. Without a peak there is no way to know what a
-    # boost would do, and guessing wrong clips. Attenuation is always safe and
-    # is never touched by any of this.
+    # THE DOMINANT TERM IS THE VOLUME, AND WE ALWAYS KNOW IT. HQPlayer's output
+    # tops out at _volMax (0 dB, from <VolumeRange max="0"/>) and sits at
+    # hqVolDb, so the room above the current level is the real threshold. At a
+    # typical -38 dB that is 38 dB of headroom and a +6.68 boost lands at
+    # -31.3 dB, nowhere near clipping - which is exactly why HQPlayer logged
+    # `clips="0"` through the playback that started this.
+    #
+    # The track's own peak is a SECOND limit, applied only when we have one:
+    # -20*log10(peak) is the largest boost the samples themselves permit, which
+    # is Slim::Player::ReplayGain::preventClipping. We call it ourselves rather
+    # than assume it ran upstream - it demonstrably had not, or +6.68 could not
+    # have reached us. Its ABSENCE is not a reason to refuse the boost; the
+    # volume headroom still bounds it.
+    #
+    # AND HQPLAYER'S OWN DSP HEADROOM IS ON TOP OF THIS, NOT INSIDE IT - so the
+    # volume limit is conservative, and we deliberately do NOT model the DSP.
+    # HQPlayer already reserves headroom for conversion and for whatever
+    # processing is configured, and reports it doing so:
+    #
+    #   Convolution gain compensation: -3
+    #   Volume scaler: 0.707107            (= -3.01 dB)
+    #
+    # That is a further ~3 dB of room in this chain, and it is HQPlayer's to
+    # manage: it depends on the filter, the modulator, the matrix profile and
+    # whether convolution is enabled at all, none of which is ours to track and
+    # all of which can change without us hearing about it. Subtracting a guess
+    # at it here would only make us wrong in a new way. The volume headroom is
+    # the floor of what is safe, not the ceiling.
+    #
+    # ATTENUATION IS NEVER TOUCHED. Every limit here applies to a boost only.
     my $peak = eval { $track->replay_peak };
     $peak = undef unless defined $peak && $peak =~ /^\s*[0-9]*\.?[0-9]+\s*$/ && $peak > 0;
 
     if ( $gain > 0 ) {
-        $gain = defined $peak
-            ? Slim::Player::ReplayGain::preventClipping( $gain, $peak )
-            : 0;
+        if ( defined $peak ) {
+            my $safe = Slim::Player::ReplayGain::preventClipping( $gain, $peak );
+            $gain = $safe if defined $safe && $safe =~ /^\s*-?[0-9.]+\s*$/ && $safe < $gain;
+        }
 
-        # preventClipping only ever LOWERS a gain, but it hands back the
-        # original when the peak leaves room, so re-check rather than assume.
-        $gain = 0 if !defined $gain || $gain !~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+        # The output threshold. hqVolDb is where HQPlayer ACTUALLY is; if we do
+        # not know yet, there is no threshold to measure against, so hold at
+        # unity rather than guess upward.
+        my $at   = $self->hqVolDb;
+        my $room = defined $at ? ( $self->_volMax - $at ) : 0;
+        $room = 0 if $room < 0;
+        $gain  = $room if $gain > $room;
+
+        $gain = 0 if $gain < 0;   # a trim can never become an attenuation
     }
 
     # Logged whether or not it mattered: the peak is the one input to this we
