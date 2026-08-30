@@ -22,6 +22,9 @@ declined.
 | HQPlayer's playlist should show the whole LMS queue, as Roon and HQPlayer's own library do — or at least be trimmed so it is not a list of finished tracks | **DECLINED** 2026-08-30, Simon's call: "stick with it as is" | Both halves were understood and neither is being changed. **All at once is not possible**: `_NextIfMore` caps LMS's song queue at two (`scalar @{$self->{songqueue}} < 2`), so only two URLs ever exist — LMS mints them lazily because service URLs are signed and time-limited and the queue is mutable. Roon differs because Roon OWNS the queue; here LMS does and we model a Squeezebox, which is also two-deep. **The growth is ours**: `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer accumulates a HISTORY of the run while LMS stays at two. Trimming with `PlaylistRemove` was offered and declined. So the list is expected to grow, and only its LAST entry is "next". |
 | `track` only ever needs an INCREASE to count as a hand-over, because HQPlayer reports `track="0"` when it is not playing and `>` already rejects that | **WRONG** 2026-08-30, fixed same day in 0.2.37 | `>` rejects an advance *into* 0; it does nothing about 0 being the **BASELINE**, and 0 → 1 is an increase. HQPlayer reports `track="0"` in the push that lands between the `<Play/>` ack and its index catching up — `state` already says playing — so that 0 got stored as `hqTrackNo` and the very next push read as an advance into the pre-queued track. Live: `12:47:07.7074 HQPlayer is playing` (track 0) → `12:47:08.0498 track=1 seen=0 -> ADVANCED` → a SECOND `_armNextTrack` 4ms later. LMS moved to Movement 6 while HQPlayer played Movement 5, queued a third track (`tracks_total="3"` where two was right), and stayed **exactly one track ahead for the rest of the album**, its counter running out on every track. This is the spurious advance the `_handedOver` comment already calls the worst failure in the file — it just came in by a route nobody had covered. Fixed at BOTH ends: 0 is refused where it would be stored, and `_handedOver` requires `$seen > 0`. **Whether it fires is a race on how fast HQPlayer's index catches up**, which is why identical code was clean on the three loads before it. Arrived with 0.2.35's index fallback; not a 0.2.36 regression. |
 | hqplayerd ignores a gain figure on `PlaylistAdd`, so there is no control-API route for streaming ReplayGain | **WRONG** 2026-08-30, corrected same day | The evidence was real — `gain="-4.07"` went over verbatim and was ignored — but the CONCLUSION generalised from one attribute name to the whole channel. `album_gain` works, overrides the file's own tags, and is stored per playlist item. Two things made the wrong reading look safe: `<Status/>` reports `gain="…"`, which is HQPlayer echoing what it read out of the FILE and not an input field; and the live queue's `<PlaylistItem>` carries no gain attribute, which was taken as proof the daemon holds no per-item gain when it simply does not report one. **The lesson is the probe, not the finding:** the whole matrix (`album_gain`, `track_gain`, `gain`, `adaptive_volume`, both as metadata and as PlaylistAdd attributes) was settled in minutes over port 4321 — append with `queued="0"`, `SelectTrack`, `Play`, read `:8088/log`, `Stop`, `PlaylistRemove` — against ONE local file with a known tag. Two builds were spent guessing at what one probe answered. |
+| A boost must be trimmed against the room between the current volume and `_volMax`, because that room is the headroom (`Player.pm`, `_replayGain`) | **WRONG** 2026-08-30, shipped in 0.2.41 and reversed in 0.2.44 | It measured the wrong domain. **With hardware volume enabled the level is the endpoint's ANALOGUE preamp**, downstream of where digital clipping happens, so it buys no digital headroom at all in the path `album_gain` is applied in. hqplayerd splits the level and says so, measured across a whole session: `Set volume: -38 -> hardware: -34 software: -4`, `-33 -> hardware: -29 software: -4`, and hardware taking every bit of the movement (−30/−35/−39/−41/−43/−47) while **software stayed −4 throughout**. A different configuration splits differently again (`hardware: 0 software: -18` is in the same log), so the split must not be modelled either. **THE VOLUME MUST NOT ENTER THIS CALCULATION.** The real ceiling is HQPlayer's configured headroom, read from its log. |
+| Local tiers must not send `album_gain`, because HQPlayer reads the file's own REPLAYGAIN tags and ours would be applied twice | **WRONG** 2026-08-30, fixed in 0.2.44 | The first half is true and the second is not. **`album_gain` REPLACES the tag, it does not add to it** — proven by isolating one local FLAC tagged −8.61 dB, sending `album_gain="-15"`, and watching it play at −15, not −23.61. And deferring to HQPlayer **loses the gain outright on a fresh load**: it applies the figure at Play time from tags it has already parsed, and the bridge goes Stop → PlaylistClear → PlaylistAdd → Play in ~300ms, so playback starts before the file has been fetched. Live on a fully-tagged album (`album_replay_gain -9.6`): three adds all played `0 dB (1)` and the −9.6 arrived only when the playlist next changed — **a whole album unnormalised**. It is also the better answer, because LMS has already chosen album vs track gain and HQPlayer only does album gain. Reported by Simon as a regression, and it was one. |
+| A raw function's response needs no explicit status code — LMS fills one in (`Stream.pm`, `_downloadHandler`) | **WRONG** 2026-08-30, fixed in 0.2.45 | It does not, and the omission broke **every m4a, ALAC and AAC track** from 0.2.32 to 0.2.45. LMS builds the status line as `sprintf("%s %s %s", protocol, code, status_message(code))`, and a raw function is handed the response object "almost unmodified" — its own dispatcher comment is `$rawFunc shall call addHTTPResponse`. `downloadMusicFile` sets a code only on its ERROR paths (406, 400), so a successful tier 3 download went out as literally `HTTP/1.1  ` — protocol, two spaces, no code. HQPlayer said so precisely and nobody read it as a status line: `clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''`. `_handler` (tier 4) and `_fail` both set a code, which is exactly why tier 4 and our 404s worked throughout. **Invisible to the offline suite because it stubs `downloadMusicFile` and never sees a socket** — the test now asserts the code on the response object itself. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -407,19 +410,21 @@ device path rather than a display name in any case. `GetInputs` lists sources
 reachable from another host. The status page therefore reports the transport id
 and says plainly that the name is unavailable.
 
-## ReplayGain — local is HQPlayer's job, streaming is ours
+## ReplayGain — LMS computes it, we carry it, on every tier
 
-**HQPlayer reads a local file's own tags and needs nothing from us.** Verified
-live 2026-08-30: an album carrying `REPLAYGAIN_ALBUM_GAIN=-6.31 dB`
+**HQPlayer can read a local file's own tags.** Verified live 2026-08-30: an
+album carrying `REPLAYGAIN_ALBUM_GAIN=-6.31 dB`
 (`REPLAYGAIN_REFERENCE_LOUDNESS=-18.00 LUFS`) produced exactly
 
 ```
 Adaptive transport gain: -6.31 dB (0.483615)
 ```
 
-with nothing sent from the bridge. **So local tiers must NOT send a gain** —
-it would be applied twice. `_replayGain` gates on the TRACK being remote for
-this reason, not on `hqTier`.
+with nothing sent from the bridge. **That was taken as a reason to send nothing
+on local tiers, and it was wrong — see the ledger row.** `album_gain` REPLACES
+the file's tag rather than adding to it, and HQPlayer reads the tags too late to
+catch a fresh load. **`_replayGain` now runs for every tier**, and the local
+line decides one thing only: what happens when LMS gives us no figure at all.
 
 **A service CDN file carries no ReplayGain tags at all.** Every streamed track
 logged `Adaptive transport gain: 0 dB (1)`, and `<Status/>` for a playing
@@ -499,73 +504,139 @@ min="-100"/>`), which is why local files were already being normalised.
 as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
 moving it would move the Eversolo's own volume.
 
-### The ceiling: a boost is TRIMMED to the threshold, never refused
+### The headroom is COMPENSATED FOR, and it is the ceiling
+
+**HQPlayer holds back headroom for conversion and DSP, and it applies that on
+top of our `album_gain`.** So what the signal actually receives is
+`headroom + gain`. Sending the ReplayGain figure raw meant a −10.03 dB album
+played at **−13.04 dB** — the headroom silently taken off every track on top of
+the normalisation. Simon, 2026-08-30: *"we are now adding -13db of reduction"*.
+
+**So the headroom is added back, and the COMBINED figure is what is held at or
+below 0 dBFS.** Every track then lands on its ReplayGain target, and the
+headroom does the job it exists for — absorbing a boost — instead of attenuating
+everything:
+
+| headroom | gain in | sent | combined | why |
+|---|---|---|---|---|
+| −3.01 | −10.03 | **−7.02** | −10.03 | lands exactly on target |
+| −3.01 | −0.50 | **+2.51** | −0.50 | a cut can send a POSITIVE figure — it is cancelling the headroom |
+| −3.01 | +6.68 | **+3.01** | 0.00 | trimmed, not refused — the largest thing sendable is the headroom's own magnitude |
+| unknown | −10.03 | −10.03 | — | nothing to compensate |
+| unknown | +6.68 | 0.00 | — | nothing to boost into, so a boost IS refused here |
 
 **ReplayGain normalises UP as readily as down.** Qobuz's album gain for *The Dark
 Side Of The Moon (50th Anniversary)* is **+6.68 dB** — the album is mastered
 quietly and −18 LUFS is a target, not a maximum. 0.2.38 sent it verbatim and
 HQPlayer applied `6.68 dB (2.15774)`, a 2.16× multiplier.
 
-**Two wrong answers came before the right one, and both failed the same way — by
+**Three wrong answers came first, and the first two failed the same way — by
 declining instead of trimming.** 0.2.39 refused every positive gain; 0.2.40
 refused any it could not check against a peak. Simon's rule, 2026-08-30: a
 positive gain is fine unless it takes HQPlayer's overall output past 0 dB full
 scale, and where it would, *"it should apply what it needs to not go over the
-threshold not just not apply it at all"*.
+threshold not just not apply it at all"*. **So every limit TRIMS. Nothing can
+turn a boost into silence.** The third, 0.2.41, trimmed against the VOLUME — see
+the ledger row; the volume is analogue and must not enter this.
 
-**So every limit TRIMS. Nothing can turn a boost into silence.**
+**The peak is a THIRD limit, and it binds only for a source already past full
+scale.** Clipping is `peak * 10^(combined/20) > 1`, so the ceiling on the
+combined figure is `-20*log10(peak)` — `Slim::Player::ReplayGain::preventClipping`,
+which we call ourselves rather than assume ran upstream (it demonstrably had
+not, or +6.68 could not have reached us). For any `peak <= 1` the headroom cap
+is tighter and this changes nothing.
 
-**The dominant term is the VOLUME, and we always know it.** Output tops out at
-`_volMax` (0 dB, from `<VolumeRange max="0"/>`) and sits at `hqVolDb`, so the room
-above the current level is the threshold:
+**Where a peak actually comes from, measured 2026-08-30: LOCAL FILES HAVE ONE
+AND STREAMING DOES NOT.** A tagged m4a album logged `peak 0.985198` then
+`peak 1.026709` on consecutive tracks, straight out of `REPLAYGAIN_ALBUM_PEAK` —
+and the second is **over full scale**, so this limit is not hypothetical. Qobuz
+publishes no peak to LMS at all (`peak none`, live-verified); Tidal's own handler
+applies `preventClipping` before we ever see the figure. `_replayGain` logs the
+raw figure, the sent one, the headroom and the peak on every track, which is the
+only way to learn which sources populate it.
 
-| volume | gain in | sent | why |
-|---|---|---|---|
-| −38 dB | +6.68 | **+6.68** | 38 dB of room — applied in full |
-| −3 dB | +6.68 | **+3.00** | trimmed to the 3 dB that exists |
-| 0 dB | +6.68 | 0.00 | no room at all |
-| any | −7.43 | −7.43 | attenuation is never touched |
+### Reading the headroom: it is in hqplayerd's log and nowhere else
 
-At any real listening level the trim never fires — it only engages above about
-−7 dB. This is why HQPlayer logged `clips="0"` through the +6.68 playback.
+**HQPlayer does not report its headroom over the control API.** Probed
+thoroughly 2026-08-30 — `Meters`, `GetMeters`, `Level`, `GetLevel`, `Analysis`,
+`GetAnalysis`, `Meter`, `OutputLevel`, `GetVolume`, `VolumeGet` and `Limits` all
+answer `Unknown command`; `<VolumeRange/>` carries only `adaptive enabled max
+min`; `<ConfigurationGet/>` returns a profile name; and a **subscribed**
+`<Status/>` stream carries no level, peak or rms field. The `peak`/`rms`/`lufs`
+fields in Signalyst's own client belong to `LibraryFile`/`LibraryDirectory` — its
+library ANALYSIS, not a live meter — and the web UI's "Limits / Apod" is a
+clipping COUNTER, not a level. Signalyst publish no API spec; the 6.0.1 client
+source is the reference and it has no metering command.
 
-**The track's peak is a SECOND limit, applied only when we have one** —
-`-20*log10(peak)`, i.e. `Slim::Player::ReplayGain::preventClipping`. We call it
-ourselves rather than assume it ran upstream: it demonstrably had not, or +6.68
-could not have reached us. **Its absence is not a reason to refuse the boost**;
-the volume headroom still bounds it. `songinfo` exposes no peak for a remote
-track, so `_replayGain` logs `(peak N)` / `(no peak)` on every track — that line
-is the only way to learn which services populate it.
-
-**AND HQPLAYER'S OWN HEADROOM IS ON TOP OF THIS, NOT INSIDE IT.** It already
-reserves room for conversion and DSP, and reports doing so:
+**It appears in exactly one place: hqplayerd's own log at `:8088/log`.**
 
 ```
 Convolution gain compensation: -3
 Volume scaler: 0.707107            (= -3.01 dB)
 ```
 
-Its adaptive volume very likely compensates further. **We deliberately do NOT
-model any of it.** It depends on the filter, the modulator, the matrix profile
-and whether convolution is enabled — none of it ours to track, all of it able to
-change without us hearing. Subtracting a guess would only make us wrong in a new
-way. **The volume headroom is the floor of what is safe, not the ceiling.**
+`readHeadroom` fetches that log with `SimpleAsyncHTTP`'s `saveAs`, which streams
+the body **straight to a file** (`Slim::Networking::Async::HTTP`: *"Writing
+response directly to ..."*) — the log runs to megabytes and must never be
+buffered in memory. `_headroomFromFile` then seeks to the last 256 KB and takes
+the **LAST** match: the log is oldest-first, so a config change leaves stale
+values behind it. `Volume scaler` is the precise figure and wins;
+`Convolution gain compensation` is the whole-dB fallback. A **positive** scaler
+is not headroom — nothing is being held back — and reads as 0.
 
-### Unity is asserted, never omitted
+**This was NOT made a preference.** Simon, 2026-08-30: *"WHY DO YOU NEED PREFS"*
+/ *"we know the headroom as this is direct from HQPlayer its in the logs"*. A
+pref would go stale the moment the user changed a filter, which is the whole
+failure mode being avoided.
 
-A track with no gain, an unreadable figure and a refused boost all send
-`album_gain="0.00"` rather than nothing. Omitting relies on HQPlayer defaulting
-each item to unity by itself; saying so means nothing can carry over from the
-previous track however the daemon handles an internal hand-over. It costs one
-attribute and removes a whole class of question. A streaming file has no tags of
-its own for a 0.00 to override — and a **local** track never reaches
-`_replayGain` at all.
+**And it is re-read when HQPlayer's processing changes.** `Volume scaler` is
+derived from the convolution gain, so a DSP change is exactly the event that
+moves the headroom. `_watchDsp` hashes the DSP fields every `<Status/>` push
+already carries — `active_filter active_shaper active_mode active_rate
+correction filter_20k filter_junk` — and forces a re-read when the signature
+moves. Otherwise the read is throttled to `HEADROOM_MAX_AGE` (15 minutes), and
+`refreshInfo` asks for one too.
 
-**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38; the
-threshold trim in 0.2.41. Local
-tracks send nothing, and that gate is now load-bearing rather than merely tidy:
-`album_gain` OVERRIDES the file's own tags, so sending ours on a local track
-would replace a right answer with a round-tripped one.
+**Do NOT probe port 8019 to find any of this.** A bare `GET /` on hqplayerd's
+UPnP port spins its log at ~68k lines/sec — `clUPnP::OnRequest():
+clString::SubString(): uIdx >= sizeStr` — and cost 683,892 lines in ten seconds
+once. Only `/root.xml` and SOAP paths are safe there. Probe **4321** (control)
+and **8088** (log) and nothing else.
+
+### Unity is asserted for streaming, and OMITTED for local
+
+A **streaming** track with no gain, an unreadable figure or a refused boost
+sends `album_gain="0.00"` rather than nothing. Omitting relies on HQPlayer
+defaulting each item to unity by itself; saying so means nothing can carry over
+from the previous track however the daemon handles an internal hand-over. It
+costs one attribute and removes a whole class of question, and a streaming file
+has no tags of its own for a 0.00 to override.
+
+**A LOCAL track with no figure sends NOTHING, and that asymmetry is deliberate.**
+`album_gain` overrides a file's own tags, and **LMS hands back no figure at all
+when the user has replay gain switched off** — `fetchGainMode` returns undef for
+`replayGainMode = 0`, with no service handler in the way for a local track.
+Asserting 0.00 there would override a perfectly good `REPLAYGAIN` tag with unity
+and silently disable HQPlayer's own `playlist_album_gain` for a user who never
+asked LMS to do this at all. Omitting restores exactly the pre-0.2.44 behaviour
+for that user.
+
+**So: one attribute, `album_gain`, on every tier.** Shipped for streaming in
+0.2.38, the trim in 0.2.41, the headroom compensation and local tiers in 0.2.44,
+the local-omit gate in 0.2.46.
+
+**Verified end to end on a local m4a, 2026-08-30** — the bridge's own log and
+hqplayerd's, three seconds apart on two clocks:
+
+```
+LMS       22:19:52  replay gain -8.23 -> -5.22 dB (headroom -3.01, peak 0.985198)
+hqplayerd 22:19:49  Adaptive transport gain: -5.22 dB (0.548277)
+hqplayerd 22:19:49  Set volume: -38.000000 +          <- unmoved, all session
+```
+
+`-8.23 + 3.01 = -5.22`, landing as **adaptive** gain with the endpoint's own
+volume untouched — which is the constraint: *"do not touch main volume as this
+will move everosolos volume it must only be the adaptive volume"*.
 
 ## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
 
@@ -714,7 +785,7 @@ LMS-Groups.
 **Do not** copy LMS-Groups' `sub chunks { [] }` — that class deliberately
 carries no audio, whereas tier 4 below needs the real chunk pipeline.
 
-## Track resolution — three URL tiers
+## Track resolution — four live URL tiers (1, 3, 4, 5)
 
 Everything is addressed **by URL, never by filesystem path**: HQPlayer's view of
 the library mount will not match LMS's, and reconciling them would need exactly
@@ -795,8 +866,10 @@ end-of-stream marker, both fixed in `Stream.pm`.
 
 3. **Local track in a format HQPlayer cannot decode** ->
    `/hqp3/<id>/download.<ext>`, LMS's own transcode with the request declared
-   HTTP/1.0 so it is not chunked. Pre-queueable, not seekable. See the
-   chunked-transcode section below.
+   HTTP/1.0 so it is not chunked **and an explicit `200` on the response**.
+   Pre-queueable, not seekable. This is the m4a/ALAC/AAC route, and both of
+   those two lines are load-bearing — see the chunked-transcode and
+   status-code traps below.
 
 4. **Anything genuinely remote** (Qobuz, Tidal, Deezer, radio) ->
    `/hqp/<token>/<seq>.<ext>`, served by `Stream.pm` off LMS's player stream.
@@ -966,6 +1039,48 @@ so two can be open at once and **tier 3 is pre-queued exactly like tier 1**.
 
 Still **not seekable** — a transcode has no length, so LMS answers
 `Accept-Ranges: none` and `_queueTrack` sends no `<Seek>` for this tier.
+
+### TRAP: a raw function must set its OWN status code, or the line goes out blank
+
+**This broke every m4a, ALAC and AAC track from 0.2.32 to 0.2.45**, and it
+shipped in the very build that fixed the chunking above. Reported by Simon,
+2026-08-30: *"Apple lossless alac and aac all in m4a wrapper do not play"*.
+
+A raw socket request to `/hqp3/…` answered with a status line of literally:
+
+```
+HTTP/1.1  
+```
+
+Protocol, two spaces, **no status code**. LMS builds it as
+
+```perl
+sprintf( "%s %s %s", $response->protocol(), $code, HTTP::Status::status_message($code) || "", $CRLF )
+```
+
+and `$code` was empty. **HQPlayer said so precisely and it was misread as a
+codec problem for two days:**
+
+```
+clPlaylist::AddURI("http://…/hqp3/470893/download.flac"):
+  clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''
+```
+
+That is HQPlayer parsing the **response code**, not the audio.
+
+**Why it happens:** a raw function is handed the response object almost
+unmodified — LMS's own dispatcher comment is `$rawFunc shall call
+addHTTPResponse` — and setting the code is part of that. `downloadMusicFile`
+sets one only on its ERROR paths (406, 400), never on success. `_handler`
+(tier 4) sets `$response->code(200)` and `_fail` sets one, **which is exactly
+why tier 4 and our 404s worked throughout while every tier 3 download did not.**
+
+**Why the offline suite could not see it:** it stubs `downloadMusicFile` and
+never opens a socket, so nothing was looking at the response object at all.
+`t_stream.pl` now asserts the code on the object itself.
+
+Note the HTTP/1.0 declaration above is unrelated and still required — both were
+needed and only one was there.
 
 ### Tier 4: the plugin's own audio endpoint (`Stream.pm`)
 
@@ -1624,13 +1739,22 @@ HTTP played correctly:
   kept the playing track and re-armed correctly. A **sample-rate change** costs
   ~2.3 s while HQPlayer retunes the output - physics, not a bug; it correlated
   exactly with 96k -> 44.1k and never appeared within a fixed-rate album.
-* **HQPlayer cannot fetch a URL containing `?`** — 2026-08-28, and it does not
-  follow a 302 either. This is the whole of the old tier 2 failure. See "Track
-  resolution".
+* **HQPlayer does not follow a 302** — 2026-08-28. The other half of this
+  bullet, "cannot fetch a URL containing `?`", was **disproven** on the wire
+  2026-08-30: query strings go over verbatim and the track plays. See the
+  ledger and "Track resolution".
 * **Tier 3 (transcode-on-download) renders** — 2026-08-28: an m4a requested as
   `/music/<id>/download.flac` answers `Content-Type: audio/x-flac`, body opens
   `fLaC`, HQPlayer plays it (`state=2 pos=3.526 proc=3.298 in_fill=0.73`).
-  `Accept-Ranges: none`, so no `<Seek>` on this tier.
+  `Accept-Ranges: none`, so no `<Seek>` on this tier. **This bullet was true of
+  the BYTES and false of playback twice over** — first the chunking, then the
+  missing status code. Both are fixed; see the traps.
+* **Tier 3 plays m4a end to end, with ReplayGain** — 2026-08-30 on 0.2.45, a
+  tagged AAC album from a real LMS queue: `PlaylistGet` shows the queued items
+  as `mime="audio/x-flac"`, playback advances, and the gain the bridge computed
+  (`-8.23 -> -5.22 dB`, headroom −3.01, `peak 0.985198`) arrives at hqplayerd as
+  `Adaptive transport gain: -5.22 dB (0.548277)` with `Set volume` unmoved.
+  ALAC takes the identical code path; it has not been watched play.
 
 **Watch for a silent output-format mismatch.** When HQPlayer's output format
 exceeds what the endpoint accepts, it reports `state=2` and returns OK to

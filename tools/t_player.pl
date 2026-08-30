@@ -237,13 +237,18 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     sub getMetadataFor { return { icon => 'https://static.qobuz.com/direct.jpg' } }
 }
 
-# -- replay gain rides on <metadata/>, and ONLY for streaming ------------------
+# -- replay gain rides on <metadata/>, on EVERY tier ---------------------------
 #
 # LMS decides album-vs-track gain upstream (Smart Gain compares a song's
 # playlist neighbours; a service handler's trackGain does its own equivalent),
-# so the only job here is to carry the figure it settled on. The gate is the
-# TRACK being remote, not hqTier: HQPlayer reads a local file's own REPLAYGAIN
-# tags itself, and sending ours as well would apply it twice.
+# so the only job here is to carry the figure it settled on.
+#
+# It was streaming-only until 0.2.44, on the reasoning that HQPlayer reads a
+# local file's own REPLAYGAIN tags and ours would be applied twice. It does not
+# add - `album_gain` REPLACES the tag - and leaving it to HQPlayer loses the
+# gain outright on a fresh load, because it reads the tags too late. The one
+# thing the local line still decides is what happens when LMS gives us NO
+# figure: see the omit test below.
 {
     no warnings qw(redefine once);
     local *Slim::Music::Info::isRemoteURL = sub { $_[0] && $_[0] =~ m{^\w+://} && $_[0] !~ m{^file://} };
@@ -256,12 +261,26 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $g = $c->_metadata( FakeSong->new($qt)->_rg(-4.07) );
     ok(scalar($g =~ m{\balbum_gain="-4\.07"}), 'a streaming track carries the gain LMS computed');
 
-    # A local file must NOT: HQPlayer already applied -6.31 dB off the file's
-    # own tags with nothing sent from here (verified live 2026-08-30).
+    # A LOCAL FILE GETS ONE TOO - and it is not optional. HQPlayer applies the
+    # figure at PLAY time from tags it has ALREADY parsed, and the bridge goes
+    # Stop -> PlaylistClear -> PlaylistAdd -> Play in ~300ms, so playback starts
+    # before the file has been fetched and read. Live on a fully-tagged album
+    # (LMS: album_replay_gain -9.6), three adds all played at 0 dB and the -9.6
+    # arrived only when the playlist next changed. Sending it with the item
+    # removes the race. Our value REPLACES the file's tag rather than adding to
+    # it - proven: a FLAC tagged -8.61 sent album_gain="-15" played at -15.
     my $lt = FakeTrack->new({ title=>'Local', artist=>'A', album=>'B', coverid=>'c',
                               id=>5, secs=>100, ct=>'flc', url=>'file:///x.flac' });
+
     my $lg = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
-    ok(scalar($lg !~ m{\bgain=}), 'a local track sends none - our album_gain would OVERRIDE its tags');
+    ok(scalar($lg =~ m{\balbum_gain="-6\.31"}),
+       'a LOCAL track carries the gain too - it is no longer streaming-only');
+
+    $c->hqHeadroom(-3.01);
+    my $lgh = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
+    ok(scalar($lgh =~ m{\balbum_gain="-3\.30"}),
+       'and is headroom-compensated exactly like a streaming one');
+    $c->hqHeadroom(undef);
 
     # UNITY IS ASSERTED, NOT OMITTED. Omitting relies on HQPlayer defaulting
     # each item to unity by itself; saying 0.00 means nothing can carry over
@@ -272,57 +291,170 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $none = $c->_metadata( FakeSong->new($qt) );
     ok(scalar($none =~ m{\balbum_gain="0\.00"}), 'and so is no value at all');
 
-    # STRICT CEILING - WE NEVER BOOST. Not hypothetical: Qobuz's album gain for
-    # The Dark Side Of The Moon (50th Anniversary) is +6.68 dB, and 0.2.38 sent
-    # it verbatim. A boost into the modulator is a clipping risk for no gain.
+    # ...BUT ONLY FOR A REMOTE TRACK. `album_gain` OVERRIDES a file's own tags,
+    # and LMS hands back no figure at all when the user has replay gain switched
+    # OFF. Asserting 0.00 there would override a good REPLAYGAIN tag with unity
+    # and silently disable HQPlayer's own playlist_album_gain for a user who
+    # never asked LMS to do this. So a local track with no figure sends NOTHING.
+    my $localNone = $c->_metadata( FakeSong->new($lt) );
+    ok(scalar($localNone !~ m{album_gain}),
+       'a LOCAL track with no figure sends no album_gain - HQPlayer reads the file itself');
 
 
-    # A BOOST IS TRIMMED TO THE THRESHOLD, NEVER REFUSED. Simon's rule
-    # 2026-08-30: positive gain is fine unless it takes HQPlayer's overall
-    # output past 0 dB full scale, and when it would, "it should apply what it
-    # needs to not go over the threshold not just not apply it at all".
+    # THE HEADROOM IS COMPENSATED FOR, NOT SUFFERED.
     #
-    # The dominant term is the VOLUME: output tops out at _volMax (0 dB) and
-    # sits at hqVolDb, so the room above the current level is the threshold.
-    $c->hqVolDb(-38);          # 38 dB of headroom - the ordinary case
+    # HQPlayer applies BOTH its headroom and our album_gain, so sending the
+    # ReplayGain figure raw meant a -10.03 dB album played at -13.04 - the
+    # headroom taken off every track on top of the normalisation. Simon,
+    # 2026-08-30: "we are now adding -13db of reduction". So the headroom is
+    # added back and the COMBINED figure is what is held at or below 0 dBFS.
+    $c->hqVolDb(-38);
 
     my $qnp = FakeTrack->new({ title=>'Speak to Me', id=>-1, secs=>71,
                                url=>'qobuz://193171335.flac' });
-    my $noPeak = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
-    ok(scalar($noPeak =~ m{\balbum_gain="6\.68"}),
-       'with headroom to spare a boost is applied IN FULL, peak or no peak');
 
-    # ...and the peak trims it further when we have one: -20*log10(0.5)=+6.02
-    my $qp = FakeTrack->new({ title=>'Speak to Me', id=>-1, secs=>71,
-                              url=>'qobuz://193171335.flac', peak=>0.5 });
-    my $room = $c->_metadata( FakeSong->new($qp)->_rg(6.68) );
-    ok(scalar($room =~ m{\balbum_gain="6\.02"}),
-       'a known peak trims the boost to what the samples permit');
+    $c->hqHeadroom(-3.01);
 
-    my $qf = FakeTrack->new({ title=>'Loud', id=>-2, secs=>60,
-                              url=>'qobuz://2.flac', peak=>1.0 });
-    my $full = $c->_metadata( FakeSong->new($qf)->_rg(6.68) );
-    ok(scalar($full =~ m{\balbum_gain="0\.00"}),
-       'a track already at full scale gets no boost - trimmed to zero, not refused');
+    my $cutM = $c->_metadata( FakeSong->new($qnp)->_rg(-10.03) );
+    ok(scalar($cutM =~ m{\balbum_gain="-7\.02"}),
+       'an attenuation is compensated so the COMBINED figure hits the ReplayGain target');
 
-    # THE OUTPUT THRESHOLD BITES when the volume is near the top: at -3 dB only
-    # 3 dB of room remains, so +6.68 is applied AS +3, not dropped.
-    $c->hqVolDb(-3);
-    my $tight = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
-    ok(scalar($tight =~ m{\balbum_gain="3\.00"}),
-       'near full output the boost is TRIMMED to the headroom, not discarded');
+    my $small = $c->_metadata( FakeSong->new($qnp)->_rg(-0.5) );
+    ok(scalar($small =~ m{\balbum_gain="2\.51"}),
+       'a small cut can send a POSITIVE figure - it is cancelling the headroom');
 
-    $c->hqVolDb(0);
-    my $none2 = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
-    ok(scalar($none2 =~ m{\balbum_gain="0\.00"}),
-       'at full output there is no room, so the boost trims to unity');
+    my $trim = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
+    ok(scalar($trim =~ m{\balbum_gain="3\.01"}),
+       'a boost is TRIMMED to the headroom so the combined lands at 0, never refused');
 
+    my $atTarget = $c->_metadata( FakeSong->new($qnp)->_rg(0) );
+    ok(scalar($atTarget =~ m{\balbum_gain="3\.01"}),
+       'a track already at target cancels the headroom exactly');
+
+    # THE VOLUME MUST NOT ENTER IT - analogue attenuation is downstream of where
+    # digital clipping happens, and hqplayerd's split is `software: -4` constant.
+    $c->hqVolDb(-90);
+    my $lowVol = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
+    ok(scalar($lowVol =~ m{\balbum_gain="3\.01"}),
+       'the volume changes nothing - it is not digital headroom');
     $c->hqVolDb(-38);
 
-    # ATTENUATION IS NEVER TOUCHED, whatever the peak or the volume says.
-    my $cutf = $c->_metadata( FakeSong->new($qf)->_rg(-7.43) );
-    ok(scalar($cutf =~ m{\balbum_gain="-7\.43"}),
-       'attenuation is never trimmed - every limit applies to a BOOST only');
+    # NO HEADROOM KNOWN: nothing to compensate, nothing to boost into.
+    $c->hqHeadroom(undef);
+    my $unknown = $c->_metadata( FakeSong->new($qnp)->_rg(-10.03) );
+    ok(scalar($unknown =~ m{\balbum_gain="-10\.03"}),
+       'with no headroom known the figure goes out untouched');
+    my $unkBoost = $c->_metadata( FakeSong->new($qnp)->_rg(6.68) );
+    ok(scalar($unkBoost =~ m{\balbum_gain="0\.00"}),
+       'and a boost is refused - we do not know what HQPlayer is holding back');
+    $c->hqHeadroom(-3.01);
+
+    # THE PEAK now binds only for a source ALREADY past full scale: peak 1.05
+    # gives -20*log10(1.05) = -0.42, so the combined must sit there, not at 0.
+    my $hot = FakeTrack->new({ title=>'Hot', id=>-2, secs=>60,
+                               url=>'qobuz://2.flac', peak=>1.05 });
+    my $hotm = $c->_metadata( FakeSong->new($hot)->_rg(6.68) );
+    ok(scalar($hotm =~ m{\balbum_gain="2\.59"}),
+       'a source past full scale trims further - combined lands below 0, not at it');
+    $c->hqHeadroom(-3.01);
+
+    # PARSING hqplayerd's LOG. `Volume scaler` is the precise figure and wins;
+    # `Convolution gain compensation` is the whole-dB fallback. The LAST match
+    # is the current setting - the log is oldest-first, so a config change
+    # leaves stale values behind it.
+    {
+        my $tmp = "/tmp/hqpb-headroom-$$.txt";
+        my $wr  = sub {
+            open my $fh, '>', $tmp or die $!;
+            print $fh $_[0];
+            close $fh;
+        };
+
+        $wr->( "Convolution gain compensation: -6\nVolume scaler: 0.707107\nblah\n" );
+        $c->hqHeadroom(undef);
+        $c->_headroomFromFile($tmp);
+        ok(scalar( sprintf('%.2f', $c->hqHeadroom) eq '-3.01' ),
+           'Volume scaler is read as dB and preferred over the rounded compensation');
+
+        $wr->( "Volume scaler: 0.707107\nlater...\nVolume scaler: 0.5\n" );
+        $c->_headroomFromFile($tmp);
+        ok(scalar( sprintf('%.2f', $c->hqHeadroom) eq '-6.02' ),
+           'the LAST match wins - a config change leaves stale values behind it');
+
+        $wr->( "nothing here\nConvolution gain compensation: -3\n" );
+        $c->hqHeadroom(undef);
+        $c->_headroomFromFile($tmp);
+        is( $c->hqHeadroom, '-3', 'the compensation line is the fallback when there is no scaler' );
+
+        $wr->( "no headroom line at all\n" );
+        $c->hqHeadroom(undef);
+        $c->_headroomFromFile($tmp);
+        ok(scalar( !defined $c->hqHeadroom ),
+           'a log with neither leaves the headroom unknown, so no boost is sent');
+
+        $wr->( "Volume scaler: 2.0\n" );
+        $c->_headroomFromFile($tmp);
+        is( $c->hqHeadroom, 0, 'a POSITIVE figure is not headroom - nothing is being held back' );
+
+        unlink $tmp;
+    }
+
+    # THE HEADROOM CHANGES WHEN HQPLAYER'S PROCESSING DOES, and the value is not
+    # in the control API (24 probes, all Unknown command) - so we watch the DSP
+    # fields every <Status/> push already carries and re-read the log when they
+    # move. `Volume scaler` is derived from the convolution gain, so a DSP
+    # change is exactly the event that moves the headroom.
+    {
+        my @reads;
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::readHeadroom = sub { push @reads, $_[1] ? 'forced' : 'throttled' };
+
+        my $a = { active_filter=>'poly-sinc-gauss-long', active_shaper=>'ASDM7EC-light',
+                  active_mode=>'2', active_rate=>'11289600', correction=>'0',
+                  filter_20k=>'0', filter_junk=>'0' };
+
+        $c->hqDspSig(undef);
+        $c->_watchDsp($a);
+        ok(scalar(@reads == 0), 'the FIRST signature is recorded, not treated as a change');
+
+        $c->_watchDsp($a);
+        ok(scalar(@reads == 0), 'an unchanged chain does not re-read the log');
+
+        $c->_watchDsp({ %$a, active_filter => 'poly-sinc-gauss-hires-lp' });
+        is( scalar(@reads), 1, 'a filter change re-reads it' );
+        is( $reads[0], 'forced', 'and forces past the throttle - it is a real event' );
+
+        $c->_watchDsp({ %$a, active_filter => 'poly-sinc-gauss-hires-lp', correction => '1' });
+        is( scalar(@reads), 2, 'so does a correction change' );
+
+        # A push that simply did not carry the fields is NOT a change - treating
+        # it as one would re-read the whole log on every stop.
+        @reads = ();
+        $c->_watchDsp({});
+        ok(scalar(@reads == 0), 'a push with none of the fields is not a change');
+    }
+
+    # The throttle: a routine re-read is skipped while the value is fresh, but a
+    # forced one always goes. Each read costs the WHOLE log - :8088/log has no
+    # range or tail support - so an unforced timer would be wasteful.
+    {
+        open my $pm, '<', 'Plugins/HQPlayerBridge/Player.pm' or die $!;
+        my $mod = do { local $/; <$pm> };
+        close $pm;
+        my ($rh) = $mod =~ /\nsub readHeadroom \{(.*?)\n\}/s;
+        ok(scalar($rh && $rh =~ /if \( !\$force \)/),
+           'readHeadroom skips a routine re-read while the value is still fresh');
+        ok(scalar($rh && $rh =~ /HEADROOM_MAX_AGE/),
+           'and the age floor is a named constant, not a bare number');
+
+        # ...and the watcher has to actually BE on the status path. Calling
+        # _watchDsp directly in the tests above proves the logic, not the
+        # wiring, and unhooking it would otherwise pass silently.
+        my ($os) = $mod =~ /\nsub _onStatus \{(.*?)\n\}/s;
+        ok(scalar($os && $os =~ /_watchDsp/),
+           '_onStatus calls the DSP watcher - every push, for free');
+    }
+
 
     my $cut = $c->_metadata( FakeSong->new($qt)->_rg(-0.4) );
     ok(scalar($cut =~ m{\balbum_gain="-0\.40"}), 'but a small ATTENUATION is passed through');

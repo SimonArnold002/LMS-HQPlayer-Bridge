@@ -347,6 +347,30 @@ is( $Slim::Web::HTTP::DOWNLOADS[0]{uri}, '/music/303/download.flac',
 is( scalar @Slim::Web::HTTP::STREAMS, '0',
     'and NOTHING is attached to the player stream - that is what makes it pre-queueable' );
 
+# THE STATUS CODE, AND WHY THIS ASSERTION EXISTS.
+#
+# A raw function is handed an "almost unmodified" response object - LMS's own
+# dispatcher comment is "$rawFunc shall call addHTTPResponse", and it means all
+# of it, the code included. downloadMusicFile sets one only on its ERROR paths
+# (406, 400), so a SUCCESSFUL tier 3 download went out as:
+#
+#   HTTP/1.1        <- sprintf("%s %s %s", protocol, code, message), code empty
+#
+# HQPlayer parses the code out of that and gets an empty string:
+#
+#   clPlaylist::AddURI(".../hqp3/470893/download.flac"):
+#     clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''
+#
+# So EVERY m4a/ALAC/AAC track failed to play from 0.2.32 until 2026-08-30. It
+# went unnoticed because _handler and _fail both set a code - tier 4 and the
+# 404s worked - and because this suite stubs downloadMusicFile and never sees a
+# socket, so nothing here was looking at the response object itself.
+{
+    my ( undef, $res ) = call( 'GET', '/hqp3/303/download.flac' );
+    is( $res->code, '200',
+        'the tier 3 download sets a status code itself - LMS does not do it for a raw function' );
+}
+
 # a HEAD is HQPlayer's first request for every item, and downloadMusicFile
 # handles it itself
 Slim::Web::HTTP::_reset();

@@ -24,6 +24,8 @@ use Slim::Utils::Timers;
 use Slim::Music::Info;
 use Slim::Player::ProtocolHandlers;
 use Slim::Player::ReplayGain;
+use Slim::Networking::SimpleAsyncHTTP;
+use File::Spec::Functions qw(catfile);
 use Slim::Utils::Network;
 use Slim::Web::HTTP;          # forgetClient, for closeStream below
 use Time::HiRes ();
@@ -38,7 +40,7 @@ use Plugins::HQPlayerBridge::UPnP;
 # per-player state has to be a declared accessor.  ('rw' switches on argument
 # count, @_ == 2, so storing 0 and undef both work correctly.)
 __PACKAGE__->mk_accessor( 'rw', qw(
-    hqControl hqUPnP hqInstance
+    hqControl hqUPnP hqInstance hqHeadroom hqDspSig hqHeadroomAt
     hqTier hqRate hqBits hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
@@ -670,121 +672,189 @@ sub _metadata {
 
 # The ReplayGain figure to hand HQPlayer, or undef to send nothing.
 #
-# STREAMING ONLY, AND DELIBERATELY GATED ON THE TRACK, NOT ON hqTier.  HQPlayer
-# reads a local file's own REPLAYGAIN tags itself - verified live 2026-08-30,
-# an album tagged REPLAYGAIN_ALBUM_GAIN=-6.31 dB produced `Adaptive transport
-# gain: -6.31 dB (0.483615)` with nothing sent from here.  Sending ours as well
-# would risk applying it twice.  A service CDN file carries no tags at all,
-# which is why every streamed track logged `Adaptive transport gain: 0 dB (1)`.
+# EVERY TIER, LOCAL INCLUDED - AND THE LOCAL CASE IS NOT OPTIONAL.
 #
-# Gating on the track rather than the tier also keeps this independent of
-# whether _resolveURL has run yet on a given path - _appendTrack and
-# _queueTrack reach _metadata by different routes.
+# It was remote-only until 0.2.44, on the reasoning that HQPlayer reads a local
+# file's own REPLAYGAIN tags and ours would be applied twice. THE FIRST HALF IS
+# TRUE AND THE SECOND IS NOT. Proven live 2026-08-30: a local FLAC tagged
+# -8.61 dB, sent `album_gain="-15"`, played at -15 dB - not -23.61. OUR FIGURE
+# REPLACES THE FILE'S TAG, it does not add to it.
 #
-# WHY THE VALUE IS READ PER QUEUE EVENT AND NEVER CACHED AGAINST THE TRACK.
-# LMS's "Smart Gain" is context-sensitive: Slim::Player::ReplayGain decides
-# album vs track gain by comparing a song's PLAYLIST NEIGHBOURS, and a service
-# handler's own trackGain does the same thing with its own metadata.  The same
-# track legitimately gets one figure inside its album and another in a mixed
-# playlist, so it has to be asked for again every time we queue.
+# And leaving it to HQPlayer loses the gain outright on a fresh load. It applies
+# the figure at PLAY time from tags it has ALREADY parsed, and the bridge goes
+# Stop -> PlaylistClear -> PlaylistAdd -> Play in about 300ms, so playback
+# starts before the file has been fetched and read. Observed live on a
+# fully-tagged album (LMS: album_replay_gain -9.6):
 #
-# $song->replayGain is already populated for the track being STARTED -
-# StreamingController computes it and stores it just before calling play().  A
-# track being PRE-QUEUED has not reached that point, so ask for it directly;
-# by arm time the playlist neighbours are known, which is all the album/track
-# decision needs.
+#   19:07:23  add /music/476251  ->  0 dB (1)
+#   19:07:23  add /music/476252  ->  0 dB (1)
+#   19:07:43  add /music/476253  ->  0 dB (1)
+#   19:09:00                     -> -9.6 dB   <- only when the playlist changed
 #
-# Which of album or track gain comes back is NOT our decision and must not be
-# reimplemented here: for a remote track fetchGainMode hands straight off to
-# the service plugin's trackGain before any of LMS's own mode logic runs.
-# Qobuz supplies both album and track figures, so its choice is a real one;
-# a service that only publishes track gain simply yields a track figure.
+# A whole album played unnormalised. Sending the figure with the item removes
+# the race: it is there before HQPlayer needs it.
+#
+# IT IS ALSO THE BETTER ANSWER. LMS has already chosen album vs track gain -
+# Smart Gain compares a song's playlist neighbours, so an album plays with album
+# gain and a shuffled queue with track gain. HQPlayer only does album gain
+# (`playlist_album_gain`, read by clPlaylist::GetAlbumGain), so deferring to it
+# throws that choice away.
+#
+# WHY THE VALUE IS READ PER QUEUE EVENT AND NEVER CACHED AGAINST THE TRACK: that
+# same context-sensitivity. The same track is legitimately -4.07 inside its
+# album and something else in a mixed playlist. $song->replayGain for the track
+# being started - StreamingController computes it and stores it just before
+# calling play() - and fetchGainMode directly for one being PRE-QUEUED, which
+# has not reached that point yet.
 sub _replayGain {
     my ( $self, $song, $track ) = @_;
 
     my $url = eval { $track->url } || '';
 
-    return undef unless $url && Slim::Music::Info::isRemoteURL($url);
+    return undef unless $url;
 
-    my $gain = eval { $song->replayGain };
+    my $raw  = eval { $song->replayGain };
+    my $gain = $raw;
 
     $gain = eval { Slim::Player::ReplayGain->fetchGainMode( $self, $song ) }
         if !defined $gain;
 
-    # Anything we cannot read as a number is unity, not "say nothing" - see the
-    # note on asserting below.
-    $gain = 0 unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+    # NO FIGURE AT ALL IS HANDLED DIFFERENTLY EITHER SIDE OF THE LOCAL LINE, and
+    # the difference matters because `album_gain` OVERRIDES a file's own tags.
+    #
+    # Remote: assert unity - see the note on asserting at the end of this sub. A
+    # streaming file has no tags of its own, so 0.00 overrides nothing and it
+    # stops anything carrying over from the item before it.
+    #
+    # LOCAL: SEND NOTHING, and let HQPlayer read the file itself. LMS hands back
+    # no figure when the user has replay gain switched OFF (`fetchGainMode`
+    # returns undef for `replayGainMode = 0`, with no handler in the way for a
+    # local track), and asserting 0.00 there would override a perfectly good
+    # REPLAYGAIN tag with unity - silently disabling HQPlayer's own
+    # `playlist_album_gain` for a user who never asked LMS to do this at all.
+    # Omitting restores exactly the pre-0.2.44 behaviour for that user.
+    if ( !defined $gain || $gain !~ /^\s*-?[0-9]*\.?[0-9]+\s*$/ ) {
+        return undef unless Slim::Music::Info::isRemoteURL($url);
+        $gain = 0;
+    }
 
-    # A BOOST IS TRIMMED TO THE THRESHOLD, NEVER REFUSED.
+    # A BOOST IS TRIMMED INTO THE HEADROOM HQPLAYER IS HOLDING BACK.
     #
     # ReplayGain normalises UP as readily as down: Qobuz's album gain for The
     # Dark Side Of The Moon (50th Anniversary) is +6.68 dB because the album is
     # mastered quietly, and -18 LUFS is a target rather than a maximum. 0.2.38
-    # sent it verbatim, HQPlayer applied `6.68 dB (2.15774)`; 0.2.39 then
-    # refused every positive gain and 0.2.40 refused any it could not check
-    # against a peak. Both were wrong in the same way.
+    # sent it verbatim and HQPlayer applied `6.68 dB (2.15774)`.
     #
-    # SIMON'S RULE, 2026-08-30: a positive gain is fine unless it takes
-    # HQPlayer's overall output past 0 dB full scale, and when it would, we
-    # "apply what it needs to not go over the threshold" - we do NOT decline it.
-    # So every limit below TRIMS. Nothing here can turn a boost into silence.
+    # THE RULE (Simon, 2026-08-30). A boost and the configured headroom must
+    # never sum above 0 dBFS, or HQPlayer's soft limiter clamps the peaks. With
+    # -3 dB of headroom: +2 dB passes through (-3 + 2 = -1, still under) and
+    # +5 dB is trimmed to +3 (netting exactly 0). So the largest boost is the
+    # headroom's own magnitude. It is TRIMMED to that, never refused.
     #
-    # THE DOMINANT TERM IS THE VOLUME, AND WE ALWAYS KNOW IT. HQPlayer's output
-    # tops out at _volMax (0 dB, from <VolumeRange max="0"/>) and sits at
-    # hqVolDb, so the room above the current level is the real threshold. At a
-    # typical -38 dB that is 38 dB of headroom and a +6.68 boost lands at
-    # -31.3 dB, nowhere near clipping - which is exactly why HQPlayer logged
-    # `clips="0"` through the playback that started this.
+    # THREE WRONG ANSWERS CAME FIRST, and it is worth knowing why each failed.
+    # 0.2.39 refused every positive gain. 0.2.40 refused any it could not check
+    # against a peak. 0.2.41 trimmed against the room between hqVolDb and
+    # _volMax - and that one was not merely cautious, it was WRONG, because it
+    # measured the wrong domain. WITH HARDWARE VOLUME ENABLED THE LEVEL IS THE
+    # ENDPOINT'S ANALOGUE PREAMP, downstream of where digital clipping happens,
+    # so it buys no headroom at all in the path this gain is applied in.
+    # hqplayerd splits the level and says so, measured across a whole session:
     #
-    # The track's own peak is a SECOND limit, applied only when we have one:
-    # -20*log10(peak) is the largest boost the samples themselves permit, which
-    # is Slim::Player::ReplayGain::preventClipping. We call it ourselves rather
-    # than assume it ran upstream - it demonstrably had not, or +6.68 could not
-    # have reached us. Its ABSENCE is not a reason to refuse the boost; the
-    # volume headroom still bounds it.
+    #   Set volume: -38  ->  hardware: -34  software: -4
+    #   Set volume: -33  ->  hardware: -29  software: -4
+    #   ...                  hardware: -30/-35/-39/-41/-43/-47, software: -4
     #
-    # AND HQPLAYER'S OWN DSP HEADROOM IS ON TOP OF THIS, NOT INSIDE IT - so the
-    # volume limit is conservative, and we deliberately do NOT model the DSP.
-    # HQPlayer already reserves headroom for conversion and for whatever
-    # processing is configured, and reports it doing so:
+    # The software part is CONSTANT however far the volume moves. And a
+    # different configuration splits differently again (`hardware: 0
+    # software: -18` is in the same log), so the split must not be modelled
+    # either. THE VOLUME MUST NOT ENTER THIS CALCULATION.
     #
-    #   Convolution gain compensation: -3
-    #   Volume scaler: 0.707107            (= -3.01 dB)
-    #
-    # That is a further ~3 dB of room in this chain, and it is HQPlayer's to
-    # manage: it depends on the filter, the modulator, the matrix profile and
-    # whether convolution is enabled at all, none of which is ours to track and
-    # all of which can change without us hearing about it. Subtracting a guess
-    # at it here would only make us wrong in a new way. The volume headroom is
-    # the floor of what is safe, not the ceiling.
+    # WHY THE HEADROOM IS A SETTING AND NOT A QUERY. HQPlayer does not report it
+    # over the control API. Probed thoroughly: Meters, GetMeters, Level,
+    # GetLevel, Analysis, GetAnalysis, Meter, OutputLevel, GetVolume, VolumeGet
+    # and Limits all answer `Unknown command`; <VolumeRange/> carries only
+    # `adaptive enabled max min`; <ConfigurationGet/> returns a profile name;
+    # and a SUBSCRIBED <Status/> stream carries no level, peak or rms field.
+    # The `peak`/`rms`/`lufs` fields in Signalyst's own client belong to
+    # LibraryFile/LibraryDirectory - its library ANALYSIS, not a live meter -
+    # and the web UI's "Limits / Apod" is a clipping COUNTER, not a level.
+    # Signalyst publish no API spec; the 6.0.1 client source is the reference,
+    # and it has no metering command. It appears only in hqplayerd's own log,
+    # as `Convolution gain compensation: -3` / `Volume scaler: 0.707107`.
     #
     # ATTENUATION IS NEVER TOUCHED. Every limit here applies to a boost only.
+    # THE HEADROOM IS COMPENSATED FOR, NOT SUFFERED.
+    #
+    # HQPlayer applies BOTH its headroom and our album_gain, so what the signal
+    # actually gets is headroom + gain. Sending the ReplayGain figure raw meant
+    # a -10.03 dB album played at -13.04 dB - the headroom silently taken off
+    # every track on top of the normalisation. Simon, 2026-08-30: "we are now
+    # adding -13db of reduction".
+    #
+    # So the headroom is added back, and the COMBINED figure is what is held at
+    # or below 0 dBFS. Every track then lands on its ReplayGain target, and the
+    # headroom does the job it exists for - absorbing a boost - instead of
+    # attenuating everything.
+    #
+    #   headroom -3.01, sent = gain + 3.01, capped so combined <= 0
+    #
+    #     gain -10.03  -> send -7.02   (combined -10.03)
+    #     gain  -0.50  -> send  2.51   (combined  -0.50)
+    #     gain  +6.68  -> send  3.01   (combined   0.00)   <- trimmed, not refused
+    #
+    # A BOOST IS THEREFORE TRIMMED RATHER THAN REFUSED, which is the same rule
+    # in the other direction: the largest thing we can send is the headroom's
+    # own magnitude, because that is what puts the combined figure at exactly 0.
+    #
+    # WITH NO HEADROOM KNOWN there is nothing to compensate and nothing to boost
+    # into, so the figure goes out as it is and a boost is refused - the safe
+    # reading of "we do not know what HQPlayer is doing".
+    #
+    # THE PEAK IS A THIRD LIMIT, and it binds only for a source that already
+    # exceeds full scale. Clipping is peak * 10^(combined/20) > 1, so the
+    # ceiling on the COMBINED figure is -20*log10(peak); for any peak <= 1 that
+    # is >= 0 and the cap above is tighter, but a source reporting peak > 1
+    # needs the extra trim.
+    #
+    # WHERE A PEAK ACTUALLY COMES FROM, measured 2026-08-30: LOCAL FILES HAVE
+    # ONE and streaming does not. A tagged m4a album logged `peak 0.985198`
+    # and `peak 1.026709` on consecutive tracks, straight out of
+    # REPLAYGAIN_ALBUM_PEAK - and the second is over full scale, so this limit
+    # is not hypothetical. Qobuz publishes none to LMS at all (`peak none`,
+    # live-verified) and Tidal's own handler applies preventClipping before we
+    # ever see the figure. So the third limit is in practice the LOCAL one.
     my $peak = eval { $track->replay_peak };
     $peak = undef unless defined $peak && $peak =~ /^\s*[0-9]*\.?[0-9]+\s*$/ && $peak > 0;
 
-    if ( $gain > 0 ) {
-        if ( defined $peak ) {
-            my $safe = Slim::Player::ReplayGain::preventClipping( $gain, $peak );
-            $gain = $safe if defined $safe && $safe =~ /^\s*-?[0-9.]+\s*$/ && $safe < $gain;
-        }
+    my $head = $self->hqHeadroom;
+    $head = 0 unless defined $head && $head =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+    my $room = abs($head);
 
-        # The output threshold. hqVolDb is where HQPlayer ACTUALLY is; if we do
-        # not know yet, there is no threshold to measure against, so hold at
-        # unity rather than guess upward.
-        my $at   = $self->hqVolDb;
-        my $room = defined $at ? ( $self->_volMax - $at ) : 0;
-        $room = 0 if $room < 0;
-        $gain  = $room if $gain > $room;
+    # What the combined figure may reach.
+    my $maxCombined = 0;
 
-        $gain = 0 if $gain < 0;   # a trim can never become an attenuation
+    if ( defined $peak ) {
+        my $noclip = -20 * ( log($peak) / log(10) );
+        $maxCombined = $noclip if $noclip < $maxCombined;
     }
 
-    # Logged whether or not it mattered: the peak is the one input to this we
-    # cannot see from outside LMS (the CLI exposes no peak for a remote track),
-    # so this line is how we learn which services populate it.
+    $gain += $room;
+
+    my $maxSend = $maxCombined + $room;
+    $gain = $maxSend if $gain > $maxSend;
+
+    # LOGGED IN FULL, BECAUSE THE PEAK IS THE ONE INPUT WE CANNOT SEE FROM
+    # OUTSIDE LMS - `songinfo` on a remote track exposes neither gain nor peak.
+    # This line is how we learn which services populate $track->replay_peak, and
+    # it shows the raw figure beside the trimmed one so a trim is never mistaken
+    # for a service publishing something different.
     main::INFOLOG && $log->is_info && $log->info( $self->name
-        . ': replay gain ' . $gain . ' dB'
-        . ( defined $peak ? " (peak $peak)" : ' (no peak)' ) . " for $url" );
+        . sprintf( ': replay gain %s -> %.2f dB (headroom %s, peak %s) for %s',
+            ( defined $raw ? $raw : 'none' ),
+            $gain,
+            ( defined $self->hqHeadroom ? sprintf( '%.2f', $self->hqHeadroom ) : 'unknown' ),
+            ( defined $peak ? $peak : 'none' ),
+            $url ) );
 
     # ...AND WE ALWAYS SAY SO, rather than omitting the attribute when there is
     # nothing to apply.  Omitting it relies on HQPlayer defaulting each item to
@@ -793,7 +863,8 @@ sub _replayGain {
     # from the track before it however the daemon handles a hand-over
     # internally.  It costs one attribute and removes a whole class of
     # question.  A streaming file has no tags of its own for a 0.00 to
-    # override; a LOCAL track never reaches here at all.
+    # override, and on a LOCAL one a 0.00 deliberately overrides the file's
+    # own tag with unity - which is what LMS asking for no gain means.
     return $gain;
 }
 
@@ -2292,6 +2363,8 @@ sub _onStatus {
     # Did HQPlayer advance into a track we handed it early?  This has to run
     # before the position below, because from this push on the position belongs
     # to the NEW track.
+    $self->_watchDsp($attrs);
+
     my $track = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track' );
 
     $self->_handedOver( $track, $meta ) if $self->hqNext;
@@ -2615,6 +2688,185 @@ sub assertRepeatOff {
     return 1;
 }
 
+# Has HQPlayer's processing changed under us?
+#
+# THE HEADROOM IS NOT IN THE CONTROL API - 24 live probes for it, all
+# `Unknown command` (see readHeadroom) - so we cannot ask for the new value when
+# the user changes it. But we do not have to: every <Status/> push ALREADY
+# carries the processing chain, and the headroom is derived from it. On this
+# instance `Volume scaler: 0.707107` is the `Convolution gain compensation: -3`
+# the convolution filters produce, so a DSP change is exactly the event that
+# moves it. Free to watch - these fields arrive whether we look at them or not.
+#
+# Roon and JPLAY drive the same surface: SetFilter/SetShaper/SetMode/SetRate/
+# SetConvolution exist and their results are reported here. None of them carries
+# a level, which is why the value itself still has to come from the log.
+#
+# A pure headroom change with no DSP change would not be caught by this, which
+# is what the age check in readHeadroom is for.
+use constant DSP_FIELDS => qw(
+    active_filter active_shaper active_mode active_rate
+    correction filter_20k filter_junk
+);
+
+sub _dspSignature {
+    my ( $self, $attrs ) = @_;
+
+    my @v = map {
+        my $v = Plugins::HQPlayerBridge::Control::pick( $attrs, $_ );
+        defined $v ? $v : '';
+    } DSP_FIELDS;
+
+    return join '|', @v;
+}
+
+sub _watchDsp {
+    my ( $self, $attrs ) = @_;
+
+    my $now = $self->_dspSignature($attrs);
+
+    # An all-empty signature is a push that simply did not carry them; it is not
+    # a change, and treating it as one would re-read the log on every stop.
+    return if $now !~ /[^|]/;
+
+    my $was = $self->hqDspSig;
+
+    $self->hqDspSig($now);
+
+    return if !defined $was || $was eq $now;
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . ": HQPlayer's processing changed - re-reading the headroom" );
+
+    $self->readHeadroom(1);
+
+    return;
+}
+
+# How much headroom HQPlayer is holding back, in dB (0 or negative).
+#
+# THIS IS THE CEILING ON A REPLAYGAIN BOOST - see _replayGain. A boost only has
+# somewhere to go if HQPlayer is reserving room for it, and it must never exceed
+# what is reserved. The figure VARIES with the configuration, so it is read
+# rather than assumed or configured.
+#
+# IT IS NOT IN THE CONTROL API. Probed exhaustively 2026-08-30: Meters,
+# GetMeters, Level, GetLevel, Analysis, GetAnalysis, Meter, OutputLevel,
+# GetVolume, VolumeGet and Limits all answer `Unknown command`; <VolumeRange/>
+# carries only `adaptive enabled max min`; <ConfigurationGet/> returns a profile
+# name; and a SUBSCRIBED <Status/> stream carries no level, peak or rms field.
+# The `peak`/`rms`/`lufs` fields in Signalyst's own client belong to
+# LibraryFile/LibraryDirectory - its library ANALYSIS, not a live meter - and
+# the web UI's "Limits / Apod" is a clipping COUNTER. Signalyst publish no API
+# spec; the 6.0.1 client source is the reference and has no metering command.
+#
+# So it is read from hqplayerd's own log, which :8088/log serves unauthenticated:
+#
+#   Volume scaler: 0.707107              -> 20*log10(0.707107) = -3.01 dB
+#   Convolution gain compensation: -3    -> the rounded form, used as fallback
+#
+# `Volume scaler` is preferred because it is the precise figure; the
+# compensation line is rounded to whole dB.
+#
+# WHY IT IS SAVED TO A FILE AND NOT BUFFERED. The endpoint supports neither
+# ranges nor a tail parameter - `Range:` is ignored (200, not 206), HEAD answers
+# 400, and ?lines/?tail/?n/?last/?limit/?bytes all return the whole thing. The
+# log is routinely several MB and was 65MB at the time of writing. SaveAs
+# streams it straight to disk (`Writing response directly to ...` in
+# Slim::Networking::Async::HTTP) so none of it is held in memory, and only the
+# TAIL is then read back - which is what makes the value current rather than
+# whatever was true when the log began.
+use constant HEADROOM_TAIL => 262144;
+
+use constant HEADROOM_MAX_AGE => 900;   # 15 minutes
+
+sub readHeadroom {
+    my ( $self, $force ) = @_;
+
+    # Throttled unless something told us it actually changed. There is no range
+    # or tail support on :8088/log - Range is ignored (200, not 206), HEAD
+    # answers 400, and every ?lines/?tail/?n/?last/?limit/?bytes variant returns
+    # the whole file - so each read costs the entire log. Cheap enough on an
+    # event, wasteful on a timer.
+    if ( !$force ) {
+        my $at = $self->hqHeadroomAt;
+        return if $at && ( Time::HiRes::time() - $at ) < HEADROOM_MAX_AGE;
+    }
+
+    $self->hqHeadroomAt( Time::HiRes::time() );
+
+    my $inst = $self->hqInstance or return;
+    my $ip   = $inst->{ip}       or return;
+
+    my $file = catfile( $serverPrefs->get('cachedir'),
+        'hqplayerbridge-log-' . ( $self->id =~ s/[^0-9a-f]//gir ) . '.txt' );
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $ok = eval { $self->_headroomFromFile($file) };
+            $log->error( $self->name . ": headroom read failed - $@" ) if $@;
+            unlink $file;
+            return $ok;
+        },
+        sub {
+            my ( undef, $error ) = @_;
+            # Not fatal, and not worth a warning every reconnect: without a
+            # figure no boost is sent, which is the safe outcome.
+            main::INFOLOG && $log->is_info && $log->info(
+                $self->name . ": could not read hqplayerd's log for the headroom - $error" );
+            unlink $file;
+            $self->hqHeadroom(undef);
+            return;
+        },
+        { saveAs => $file, timeout => 30 },
+    )->get( 'http://' . $ip . ':8088/log' );
+
+    return;
+}
+
+sub _headroomFromFile {
+    my ( $self, $file ) = @_;
+
+    open my $fh, '<', $file or return;
+    binmode $fh;
+
+    # Only the tail matters: the newest engine init is the current setting.
+    my $size = -s $fh;
+    seek( $fh, $size > HEADROOM_TAIL ? $size - HEADROOM_TAIL : 0, 0 );
+    my $tail = do { local $/; <$fh> };
+    close $fh;
+
+    return unless defined $tail;
+
+    my $db;
+
+    # Last match wins - the log is oldest-first.
+    while ( $tail =~ /Volume scaler:\s*([0-9.]+)/g ) {
+        my $scale = $1;
+        next unless $scale > 0;
+        $db = 20 * ( log($scale) / log(10) );
+    }
+
+    if ( !defined $db ) {
+        while ( $tail =~ /Convolution gain compensation:\s*(-?[0-9.]+)/g ) {
+            $db = $1;
+        }
+    }
+
+    return unless defined $db;
+
+    # A positive figure is not headroom. Nothing is being held back, so nothing
+    # can be boosted into it.
+    $db = 0 if $db > 0;
+
+    $self->hqHeadroom($db);
+
+    main::INFOLOG && $log->is_info && $log->info(
+        $self->name . sprintf( ': HQPlayer is holding %.2f dB of headroom', $db ) );
+
+    return 1;
+}
+
 sub refreshInfo {
     my $self = shift;
 
@@ -2622,6 +2874,8 @@ sub refreshInfo {
     # the XML control API answers "Unknown command" for GetVolumeDBRange.  It
     # is a UPnP action, and it works - see refreshVolumeRange.
     $self->refreshVolumeRange;
+
+    $self->readHeadroom;
 
     $self->assertRepeatOff;
 

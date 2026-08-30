@@ -1,4 +1,7 @@
 package Slim::Networking::SimpleAsyncHTTP;
-sub new { my $c=shift; return bless { cb=>$_[0], ecb=>$_[1], p=>$_[2] }, $c }
-sub get {} sub post {} sub content {''}
+# Records requests instead of making them; a test drives the callback itself.
+our @REQ;
+sub new { my ($c,$cb,$ecb,$p)=@_; return bless { cb=>$cb, ecb=>$ecb, p=>$p||{} }, $c }
+sub get { my ($s,$url)=@_; push @REQ, { url=>$url, %{$s->{p}}, cb=>$s->{cb}, ecb=>$s->{ecb} }; return $s }
+sub _reset { @REQ = () }
 1;

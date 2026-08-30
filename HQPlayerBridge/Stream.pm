@@ -458,7 +458,31 @@ sub _downloadHandler {
         return _fail( $httpClient, $response, 404, 'no such track' );
     }
 
-    # THE WHOLE FIX.  downloadMusicFile reads the request's protocol to decide
+    # SET THE STATUS CODE.  A RAW FUNCTION IS HANDED AN "ALMOST UNMODIFIED"
+    # RESPONSE OBJECT AND LMS NEVER SETS A CODE ON IT - the dispatcher's own
+    # comment says "$rawFunc shall call addHTTPResponse", and it means all of
+    # it.  downloadMusicFile sets a code only on its ERROR paths (406, 400), so
+    # a successful download went out with the code missing entirely:
+    #
+    #   HTTP/1.1  <-- sprintf("%s %s %s", protocol, code, message), code empty
+    #
+    # LMS's own /music/ route works because the ordinary page path sets the code
+    # before dispatch; a raw function is on its own.  _handler and _fail both
+    # set one, which is exactly why tier 4 and our 404s worked while every tier
+    # 3 download produced a headerless-looking response.
+    #
+    # HQPlayer's reader parses the code out of that line and gets an empty
+    # string, which is the whole of the reported failure:
+    #
+    #   clPlaylist::AddURI(".../hqp3/470893/download.flac"):
+    #     clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''
+    #
+    # ALAC, AAC and everything else in an m4a wrapper therefore never played on
+    # tier 3 at all - shipped broken in 0.2.32 and not heard until 2026-08-30,
+    # because the offline suite stubs downloadMusicFile and never sees a socket.
+    $response->code(200);
+
+    # downloadMusicFile reads the request's protocol to decide
     # whether to chunk, and nothing else in it cares - the transcode, the
     # non-blocking writer and the headers are identical either way.
     $request->protocol('HTTP/1.0');
