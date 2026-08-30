@@ -711,11 +711,27 @@ sub _replayGain {
     $gain = eval { Slim::Player::ReplayGain->fetchGainMode( $self, $song ) }
         if !defined $gain;
 
-    return undef unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
+    # Anything we cannot read as a number is unity, not "say nothing" - see the
+    # note on asserting below.
+    $gain = 0 unless defined $gain && $gain =~ /^\s*-?[0-9]*\.?[0-9]+\s*$/;
 
-    # Unity is what HQPlayer already does; saying so adds nothing.
-    return undef if abs($gain) < 0.005;
+    # STRICT CEILING: WE NEVER BOOST.  Simon's call 2026-08-30, and it is not
+    # hypothetical - Qobuz's album gain for The Dark Side Of The Moon (50th
+    # Anniversary) is +6.68 dB, because the album is mastered quietly and
+    # ReplayGain normalises UP towards -18 LUFS as readily as down. 0.2.38 sent
+    # that figure verbatim. A boost into HQPlayer's modulator is a clipping
+    # risk for no benefit, so positive gains are floored at unity and only
+    # attenuation is ever passed on.
+    $gain = 0 if $gain > 0;
 
+    # ...AND WE ALWAYS SAY SO, rather than omitting the attribute when there is
+    # nothing to apply.  Omitting it relies on HQPlayer defaulting each item to
+    # unity by itself; asserting 0.00 makes a track with no gain, an unreadable
+    # one and a clamped one all explicitly unity, so nothing can carry over
+    # from the track before it however the daemon handles a hand-over
+    # internally.  It costs one attribute and removes a whole class of
+    # question.  A streaming file has no tags of its own for a 0.00 to
+    # override; a LOCAL track never reaches here at all.
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ": replay gain $gain dB for $url" );
 

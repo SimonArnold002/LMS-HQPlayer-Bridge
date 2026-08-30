@@ -262,13 +262,27 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     my $lg = $c->_metadata( FakeSong->new($lt)->_rg(-6.31) );
     ok(scalar($lg !~ m{\bgain=}), 'a local track sends none - our album_gain would OVERRIDE its tags');
 
-    # Unity is what HQPlayer does anyway, so saying so is noise.
+    # UNITY IS ASSERTED, NOT OMITTED. Omitting relies on HQPlayer defaulting
+    # each item to unity by itself; saying 0.00 means nothing can carry over
+    # from the previous track however the daemon handles a hand-over.
     my $zero = $c->_metadata( FakeSong->new($qt)->_rg(0) );
-    ok(scalar($zero !~ m{\bgain=}), 'a gain of 0 dB is left off');
+    ok(scalar($zero =~ m{\balbum_gain="0\.00"}), 'a gain of 0 dB is asserted, not left off');
 
-    # No value at all must not emit gain="" or gain="0.00".
     my $none = $c->_metadata( FakeSong->new($qt) );
-    ok(scalar($none !~ m{\bgain=}), 'no value means no attribute, not an empty one');
+    ok(scalar($none =~ m{\balbum_gain="0\.00"}), 'and so is no value at all');
+
+    # STRICT CEILING - WE NEVER BOOST. Not hypothetical: Qobuz's album gain for
+    # The Dark Side Of The Moon (50th Anniversary) is +6.68 dB, and 0.2.38 sent
+    # it verbatim. A boost into the modulator is a clipping risk for no gain.
+    my $up = $c->_metadata( FakeSong->new($qt)->_rg(6.68) );
+    ok(scalar($up =~ m{\balbum_gain="0\.00"}), 'a POSITIVE gain is floored at unity, never boosted');
+    ok(scalar($up !~ m{\balbum_gain="6}), 'and the boost figure never reaches the wire');
+
+    my $tiny = $c->_metadata( FakeSong->new($qt)->_rg(0.4) );
+    ok(scalar($tiny =~ m{\balbum_gain="0\.00"}), 'a small positive gain is floored too');
+
+    my $cut = $c->_metadata( FakeSong->new($qt)->_rg(-0.4) );
+    ok(scalar($cut =~ m{\balbum_gain="-0\.40"}), 'but a small ATTENUATION is passed through');
 
     # A PRE-QUEUED track has not reached StreamingController yet, so the song
     # carries nothing and the value has to be asked for directly. By arm time
@@ -286,7 +300,7 @@ print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
     # A handler that hands back junk must not reach the wire as gain="junk".
     Slim::Player::ReplayGain->_setTestGain('n/a');
     my $junk = $c->_metadata( FakeSong->new($qt) );
-    ok(scalar($junk !~ m{\bgain=}), 'a non-numeric gain is dropped, not forwarded');
+    ok(scalar($junk =~ m{\balbum_gain="0\.00"}), 'a non-numeric gain becomes unity, not gain="n/a"');
 
     Slim::Player::ReplayGain->_setTestGain(undef);
 

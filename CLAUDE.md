@@ -499,7 +499,29 @@ min="-100"/>`), which is why local files were already being normalised.
 as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
 moving it would move the Eversolo's own volume.
 
-**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38. Local
+### The ceiling: we never boost, and unity is asserted
+
+**ReplayGain normalises UP as readily as down, and 0.2.38 shipped without a
+ceiling.** Caught live: Qobuz's album gain for *The Dark Side Of The Moon (50th
+Anniversary)* is **+6.68 dB** — the album is mastered quietly and −18 LUFS is a
+target, not a maximum — and 0.2.38 put `album_gain="6.68"` on the wire. A boost
+into HQPlayer's modulator is a clipping risk for no benefit.
+
+**Positive gains are floored at unity (0.2.39). Only attenuation is ever passed
+on.** Simon's call, and it was asked for at the design stage — it was written
+into the abandoned volume-shift plan and lost when the mechanism changed to
+`album_gain`. Do not remove it to "respect the tags".
+
+**And unity is ASSERTED, never omitted.** A track with no gain, an unreadable
+figure and a clamped positive all send `album_gain="0.00"` rather than nothing.
+Omitting relies on HQPlayer defaulting each item to unity by itself; saying so
+means nothing can carry over from the previous track however the daemon handles
+an internal hand-over. It costs one attribute and removes a whole class of
+question. A streaming file has no tags of its own for a 0.00 to override — and
+a **local** track never reaches `_replayGain` at all.
+
+**So: one attribute, `album_gain`, streaming only.** Shipped in 0.2.38, ceiling
+added in 0.2.39. Local
 tracks send nothing, and that gate is now load-bearing rather than merely tidy:
 `album_gain` OVERRIDES the file's own tags, so sending ours on a local track
 would replace a right answer with a round-tripped one.
