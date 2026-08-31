@@ -8,14 +8,6 @@ my %G;
 sub fetchGainMode { return $G{gain} }
 sub _setTestGain  { $G{gain} = $_[1] }
 
-# The real thing, verbatim from Slim/Player/ReplayGain.pm - the largest boost a
-# peak permits is -20*log10(peak).
-sub preventClipping {
-    my ( $gain, $peak ) = @_;
-    if ( defined $peak && defined $gain && $peak > 0 ) {
-        my $noclip = -20 * ( log($peak) / log(10) );
-        return $noclip if $noclip < $gain;
-    }
-    return $gain;
-}
+# preventClipping is deliberately absent: the bridge does its own clip guarding
+# nowhere at all as of 0.2.49, and LMS applies this upstream of anything we see.
 1;

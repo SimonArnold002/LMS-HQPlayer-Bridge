@@ -25,8 +25,9 @@ declined.
 | A boost must be trimmed against the room between the current volume and `_volMax`, because that room is the headroom (`Player.pm`, `_replayGain`) | **WRONG** 2026-08-30, shipped in 0.2.41 and reversed in 0.2.44 | It measured the wrong domain. **With hardware volume enabled the level is the endpoint's ANALOGUE preamp**, downstream of where digital clipping happens, so it buys no digital headroom at all in the path `album_gain` is applied in. hqplayerd splits the level and says so, measured across a whole session: `Set volume: -38 -> hardware: -34 software: -4`, `-33 -> hardware: -29 software: -4`, and hardware taking every bit of the movement (−30/−35/−39/−41/−43/−47) while **software stayed −4 throughout**. A different configuration splits differently again (`hardware: 0 software: -18` is in the same log), so the split must not be modelled either. **THE VOLUME MUST NOT ENTER THIS CALCULATION.** The real ceiling is HQPlayer's configured headroom, read from its log. |
 | Local tiers must not send `album_gain`, because HQPlayer reads the file's own REPLAYGAIN tags and ours would be applied twice | **WRONG** 2026-08-30, fixed in 0.2.44 | The first half is true and the second is not. **`album_gain` REPLACES the tag, it does not add to it** — proven by isolating one local FLAC tagged −8.61 dB, sending `album_gain="-15"`, and watching it play at −15, not −23.61. And deferring to HQPlayer **loses the gain outright on a fresh load**: it applies the figure at Play time from tags it has already parsed, and the bridge goes Stop → PlaylistClear → PlaylistAdd → Play in ~300ms, so playback starts before the file has been fetched. Live on a fully-tagged album (`album_replay_gain -9.6`): three adds all played `0 dB (1)` and the −9.6 arrived only when the playlist next changed — **a whole album unnormalised**. It is also the better answer, because LMS has already chosen album vs track gain and HQPlayer only does album gain. Reported by Simon as a regression, and it was one. |
 | A raw function's response needs no explicit status code — LMS fills one in (`Stream.pm`, `_downloadHandler`) | **WRONG** 2026-08-30, fixed in 0.2.45 | It does not, and the omission broke **every m4a, ALAC and AAC track** from 0.2.32 to 0.2.45. LMS builds the status line as `sprintf("%s %s %s", protocol, code, status_message(code))`, and a raw function is handed the response object "almost unmodified" — its own dispatcher comment is `$rawFunc shall call addHTTPResponse`. `downloadMusicFile` sets a code only on its ERROR paths (406, 400), so a successful tier 3 download went out as literally `HTTP/1.1  ` — protocol, two spaces, no code. HQPlayer said so precisely and nobody read it as a status line: `clStreamReaderHTTP::clStreamReaderHTTP(): clString::ToUInt(): not an integer ''`. `_handler` (tier 4) and `_fail` both set a code, which is exactly why tier 4 and our 404s worked throughout. **Invisible to the offline suite because it stubs `downloadMusicFile` and never sees a socket** — the test now asserts the code on the response object itself. |
-| The headroom should be added back to every figure, so a track always lands on its ReplayGain target (`Player.pm`, `_replayGain`) | **WRONG for the NO-FIGURE case** 2026-08-30, shipped 0.2.44-0.2.46, fixed in 0.2.47 | Compensation only means something when there is a TARGET to land on. With no figure at all there is no target, and adding the headroom back turned "we know nothing" into a **+3.01 dB boost** that ate exactly the room HQPlayer reserves for its DSP. Reported by Simon — *"no replaygain no adaptive volume"* — and visible at both ends on a Qobuz album that publishes no gain: `replay gain none -> 3.01 dB` in the bridge's log, `Adaptive transport gain: 3.01 dB (1.41416)` in hqplayerd's. A 1.41× multiplier on material nobody asked to be normalised. **The distinction that survives:** a track whose figure IS `0.00` dB has a target of unity and still gets the compensation. Only the ABSENCE of a figure is inert. The unity assertion for a remote track stays — it just sends a flat `0.00` now instead of a compensated one. |
-| `Volume scaler` is the headroom, in a more precise form than `Convolution gain compensation` (`Player.pm`, `_convGainFromFile`) | **WRONG** 2026-08-30, shipped 0.2.44-0.2.47, fixed in 0.2.48 | Two different numbers that coincided. `20*log10(0.707107) = -3.01` matched the compensation of the day, and that was taken as confirmation. Simon set the compensation to **0**, played a fresh track, and the plugin kept compensating — because the scaler had not moved. Across a whole log it appears **21 times, 0.707107 every time**, spanning the change, while the compensation tracked the setting (18 × −3, then 5 × 0). They live in different sections of the init: the compensation after `Playback engine ratio:` in the DSP block, the scaler after `Network endpoint has volume range` in the OUTPUT stage. 0.707107 = 1/√2, the SDM/DSD full-scale convention (hypothesis; the constancy is measured). **Two lessons.** The value is now read from the NEWEST init block only, because "last match in the tail" picks up a stale compensation when convolution is switched off. And the wrong NAME caused this: hunting for something called "headroom" is what made a −3.01-looking constant persuasive — Simon: *"its called convolution gain compensation not headroom"*. |
+| The headroom should be added back to every figure, so a track always lands on its ReplayGain target (`Player.pm`, `_replayGain`) | **WRONG for the NO-FIGURE case** 2026-08-30, shipped 0.2.44-0.2.46, fixed in 0.2.47 | Compensation only means something when there is a TARGET to land on. With no figure at all there is no target, and adding the headroom back turned "we know nothing" into a **+3.01 dB boost** that ate exactly the room HQPlayer reserves for its DSP. Reported by Simon — *"no replaygain no adaptive volume"* — and visible at both ends on a Qobuz album that publishes no gain: `replay gain none -> 3.01 dB` in the bridge's log, `Adaptive transport gain: 3.01 dB (1.41416)` in hqplayerd's. A 1.41× multiplier on material nobody asked to be normalised. **The distinction that survives:** a track whose figure IS `0.00` dB has a target of unity and still gets the compensation. Only the ABSENCE of a figure is inert. The unity assertion for a remote track stays — it just sends a flat `0.00` now instead of a compensated one. **SUPERSEDED by the 0.2.49 reversal** — the compensation, the log reader and the unity assertion are all gone; this row is kept for the reasoning, not the behaviour. |
+| `Volume scaler` is the headroom, in a more precise form than `Convolution gain compensation` (`Player.pm`, `_convGainFromFile`) | **WRONG** 2026-08-30, shipped 0.2.44-0.2.47, fixed in 0.2.48 | Two different numbers that coincided. `20*log10(0.707107) = -3.01` matched the compensation of the day, and that was taken as confirmation. Simon set the compensation to **0**, played a fresh track, and the plugin kept compensating — because the scaler had not moved. Across a whole log it appears **21 times, 0.707107 every time**, spanning the change, while the compensation tracked the setting (18 × −3, then 5 × 0). They live in different sections of the init: the compensation after `Playback engine ratio:` in the DSP block, the scaler after `Network endpoint has volume range` in the OUTPUT stage. 0.707107 = 1/√2, the SDM/DSD full-scale convention (hypothesis; the constancy is measured). **Two lessons.** The value is now read from the NEWEST init block only, because "last match in the tail" picks up a stale compensation when convolution is switched off. And the wrong NAME caused this: hunting for something called "headroom" is what made a −3.01-looking constant persuasive — Simon: *"its called convolution gain compensation not headroom"*. **SUPERSEDED by the 0.2.49 reversal** — the compensation, the log reader and the unity assertion are all gone; this row is kept for the reasoning, not the behaviour. |
+| The bridge should scale LMS's ReplayGain figure at all — compensate for HQPlayer's convolution gain, cap it against the peak, or assert unity when there is none (`Player.pm`, `_replayGain`) | **REVERSED** 2026-08-31, Simon's call | Every layer built over 0.2.39-0.2.48 is removed in 0.2.49 and the figure now goes out **verbatim, on every tier**, with no attribute at all when LMS has none: *"Adaptive gain for replay gain is just applied with no compensation at all as we originally had it. Do not read the gains from Convolution."* / *"all tiers operate the same, no replay gain provided by LMS no Adaptive Gain added"*. **The facts underneath the compensation were sound** — HQPlayer really does apply its convolution gain compensation on top of `album_gain`, so a -10.03 album with -3.01 of compensation really did land at -13.04 — but that is HQPlayer doing what the user configured, and cancelling it out is not the bridge's job. **The lesson is the pattern, not the arithmetic:** five builds each corrected the previous build's ceiling (volume room, then headroom, then peak-vs-0dB base) and every one was a new way to disagree with a number LMS had already computed correctly. When a correction needs its own correction three times over, the thing to question is whether to be correcting at all. `readConvGain`, `_convGainFromFile`, `_watchDsp`, `_dspSignature`, the three accessors and both constants are DELETED, and `t_player.pl` asserts their absence so a dormant reader cannot be quietly rewired. |
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -425,8 +426,8 @@ Adaptive transport gain: -6.31 dB (0.483615)
 with nothing sent from the bridge. **That was taken as a reason to send nothing
 on local tiers, and it was wrong — see the ledger row.** `album_gain` REPLACES
 the file's tag rather than adding to it, and HQPlayer reads the tags too late to
-catch a fresh load. **`_replayGain` now runs for every tier**, and the local
-line decides one thing only: what happens when LMS gives us no figure at all.
+catch a fresh load. **`_replayGain` runs for every tier, and every tier is
+treated identically** — see the 0.2.49 reversal below.
 
 **A service CDN file carries no ReplayGain tags at all.** Every streamed track
 logged `Adaptive transport gain: 0 dB (1)`, and `<Status/>` for a playing
@@ -506,140 +507,53 @@ min="-100"/>`), which is why local files were already being normalised.
 as `hardware: -29 software: -4`) and is **off limits** — Simon's call, 2026-08-30:
 moving it would move the Eversolo's own volume.
 
-### The headroom is COMPENSATED FOR, and it is the ceiling
+### REVERSED in 0.2.49: the figure goes out VERBATIM, and nothing is read from HQPlayer
 
-**HQPlayer holds back headroom for conversion and DSP, and it applies that on
-top of our `album_gain`.** So what the signal actually receives is
-`headroom + gain`. Sending the ReplayGain figure raw meant a −10.03 dB album
-played at **−13.04 dB** — the headroom silently taken off every track on top of
-the normalisation. Simon, 2026-08-30: *"we are now adding -13db of reduction"*.
+**What LMS says is what HQPlayer gets.** `_replayGain` returns
+`$song->replayGain` (or `fetchGainMode` for a pre-queued track) and
+`_metadata` formats it to two decimals. There is no scaling, no ceiling, no
+trim and no assertion of unity. Simon's call, 2026-08-31: *"Adaptive gain for
+replay gain is just applied with no compensation at all as we originally had
+it. Do not read the gains from Convolution."*
 
-**So the headroom is added back, and the COMBINED figure is what is held at or
-below 0 dBFS.** Every track then lands on its ReplayGain target, and the
-headroom does the job it exists for — absorbing a boost — instead of attenuating
-everything:
+**Every tier behaves identically.** A figure from LMS is sent; **no figure from
+LMS means no `album_gain` attribute at all** — local and streaming alike —
+*"all tiers operate the same, no replay gain provided by LMS no Adaptive Gain
+added"*. The local/remote asymmetry that used to live here is gone with the
+rest of it.
 
-| headroom | gain in | sent | combined | why |
-|---|---|---|---|---|
-| −3.01 | −10.03 | **−7.02** | −10.03 | lands exactly on target |
-| −3.01 | −0.50 | **+2.51** | −0.50 | a cut can send a POSITIVE figure — it is cancelling the headroom |
-| −3.01 | +6.68 | **+3.01** | 0.00 | trimmed, not refused — the largest thing sendable is the headroom's own magnitude |
-| unknown | −10.03 | −10.03 | — | nothing to compensate |
-| unknown | +6.68 | 0.00 | — | nothing to boost into, so a boost IS refused here |
-| −3.01 | **no figure** | **0.00** | — | no target, so NOTHING is applied — not a boost |
+**WHAT WAS DELETED, and it must not come back.** 0.2.39–0.2.48 built up four
+layers on top of LMS's figure, and all four are removed:
 
-**ReplayGain normalises UP as readily as down.** Qobuz's album gain for *The Dark
-Side Of The Moon (50th Anniversary)* is **+6.68 dB** — the album is mastered
-quietly and −18 LUFS is a target, not a maximum. 0.2.38 sent it verbatim and
-HQPlayer applied `6.68 dB (2.15774)`, a 2.16× multiplier.
+| Removed in 0.2.49 | What it did |
+|---|---|
+| Headroom compensation | added HQPlayer's convolution gain compensation back to every figure |
+| `readConvGain` / `_convGainFromFile` | fetched `:8088/log` once per track and parsed the newest engine-init block for `Convolution gain compensation:` |
+| `_watchDsp` / `_dspSignature` | watched the DSP fields on every `<Status/>` push to force a re-read when processing changed |
+| The clipping ceiling | held the combined figure under `-20*log10(peak)`, reading `$track->replay_peak` |
 
-**Three wrong answers came first, and the first two failed the same way — by
-declining instead of trimming.** 0.2.39 refused every positive gain; 0.2.40
-refused any it could not check against a peak. Simon's rule, 2026-08-30: a
-positive gain is fine unless it takes HQPlayer's overall output past 0 dB full
-scale, and where it would, *"it should apply what it needs to not go over the
-threshold not just not apply it at all"*. **So every limit TRIMS. Nothing can
-turn a boost into silence.** The third, 0.2.41, trimmed against the VOLUME — see
-the ledger row; the volume is analogue and must not enter this.
+The `hqConvGain` / `hqConvGainAt` / `hqDspSig` accessors, the `LOG_TAIL` and
+`CONVGAIN_MAX_AGE` constants, the `catfile` import and the whole
+`Slim::Player::ReplayGain::preventClipping` line of reasoning went with them.
+`tools/t_player.pl` asserts their **absence** — a dormant reader would be one
+edit away from being wired back in.
 
-**The peak is a THIRD limit, and it binds only for a source already past full
-scale.** Clipping is `peak * 10^(combined/20) > 1`, so the ceiling on the
-combined figure is `-20*log10(peak)` — `Slim::Player::ReplayGain::preventClipping`,
-which we call ourselves rather than assume ran upstream (it demonstrably had
-not, or +6.68 could not have reached us). For any `peak <= 1` the headroom cap
-is tighter and this changes nothing.
+**The reasoning that motivated the compensation was not wrong on its facts.**
+HQPlayer really does apply its convolution gain compensation on top of
+`album_gain`, so a −10.03 dB album with −3.01 of compensation really does land
+at −13.04. **That is HQPlayer doing what the user configured it to do**, and
+cancelling it out is not the bridge's job. Five builds were spent trying to
+land tracks on a computed target and each one moved the goalposts somewhere
+else; sending the number LMS states is the behaviour 0.2.38 shipped and the
+behaviour to keep.
 
-**Where a peak actually comes from, measured 2026-08-30: LOCAL FILES HAVE ONE
-AND STREAMING DOES NOT.** A tagged m4a album logged `peak 0.985198` then
-`peak 1.026709` on consecutive tracks, straight out of `REPLAYGAIN_ALBUM_PEAK` —
-and the second is **over full scale**, so this limit is not hypothetical. Qobuz
-publishes no peak to LMS at all (`peak none`, live-verified); Tidal's own handler
-applies `preventClipping` before we ever see the figure. `_replayGain` logs the
-raw figure, the sent one, the headroom and the peak on every track, which is the
-only way to learn which sources populate it.
+**If normalised playback seems quiet, the compensation setting is the thing to
+change** — in HQPlayer, by the user. Do not reintroduce a reader for it, and do
+not reach for the peak either: LMS applies its own clip prevention upstream of
+anything the bridge sees.
 
-### Reading it: the value is CONVOLUTION GAIN COMPENSATION, and it is in the log
-
-**Call it by its name.** It is HQPlayer's **convolution gain compensation** — a
-setting the user chooses — not "headroom". Simon, 2026-08-30: *"its called
-convolution gain compensation not headroom for reference."* The loose name is
-not cosmetic: looking for something called headroom is exactly how `Volume
-scaler` got picked up instead, because it *looked* like one. The accessors are
-`hqConvGain` / `readConvGain` / `_convGainFromFile` for the same reason.
-"Headroom" below means only the general idea of room before clipping, which is
-what the compensation creates.
-
-**HQPlayer does not report it over the control API.** Probed
-thoroughly 2026-08-30 — `Meters`, `GetMeters`, `Level`, `GetLevel`, `Analysis`,
-`GetAnalysis`, `Meter`, `OutputLevel`, `GetVolume`, `VolumeGet` and `Limits` all
-answer `Unknown command`; `<VolumeRange/>` carries only `adaptive enabled max
-min`; `<ConfigurationGet/>` returns a profile name; and a **subscribed**
-`<Status/>` stream carries no level, peak or rms field. The `peak`/`rms`/`lufs`
-fields on `LibraryFile`/`LibraryDirectory` are its library ANALYSIS, not a live
-meter, and the web UI's "Limits / Apod" is a clipping COUNTER.
-
-**BUT A LIVE METER DOES EXIST — see the next section. It is not on 4321 and it
-is not XML, which is why a command-name sweep could not find it.** It does not
-change any of this: a meter is retrospective and the ceiling has to be known
-BEFORE the track starts, which is what the configured headroom is.
-
-**It appears in exactly one place: hqplayerd's own log at `:8088/log`.**
-
-```
-Playback engine ratio: 117.6
-Convolution engine: overlap-save
-Convolution gain compensation: 0            <- THIS. It is the user's setting.
-...
-Network endpoint has volume range: -100 - 0 -> hardware volume enabled
-Volume scaler: 0.707107                     <- NOT this. A constant.
-```
-
-**`Volume scaler` IS NOT THE VALUE, and 0.2.44–0.2.47 read it.** It was
-preferred on the reasoning that `20*log10(0.707107) = -3.01 dB` is the same
-figure more precisely. It is not the same figure — it only looked like one
-because the compensation happened to be −3 at the time. Simon set the
-compensation to 0, played a fresh track, and the plugin went on compensating:
-
-```
-23:35:15  Convolution gain compensation: 0        <- moved
-23:35:15  Volume scaler: 0.707107                 <- did NOT
-```
-
-Across a whole log `Volume scaler` appears **21 times and is 0.707107 every
-time**, spanning the change, while the compensation moved with the setting
-(18 × −3, then 5 × 0). They are also in different sections: the compensation
-sits in the DSP init after `Playback engine ratio:`, the scaler in the OUTPUT
-stage after `Network endpoint has volume range`. 0.707107 is 1/√2 exactly, which
-is the SDM/DSD full-scale convention — that reading is a hypothesis, but its
-being a constant unrelated to the setting is measured.
-
-`readConvGain` fetches the log with `SimpleAsyncHTTP`'s `saveAs`, which streams
-the body **straight to a file** (`Slim::Networking::Async::HTTP`: *"Writing
-response directly to ..."*) — it can run to megabytes and must never be buffered
-in memory. `_convGainFromFile` seeks to the last 256 KB and reads **only the
-newest engine-init block**, anchored on the last `Playback engine ratio:`.
-
-**"Last match in the tail" is NOT the same thing, and the difference matters
-when convolution is switched off**: the newest block then carries no
-compensation line at all, and the last match in the tail is a stale one from
-when it was on. A newest block with no compensation line means no convolution
-and so nothing reserved — 0. A **positive** compensation reserves nothing
-either, and clamps to 0.
-
-**This was NOT made a preference.** Simon, 2026-08-30: *"WHY DO YOU NEED PREFS"*
-/ *"we know the headroom as this is direct from HQPlayer its in the logs"*. A
-pref would go stale the moment the user changed a filter, which is the whole
-failure mode being avoided.
-
-**NOTHING PUSHES US WHEN IT CHANGES.** `<Status/>` carries `active_filter
-active_shaper active_mode active_rate correction filter_20k filter_junk` and
-`<State/>` carries `convolution="1"` — enabled or not, never the figure. So
-`_watchDsp` catches a filter/mode/rate change but **cannot** see the
-compensation being edited. The age check is the only net under that, and at 15
-minutes it was far too slack — which is precisely how Simon saw a fresh track
-still compensating. `CONVGAIN_MAX_AGE` is now **60 s** and `_queueTrack` asks
-for a read on every load, so in practice it is re-read once per track. The read
-is async, so a change lands on the NEXT track rather than the current one.
+`_replayGain` logs the raw figure and the sent one on every track. They are now
+always the same number, which is the point.
 
 ### CORRECTED: there IS a live meter, on control port + 1
 
@@ -696,42 +610,42 @@ clString::SubString(): uIdx >= sizeStr` — and cost 683,892 lines in ten second
 once. Only `/root.xml` and SOAP paths are safe there. Probe **4321** (control)
 and **8088** (log) and nothing else.
 
-### Unity is asserted for streaming, and OMITTED for local
+### NO FIGURE MEANS NO ATTRIBUTE — on every tier
 
-A **streaming** track with no gain, an unreadable figure or a refused boost
-sends a flat `album_gain="0.00"` rather than nothing — **flat, meaning NOT
-headroom-compensated**. Compensation applies only where there is a ReplayGain
-target to land on; see the ledger row for the build that got this wrong. Omitting relies on HQPlayer
-defaulting each item to unity by itself; saying so means nothing can carry over
-from the previous track however the daemon handles an internal hand-over. It
-costs one attribute and removes a whole class of question, and a streaming file
-has no tags of its own for a 0.00 to override.
+**LMS gives nothing, we send nothing.** No `album_gain` at all: not a flat
+`0.00`, not a computed unity. That covers a track with no ReplayGain data, a
+non-numeric figure from a handler, and the user having replay gain switched
+**off** in LMS (`fetchGainMode` returns undef for `replayGainMode = 0`).
 
-**A LOCAL track with no figure sends NOTHING, and that asymmetry is deliberate.**
-`album_gain` overrides a file's own tags, and **LMS hands back no figure at all
-when the user has replay gain switched off** — `fetchGainMode` returns undef for
-`replayGainMode = 0`, with no service handler in the way for a local track.
-Asserting 0.00 there would override a perfectly good `REPLAYGAIN` tag with unity
-and silently disable HQPlayer's own `playlist_album_gain` for a user who never
-asked LMS to do this at all. Omitting restores exactly the pre-0.2.44 behaviour
-for that user.
+**Why unity is not asserted.** `album_gain` OVERRIDES a local file's own tags,
+so a 0.00 sent to mean "nothing to apply" silently disables HQPlayer's own
+`playlist_album_gain` for a user who never asked LMS to do this. 0.2.39–0.2.48
+asserted unity for streaming only and omitted for local, on the reasoning that
+a CDN file has no tags for a 0.00 to override and that asserting stops anything
+carrying over between playlist items. **That asymmetry is gone as of 0.2.49** —
+Simon: *"all tiers operate the same"*. A carry-over between items has never
+been observed; it was a theoretical worry, and it is not worth a rule that
+behaves differently depending on where the track came from.
 
-**So: one attribute, `album_gain`, on every tier.** Shipped for streaming in
-0.2.38, the trim in 0.2.41, the headroom compensation and local tiers in 0.2.44,
-the local-omit gate in 0.2.46.
+**A real figure of `0.00` dB is still sent.** That is LMS saying "this track is
+already at target", which is not the same as saying nothing.
 
-**Verified end to end on a local m4a, 2026-08-30** — the bridge's own log and
-hqplayerd's, three seconds apart on two clocks:
+**So: one attribute, `album_gain`, on every tier, carrying LMS's figure
+unaltered.** Shipped for streaming in 0.2.38; the ceiling in 0.2.39, the trim
+in 0.2.41, the compensation and local tiers in 0.2.44, the local-omit
+gate in 0.2.46 — and everything but the local tiers reverted in 0.2.49.
+
+**The end-to-end shape to expect** (bridge log and hqplayerd's, on two clocks):
 
 ```
-LMS       22:19:52  replay gain -8.23 -> -5.22 dB (headroom -3.01, peak 0.985198)
-hqplayerd 22:19:49  Adaptive transport gain: -5.22 dB (0.548277)
+LMS       22:19:52  replay gain -8.23 -> -8.23 dB for file:///...
+hqplayerd 22:19:49  Adaptive transport gain: -8.23 dB
 hqplayerd 22:19:49  Set volume: -38.000000 +          <- unmoved, all session
 ```
 
-`-8.23 + 3.01 = -5.22`, landing as **adaptive** gain with the endpoint's own
-volume untouched — which is the constraint: *"do not touch main volume as this
-will move everosolos volume it must only be the adaptive volume"*.
+The two figures match, and it lands as **adaptive** gain with the endpoint's
+own volume untouched — which is the constraint: *"do not touch main volume as
+this will move everosolos volume it must only be the adaptive volume"*.
 
 ## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
 
@@ -1849,6 +1763,9 @@ HTTP played correctly:
   as `mime="audio/x-flac"`, playback advances, and the gain the bridge computed
   (`-8.23 -> -5.22 dB`, headroom −3.01, `peak 0.985198`) arrives at hqplayerd as
   `Adaptive transport gain: -5.22 dB (0.548277)` with `Set volume` unmoved.
+  **On 0.2.49 the same track would send `-8.23`** — the compensation that made
+  this −5.22 is gone. What this bullet still proves is that the figure reaches
+  hqplayerd on tier 3 at all, and that `Set volume` stays put.
 * **TIER 3 IS GAPLESS ACROSS A TRACK BOUNDARY, AAC and ALAC** — 2026-08-30,
   reported by Simon and matched in hqplayerd's log. The signature is exactly the
   one this file predicted: an add with **no `Playlist clear` and no `Play`**.
@@ -1869,7 +1786,8 @@ HTTP played correctly:
   positive-gain trim firing. **It was the no-figure bug** (see the ledger):
   +3.01 is what BOTH paths produce with a −3.01 headroom, and the LMS log line
   that would have separated them — `replay gain none` vs `replay gain 6.68` —
-  was not checked. **The trim has still never been seen fire live.** Lesson:
+  was not checked. **The trim was never once seen fire live, over five builds,
+  and it is now deleted.** Lesson:
   when two code paths produce the same number, the daemon's log cannot tell you
   which one ran; go to the line that carries the input.
 * **hqplayerd confirms the switch we depend on** — `Playlist uses album gain`
