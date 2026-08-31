@@ -12,7 +12,7 @@ declined.
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
 | Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayer-verify-playback-not-state]]. |
 | A bare `<Status/>` is not a subscribe - the vendor's client always writes the attribute, so a missing one reads as `subscribe="0"`, no pushes ever arrive, the clock freezes and LMS is stranded in `play` (`Player.pm` `_startPolling` / `_statusWatchdog`) | **DECLINED** 2026-08-28 | Measured A/B against engine 6.0.4 on one connection each, 6s: bare `<Status/>` -> **2** pushes, `subscribe="1"` -> **2**, `subscribe="0"` -> **1**. Bare is equivalent to `subscribe="1"`; the "missing attribute reads as 0" step was flagged as unproven by the reporter and is the step that is false. The log pattern has a different cause: **HQPlayer stops pushing when it is not playing**. Watchdog firings during the healthy sweep 16:21-16:27 = **0**; continuous from 16:29:36, right after a pause at 16:29:06. Sending `subscribe="1"` explicitly is harmless and slightly clearer, but fixes nothing. THE REPORT'S SYMPTOM IS REAL WITH ANOTHER CAUSE - see the row below. |
-| LMS can be stranded in `mode=play` with a frozen clock, leaving the Eversolo screen on for ever | **ACCEPTED, not yet fixed** 2026-08-28 | `_endOfStream` opens `return unless $self->hqStarted`, and `hqStarted` is only set when HQPlayer REPORTS playing. So a `Play` that is acked but never becomes playback tells LMS nothing, for ever. That is the state every tier 4 bug fixed in 0.2.27 produced; the causes are gone but the gap is not. Fix: a start timeout - if HQPlayer has not reported playing ~10s after the Play ack, report the load as failed. Would have surfaced the 0.2.24-0.2.27 bugs in seconds. Note the screen plugin already has its own net (`_reconcile` spots a non-advancing clock and asks the device); it failed here only because the Eversolo was unreachable at that moment. |
+| LMS can be stranded in `mode=play` with a frozen clock, leaving the Eversolo screen on for ever | **ACCEPTED 2026-08-28, FIXED in 0.2.50** | `_endOfStream` opens `return unless $self->hqStarted`, and `hqStarted` is only set when HQPlayer REPORTS playing. So a `Play` that is acked but never becomes playback tells LMS nothing, for ever. That is the state every tier 4 bug fixed in 0.2.27 produced; the causes are gone but the gap is not. Fix: a start timeout - if HQPlayer has not reported playing ~10s after the Play ack, report the load as failed. Would have surfaced the 0.2.24-0.2.27 bugs in seconds. Note the screen plugin already has its own net (`_reconcile` spots a non-advancing clock and asks the device); it failed here only because the Eversolo was unreachable at that moment. **Built as specified**: `START_DEADLINE` (10s) armed where the Play ack sets `hqPlayAck`, cancelled at the `hqStarted` latch, in `stop()` and in `_newGeneration`; on expiry it reports `playerStreamingFailed('PROBLEM_OPENING')` once. Three things it deliberately does NOT fail: a load superseded by a newer one (generation check), a track paused inside the window (LMS can pause a track that has not started, and HQPlayer then correctly never reports playing), and one that started (belt-and-braces `hqStarted` guard on top of the cancel). |
 | `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` logs it at debug. |
 | The volume curve should be tapered (a knee, or `denonavpcontrol`'s sqrt) rather than linear | **DECLINED** 2026-08-27 | Linear in dB **is** a logarithmic taper on the signal — equal dB per step. A bend would make a fixed skin increment (Material's volume step is 1, 3 or 5) worth a different number of dB depending on slider position, and it only pays off for a listener with one habitual level. It would also break agreement with HQPlayer's own 0-100 scale, which is linear over the range (`GetVolume` 61 at −39 dB on −100…0). |
 | An endpoint re-registering can jump the output +21 dB, so an increase just after a link-up should be refused and pulled back (`Player.pm`, `_followVolume`) | **REVERSED** 2026-08-30 | Shipped in 0.2.31, removed in 0.2.32. The event is real, but the guard's trigger was `transport_serial`, which **increments at every track boundary** (measured 4→5→6→7→8→9 across five boundaries of one album). So it armed for 10s after every track change and pulled back the user's own volume changes. Simon's call: the volume is the user's. Do not re-propose without a trigger that means "the endpoint re-registered" and nothing else. |
@@ -977,9 +977,13 @@ lacks. Verified on both Qobuz and Tidal. **Consequence: the track you seek into
 is NOT pre-queued, so the boundary after a seek is buffer-margin rather than
 true gapless.** It recovers on the following track.
 
-**STILL UNVERIFIED:** scrobbling and play counts on tier 5 (they normally ride
-the stream socket), and signed-URL expiry, since pre-queuing hands the url over
-a whole track early.
+**SCROBBLING AND PLAY COUNTS WORK ON TIER 5** — confirmed by Simon 2026-08-31,
+*"scrobbles have been working fine"*. They were expected to be at risk because
+they normally ride the stream socket and direct streaming removes it; they do
+not depend on it. Do not re-raise this as an open question.
+
+**STILL UNVERIFIED:** signed-URL expiry, since pre-queuing hands the url over a
+whole track early.
 
 ### TRAP: a transcode is served CHUNKED, and HQPlayer does not de-chunk
 
@@ -1194,6 +1198,48 @@ pushed message and maps it onto the controller callbacks:
 | `state` 2 → 0, not ours, nothing held | `playerEndOfStream` + `playerReadyToStream` + `playerStopped` |
 | `state` 2 → 0, not ours, a tier 4 track held | nothing — the held track is loaded instead |
 | command rejected **on a full load** | `playerStreamingFailed('PROBLEM_OPENING')` |
+| Play acked but `state` never reaches 2 within `START_DEADLINE` | `playerStreamingFailed('PROBLEM_OPENING')`, once |
+
+### The start deadline: an ack is not a start (0.2.50)
+
+**`hqPlayAck` and `hqStarted` are two different facts, and the gap between them
+was unmonitored.** The ack means HQPlayer *accepted* `<Play/>`; `hqStarted` only
+latches when a pushed `<Status/>` reports state 2. Everything downstream is gated
+on `hqStarted` — `_endOfStream` opens `return unless $self->hqStarted` — so an
+ack that never became playback reported **nothing to anybody, for ever**: LMS
+stranded in `mode=play` with a frozen clock, and the Eversolo's screen lit
+indefinitely. That is the state every tier 4 bug fixed in 0.2.27 produced. The
+causes were fixed; the gap was carried as an open ledger row for three days.
+
+**The `<Play/>` retry loop already covers the ack never ARRIVING** (~17s over 8
+attempts, in `UPnP::cancelPlay`'s epoch-checked timer). This covers the opposite
+case: the ack arrives, and nothing happens after it.
+
+`START_DEADLINE` is **10 seconds** — roughly 4x the worst legitimate delay. A
+track normally reports playing in ~0.33s; the slowest known real case is a
+sample-rate change forcing an engine reinit at ~2.3s.
+
+**Armed** in `_queueTrack`, immediately after the Play ack sets `hqPlayAck`, with
+the load's generation. **Cancelled** in three places: the `hqStarted(1)` latch in
+`_onStatus` (the success path), `stop()`, and `_newGeneration`.
+
+**THREE THINGS IT MUST NOT FAIL, and each is a test:**
+
+* **A superseded load.** Track one's deadline firing while track two is loading
+  would skip a perfectly healthy track. The generation check is the authority;
+  the timer is killed on those paths too.
+* **A track paused inside the window.** LMS can pause a track that has not
+  started yet, and HQPlayer will then correctly never report playing. Guarded on
+  `hqWanted eq 'play'` — only a load still being *waited on* has failed.
+* **A track that started.** The cancel at the latch handles it; `_startDeadline`
+  re-checks `hqStarted` anyway. Deliberate belt and braces — and note the
+  behavioural tests cannot catch a missing cancel *because* of that guard, which
+  is why there is a source-level assertion that the latch cancels.
+
+**It reports ONCE and does not reschedule.** The 0.2.13 lesson is a failure
+reported per track in ~100ms racing an entire album; one report per load, a
+deadline apart, is the opposite shape — but only as long as it does not repeat
+itself, which is asserted.
 
 ### TRAP: a track change straddles the status stream
 

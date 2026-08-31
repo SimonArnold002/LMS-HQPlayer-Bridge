@@ -70,6 +70,25 @@ use constant END_GRACE => 3;
 # one that did would simply be reported a push or two later.
 use constant START_GRACE => 2;
 
+# How long after HQPlayer ACKNOWLEDGES <Play/> it has to actually report playing
+# before the load is called failed.
+#
+# THE HOLE THIS CLOSES. The ack means HQPlayer accepted the command, and
+# `hqPlayAck` is set on the strength of it; `hqStarted` only latches when a
+# <Status/> push reports state 2. Everything downstream is gated on hqStarted -
+# `_endOfStream` opens `return unless $self->hqStarted` - so an ack that never
+# becomes playback tells LMS NOTHING, for ever. It sits in `mode=play` with a
+# frozen clock and the Eversolo's screen stays lit. That is the state every
+# tier 4 bug fixed in 0.2.27 produced: the causes are gone, the gap was not.
+#
+# The <Play/> retry loop covers the ack never ARRIVING (~17s over 8 attempts).
+# This covers the ack arriving and nothing happening after it.
+#
+# 10s is roughly 4x the worst legitimate delay: a track normally reports
+# playing in ~0.33s, and the slowest known real case is a sample-rate change
+# forcing an engine reinit at ~2.3s.
+use constant START_DEADLINE => 10;
+
 # HQPlayer reports state as an INTEGER, not a word - verified live 2026-08-26
 # by driving a real track through Play/Pause/Stop and watching <Status/>.
 use constant HQP_STOPPED => 0;
@@ -838,6 +857,9 @@ sub _newGeneration {
     # ...and a pending end-of-stream belongs to the run that is ending.
     $self->_cancelEndOfStream;
 
+    # As does a load still waiting to be told it started.
+    $self->_cancelStartDeadline;
+
     my $gen = ( $self->hqGen || 0 ) + 1;
     $self->hqGen($gen);
 
@@ -1338,8 +1360,72 @@ sub _queueTrack {
                 $self->name . ': buffer ready' . _ctlState( $self->controller ) );
 
             $self->_startPolling;
+
+            # ...and hold the load to a deadline. HQPlayer has said it will
+            # play; from here it has START_DEADLINE seconds to actually say it
+            # IS playing, or the load is reported failed. See START_DEADLINE.
+            $self->_armStartDeadline($gen);
         } );
     } );
+
+    return;
+}
+
+# The start deadline: arm, cancel, and the expiry itself.
+#
+# Armed the moment HQPlayer acks <Play/>, cancelled the moment a status push
+# latches hqStarted. It exists for the case in between, which reports nothing to
+# anybody and used to hang LMS in `mode=play` for ever.
+sub _armStartDeadline {
+    my ( $self, $gen ) = @_;
+
+    Slim::Utils::Timers::killTimers( $self, \&_startDeadline );
+    Slim::Utils::Timers::setTimer( $self,
+        Time::HiRes::time() + START_DEADLINE, \&_startDeadline, $gen );
+
+    return;
+}
+
+sub _cancelStartDeadline {
+    Slim::Utils::Timers::killTimers( $_[0], \&_startDeadline );
+
+    return;
+}
+
+# TRAP: setTimer calls back as ($obj, @args), so $gen arrives as the SECOND
+# argument, not the first - same shape as _fadeDone.
+sub _startDeadline {
+    my ( $self, $gen ) = @_;
+
+    # A stop, a skip or a fresh load during the window retired this track. The
+    # generation is the authority; the timer is killed on those paths too, and
+    # this is the belt to that pair of braces.
+    return if $self->_superseded( $gen, 'start deadline' );
+
+    # It started. Normally the latch in _onStatus has already cancelled this,
+    # so reaching here with hqStarted set means a cancel was missed - harmless,
+    # and not a reason to fail a playing track.
+    return if $self->hqStarted;
+
+    # PAUSING OR STOPPING INSIDE THE WINDOW IS NOT A FAILURE. LMS can pause a
+    # track that has not started yet, and HQPlayer will then correctly never
+    # report playing. Only a load we are still WAITING on has failed.
+    my $want = $self->hqWanted || '';
+
+    return if $want ne 'play';
+
+    $log->error( $self->name . sprintf(
+        ': HQPlayer acknowledged Play but never started - giving up after %ds', START_DEADLINE ) );
+
+    # Report it ONCE, and leave hqPlayAck alone: this track is over either way,
+    # and LMS's next act is a fresh load that will set its own generation. The
+    # 0.2.13 lesson is about a failure reported per track in ~100ms racing a
+    # whole album; one report per load, a deadline apart, is the opposite.
+    $self->hqStarted( 0 );
+
+    my $c = $self->controller;
+
+    $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
 
     return;
 }
@@ -1387,6 +1473,9 @@ sub stop {
     $self->hqPlayAck( 0 );
     $self->bufferReady( 0 );
     $self->hqWanted('stop');
+
+    # Nothing is waiting to start any more.
+    $self->_cancelStartDeadline;
 
     $self->_send('<Stop/>');
     $self->_stopPolling;
@@ -1684,12 +1773,24 @@ sub _setFixed {
 # ---------------------------------------------------------------------------
 # Learning the range.
 #
-# VERIFIED live: HQPlayer DOES implement UPnP GetVolumeDBRange, even though the
-# XML control API answers "Unknown command" for it - the -100...0 instance
-# returns MinValue -25600, MaxValue 0.  Those are the AV spec's 1/256 dB units,
-# so divide; whole dB is accepted too, in case another build reports it that
-# way.  One SOAP call per connect, well off the hot path, so its 300-550ms
-# costs nothing.
+# VERIFIED live: HQPlayer DOES implement UPnP GetVolumeDBRange - the -100...0
+# instance returns MinValue -25600, MaxValue 0.  Those are the AV spec's
+# 1/256 dB units, so divide; whole dB is accepted too, in case another build
+# reports it that way.  One SOAP call per connect, well off the hot path, so its
+# 300-550ms costs nothing.
+#
+# THIS IS THE LAST THING UPnP IS USED FOR, AND IT NO LONGER HAS TO BE.  The XML
+# control API answers "Unknown command" to `GetVolumeDBRange` - that much is
+# true and was measured - but that is the UPnP ACTION NAME, and the conclusion
+# drawn from it (that the control API cannot report a range) is wrong.
+# `<VolumeRange/>` is a control command and carries the same numbers:
+#
+#   <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
+#
+# Reading it there retires UPnP.pm, describe, its backoff retry and the SOAP
+# client outright, which is Simon's standing ask ("get gapless tested then
+# remove it") - gapless is tested on every tier and all three services now.
+# Not done here: it is its own change, not a rider on a start-deadline build.
 # ---------------------------------------------------------------------------
 sub refreshVolumeRange {
     my $self = shift;
@@ -2289,6 +2390,10 @@ sub _onStatus {
             $self->hqStarted( 1 );
             $self->hqStartedAt( Time::HiRes::time() );
 
+            # It started within the deadline - that is what the deadline was
+            # waiting for.
+            $self->_cancelStartDeadline;
+
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ': HQPlayer is playing' . _ctlState($controller) );
 
@@ -2550,9 +2655,9 @@ sub assertRepeatOff {
 sub refreshInfo {
     my $self = shift;
 
-    # The volume range does not come from here: GetInfo does not carry one, and
-    # the XML control API answers "Unknown command" for GetVolumeDBRange.  It
-    # is a UPnP action, and it works - see refreshVolumeRange.
+    # The volume range does not come from here - GetInfo does not carry one.
+    # It is read over UPnP today; `<VolumeRange/>` on this socket carries the
+    # same min/max and is what should replace it.  See refreshVolumeRange.
     $self->refreshVolumeRange;
 
     $self->assertRepeatOff;

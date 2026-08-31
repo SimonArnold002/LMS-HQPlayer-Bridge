@@ -1123,6 +1123,117 @@ print "-- a load that genuinely fails --\n";
        'and Play is never sent for a track HQPlayer refused');
 }
 
+print "-- the start deadline: an ack that never becomes playback --\n";
+#
+# THE HOLE. `hqPlayAck` says HQPlayer ACCEPTED <Play/>; `hqStarted` only latches
+# when a <Status/> push reports state 2. Everything downstream is gated on
+# hqStarted - `_endOfStream` opens `return unless $self->hqStarted` - so an ack
+# that never becomes playback reported NOTHING to LMS, for ever: stranded in
+# `mode=play` with a frozen clock and the Eversolo's screen lit. Carried as an
+# ACCEPTED-not-yet-fixed ledger row since 2026-08-28, built in 0.2.50.
+#
+# The <Play/> retry loop already covers the ack never ARRIVING. These tests are
+# about the ack arriving and nothing happening afterwards.
+{
+    my $mk = sub {
+        my $mac = shift;
+        my $pl = Plugins::HQPlayerBridge::Player->new($mac, 'paddr', 1.0, undef, 12, undef);
+        $pl->hqUPnP( LoadUPnP->new );
+        $pl->hqControl( bless {}, 'FakeCtl' );
+        my $cc = LoadController->new($one);
+        $pl->controller($cc);
+        @sent = (); @sentCb = ();
+        Slim::Utils::Timers::_reset();
+        $pl->play({ controller => $cc });
+        _answer();      # PlaylistAdd -> OK
+        _answer();      # Play        -> OK
+        return ( $pl, $cc );
+    };
+
+    # THE FAILURE ITSELF.
+    my ( $dp, $dc ) = $mk->('02:aa:bb:cc:dd:01');
+    is($dp->hqPlayAck, '1', 'the Play ack is in - this is the window the deadline covers');
+    is($dp->hqStarted, '0', 'and HQPlayer has not reported playing');
+
+    $dc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$dc->{calls}}),
+       'an ack that never becomes playback IS reported as a failed load');
+    is($dp->hqStarted, '0', 'and the player is not left claiming to have started');
+
+    # ...ONCE. The 0.2.13 lesson is a failure reported per track in ~100ms
+    # racing a whole album. One report per load, a deadline apart, is the
+    # opposite - but only if it does not repeat on its own.
+    $dc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$dc->{calls}}),
+       'and it is reported ONCE - the deadline does not reschedule itself');
+
+    # A NORMAL START CANCELS IT. This is the test that matters most: a deadline
+    # that fires on a healthy track would skip every track in the library.
+    my ( $gp, $gc ) = $mk->('02:aa:bb:cc:dd:02');
+    my ($gurl) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    status($gp, 2, $gurl, 1);
+    is($gp->hqStarted, '1', 'a PLAYING push starts the track as usual');
+
+    $gc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$gc->{calls}}),
+       'and the deadline is cancelled - a track that started is never failed');
+
+    # A PAUSE INSIDE THE WINDOW IS NOT A FAILURE. LMS can pause a track that has
+    # not started yet, and HQPlayer will then correctly never report playing.
+    my ( $pp, $pc ) = $mk->('02:aa:bb:cc:dd:03');
+    $pp->hqWanted('pause');
+    $pc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$pc->{calls}}),
+       'a track paused inside the window is not reported as a failed load');
+
+    # STOP CANCELS IT OUTRIGHT - both by killing the timer and by superseding
+    # the generation, which is deliberate belt and braces.
+    my ( $sp, $sc ) = $mk->('02:aa:bb:cc:dd:04');
+    $sp->stop;
+    $sc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$sc->{calls}}),
+       'a stopped track is not reported as a failed load');
+
+    # A FRESH LOAD SUPERSEDES IT. Without this, track one's deadline fires while
+    # track two is loading and skips a track that is perfectly healthy.
+    my ( $np, $nc ) = $mk->('02:aa:bb:cc:dd:05');
+    $np->play({ controller => LoadController->new($two) });
+    $nc->{calls} = [];
+    Slim::Utils::Timers::_fireAll();
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$nc->{calls}}),
+       "a superseded load's deadline never fails the track that replaced it");
+
+    # THE WIRING, not just the logic. Calling _startDeadline directly proves the
+    # decision; it does not prove a timer is ever set, and an unarmed deadline
+    # would pass every test above by never firing.
+    {
+        open my $pm, '<', 'Plugins/HQPlayerBridge/Player.pm' or die $!;
+        my $mod = do { local $/; <$pm> };
+        close $pm;
+
+        my ($qt) = $mod =~ /\nsub _queueTrack \{(.*?)\n\}\n\n/s;
+        ok(scalar( $qt && $qt =~ /_armStartDeadline/ ),
+           'the load path actually ARMS the deadline after the Play ack');
+
+        # Asserted against the whole module rather than a captured _onStatus
+        # body: the behavioural test above cannot catch a missing cancel here,
+        # because _startDeadline's own hqStarted guard covers for it. The
+        # guard is deliberate belt-and-braces, so this is what proves the belt.
+        ok(scalar( $mod =~ /hqStarted\( 1 \);.*?_cancelStartDeadline/s ),
+           'and the start latch cancels it');
+
+        ok(scalar( $mod =~ /use constant START_DEADLINE => \d+;/ ),
+           'the deadline is a named constant, not a bare number');
+    }
+
+    Slim::Utils::Timers::_reset();
+}
+
 print "-- a load superseded mid-flight --\n";
 # skip: play track two, then stop before HQPlayer has answered
 $p->play({ controller => LoadController->new($two) });
