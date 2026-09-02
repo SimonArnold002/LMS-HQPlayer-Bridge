@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
   <div class="badges">
-    <span class="badge accent">v0.2.50</span>
+    <span class="badge accent">v0.2.52</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No audio through the plugin</span>
@@ -236,6 +236,14 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 </li>
 <li><strong>The settings page is read-only</strong> — there's nothing to configure yet.
 </li></ul>
+</section>
+<section id="licence-and-attribution">
+<h2>Licence and attribution</h2>
+<p>This plugin is released under the <strong>MIT licence</strong> — see <a href="LICENSE">LICENSE</a>.</p>
+<p><strong>It is not affiliated with, endorsed by, or supported by Signalyst.</strong> For anything to do with HQPlayer itself, go to Signalyst, not here; and please don't take a problem caused by this plugin to them.</p>
+<p><strong>HQPlayer</strong> and <strong>Signalyst</strong> are trademarks of their respective owner. They are used here only to identify the software this plugin works with.</p>
+<p>The control protocol was implemented with reference to <strong>Signalyst's own <code>hqp-control</code> source</strong>, © 2011–2026 Jussi Laako, which Signalyst publish under the MIT licence. A copy is included in this repository at <code>hqp-control-601-src/</code> together with its licence (<code>COPYING</code>); it is reference material only and none of it is compiled into or shipped with the plugin. The HQPlayer Control API is offered by Signalyst for exactly this purpose — "implementing a custom GUI or other type of front-end utilizing the HQPlayer playback engine".</p>
+<p>The plugin icon is original artwork drawn for this plugin. It is not Signalyst's application icon and does not reproduce any part of it.</p>
 </section>
 </main>
 

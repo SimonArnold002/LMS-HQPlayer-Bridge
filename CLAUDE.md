@@ -647,6 +647,82 @@ The two figures match, and it lands as **adaptive** gain with the endpoint's
 own volume untouched — which is the constraint: *"do not touch main volume as
 this will move everosolos volume it must only be the adaptive volume"*.
 
+## Icons: the plugin's own, and the Material player icon
+
+Two different mechanisms, often confused.
+
+**The plugin icon** is `install.xml`'s `<icon>`, pointing at
+`plugins/HQPlayerBridge/html/images/HQPlayerBridgeIcon_svg.png`. The `_svg.png`
+suffix is the whole signal: Material sees it and swaps in the sibling `.svg` so
+it can recolour it per theme. Three files, the PFR convention:
+
+| file | what |
+|---|---|
+| `HQPlayerBridgeIcon.png` | 256x256 RGBA, transparent ground |
+| `HQPlayerBridgeIcon_svg.png` | a BYTE-IDENTICAL copy - the name is the marker |
+| `HQPlayerBridgeIcon.svg` | the vector Material actually themes |
+
+**The Material PLAYER icon** is chosen by `$client->model`, which this player
+reports as `hqplayer`. It needs an entry in lms-material's
+`html/misc/player-icons.json` plus `html/images/hqplayer.svg` - two files, in
+THAT repo, nothing here. Staged in `docs/material-pr/`.
+
+**The artwork is a single pulse-trace path**, hand-authored, the same file in
+both places. Earlier designs (a traced Signalyst logo, a redrawn ECG-and-note, a
+wordmark knocked out of a waveform) were all scrapped; their generators are
+parked in `docs/material-pr/old-designs/` with a note on each. Nothing in the
+shipped icon needs generating.
+
+**The PNGs are rendered from the SVG**, and `qlmanage` FLATTENS ALPHA onto white
+- so a thumbnail cannot be saved as the transparent PNG directly. The artwork is
+pure `#000` on `#fff`, so alpha is recovered exactly as `255 - luminance` with
+the RGB left at black. Render at 1024 and downsample to 256 for clean edges.
+
+**The PNG is monochrome black.** Material never shows it (the `_svg.png` swap
+themes the vector instead), and LMS's own skins are light-ground, so this is
+safe - but it WOULD be near-invisible on a dark non-Material skin. The previous
+icon was Signalyst's colour logo, which was not.
+
+### AUTHOR MONOCHROME, AND KNOW WHAT THE RECOLOUR DOES
+
+Material's `_svgHandler` rewrites the file as it serves it:
+
+```perl
+$svg =~ s/#000/$colour/g;
+$svg =~ s/fill\s*=\s*"[#0-9a-fA-F\.]+"/fill="${colour}"/g;
+$svg =~ s/stroke\s*=\s*"[#0-9a-fA-F\.]+"/stroke="${colour}"/g;
+if (index($svg, "fill=\"")==-1) { $svg =~ s/\<path /\<path fill="${colour}" /g; }
+```
+
+So a two-colour logo cannot survive - it comes out flat whatever you do.
+`fill="none"` and `fill-rule="evenodd"` DO survive, because the colour pattern
+cannot match `none` and `fill-rule=` has a `-` where the pattern wants `=`.
+Strokes are recoloured too, so a stroked path is a legitimate way to draw a thin
+line rather than outlining it as a fill.
+
+**SIMULATE THOSE FOUR LINES OVER ANY CANDIDATE BEFORE SHIPPING IT.** It is five
+lines of perl and it is the whole contract. Every icon supplied for this plugin
+has failed it in a way that is invisible in a local preview:
+
+* **`fill="currentColor"` is NOT themed and BLOCKS the fallback.** It contains
+  letters outside `[#0-9a-fA-F.]` so the substitution skips it - and its mere
+  presence makes `index($svg,'fill="')` non-negative, so the bare-`<path>`
+  injection never fires either. Served standalone, `currentColor` resolves to the
+  document default: **black, in every theme.** Put `fill="#000"` on the path.
+* **`fill="#FFF"` IS themed.** White knockout text is repainted in the theme
+  colour and vanishes. Use a hole (`fill-rule="evenodd"`), not white ink.
+* **One element's `fill=` can stop another being themed** - the injection is a
+  whole-file check, so any `fill=` anywhere disables it for every bare `<path>`.
+
+**Also check the namespace.** Three supplied files carried
+`xmlns="http://w3.org"`, which is not the SVG namespace. It happens to render in
+some viewers and is wrong; it must be `http://www.w3.org/2000/svg`.
+
+**And check the ink actually fits.** `2..22` on both axes is the Material live
+area. A stroked path extends half its `stroke-width` beyond its coordinates, and
+an outlined ribbon extends by its half-width on top of that - both have clipped
+silently here before.
+
 ## TRAP: `queued="1"` ON A MID-PLAYBACK APPEND KILLS THE DAEMON
 
 **Isolated live 2026-08-28, engine 6.0.4, four controlled runs.** This is the
@@ -1983,6 +2059,42 @@ here, that a playlist HQPlayer can advance into on its own stops reporting
 transition is read off the playlist index instead, and `state` 0 now means end
 of *playlist*, which is what the end-of-stream path always wanted it to mean.
 The tier 4 objection stands unchanged and is why tier 4 is excluded.
+
+## SETTLED: the API is free to use, and the licensing is not a grey area
+
+Researched 2026-09-02, before release. **Do not re-litigate this.**
+
+**Signalyst publish their own reference client for this API under the MIT
+licence.** `hqp-control-601-src/COPYING` is the verbatim MIT text, © 2011–2026
+Jussi Laako. MIT grants use, copy, modify, merge, publish, distribute,
+sublicense and sell. A vendor licensing their reference client this way is not
+reserving the protocol.
+
+Corroborating, all checked:
+
+* Signalyst's HQPlayer Embedded page offers the Control API for "implementing a
+  custom GUI or other type of front-end utilizing the HQPlayer playback engine"
+  — third-party front-ends are the STATED purpose.
+* Third-party clients are established and public: HQPWV (GPL-3.0, GitHub),
+  HQPDcontrol (App Store), Roon and JPLAY drive the same surface.
+* **There is no EULA or API terms page on signalyst.com** — `/terms`, `/eula`
+  and `/licence` all 404; the privacy and delivery policies cover neither the
+  API nor development.
+
+**THE ONE MIT OBLIGATION IS ALREADY MET.** The notice must travel with any copy,
+and this repo does redistribute the vendor source — `COPYING` is present both in
+`hqp-control-601-src/` and inside `hqp-control-601-src.zip`. **The shipped
+plugin zip contains none of it** (verified: zero matches), so the released
+artefact carries no vendor code at all. Our own `LICENSE` is MIT too, so there
+is no compatibility question either.
+
+**WHAT IS *NOT* SETTLED BY ANY OF THAT IS TRADEMARK.** MIT covers the code and
+says nothing about the marks. "HQPlayer" and "Signalyst" are trademarks, used
+here nominatively — in the plugin name, the icon, and the Material PR. That is
+normal practice (Material already ships Ubuntu, Windows, Chrome and Bandcamp
+marks for the same reason) but it is a judgement call, not a licence grant.
+README.md carries the disclaimer: not affiliated, not endorsed, marks belong to
+their owner, protocol implemented with reference to the MIT-licensed source.
 
 ## THE API IS DOCUMENTED — read the vendor's client, do not probe blind
 

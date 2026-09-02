@@ -128,3 +128,28 @@ It reports HQPlayer's **transport id** rather than your endpoint's name. HQPlaye
 - **Multi-room sync with hardware players is untested.** The player registers as a normal LMS player, so nothing blocks it, but it hasn't been verified and a bridged player can't be sample-accurate with a Squeezebox.
 - **No HTTP authentication.** If your LMS server is password-protected, HQPlayer can't fetch the audio URLs it's given.
 - **The settings page is read-only** — there's nothing to configure yet.
+
+---
+
+## Licence and attribution
+
+This plugin is released under the **MIT licence** — see [LICENSE](LICENSE).
+
+**It is not affiliated with, endorsed by, or supported by Signalyst.** For
+anything to do with HQPlayer itself, go to Signalyst, not here; and please don't
+take a problem caused by this plugin to them.
+
+**HQPlayer** and **Signalyst** are trademarks of their respective owner. They are
+used here only to identify the software this plugin works with.
+
+The control protocol was implemented with reference to **Signalyst's own
+`hqp-control` source**, © 2011–2026 Jussi Laako, which Signalyst publish under
+the MIT licence. A copy is included in this repository at
+`hqp-control-601-src/` together with its licence (`COPYING`); it is reference
+material only and none of it is compiled into or shipped with the plugin. The
+HQPlayer Control API is offered by Signalyst for exactly this purpose —
+"implementing a custom GUI or other type of front-end utilizing the HQPlayer
+playback engine".
+
+The plugin icon is original artwork drawn for this plugin. It is not Signalyst's
+application icon and does not reproduce any part of it.
