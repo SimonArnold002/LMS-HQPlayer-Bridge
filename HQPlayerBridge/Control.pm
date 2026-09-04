@@ -144,6 +144,10 @@ sub new {
         sock      => undef,
         connected => 0,
         connecting=> 0,
+        # A completed TCP handshake is NOT proof of a working link - see
+        # _connectResolved.  This flips only when HQPlayer actually says
+        # something, and it is what gates the backoff reset.
+        proven    => 0,
         backoff   => BACKOFF_MIN,
         closing   => 0,
     }, $class;
@@ -245,7 +249,20 @@ sub _connectResolved {
 
     $self->{connecting} = 0;
     $self->{connected}  = 1;
-    $self->{backoff}    = BACKOFF_MIN;
+
+    # DELIBERATELY NOT resetting the backoff here.  hqplayerd ACCEPTS the
+    # socket and only then decides it cannot serve - it logs
+    # "Control connection from <ip>" followed immediately by
+    # "clControlThread::HandleConnection(): std::exception" and closes.  That
+    # is its normal behaviour whenever its output endpoint is missing, e.g.
+    # the NAA is switched off.
+    #
+    # Resetting on the handshake made every one of those look like a success,
+    # so the ladder never climbed: measured 2,324 accept-then-drop cycles in
+    # 9.5 hours against an HQPlayer whose endpoint was powered down, instead
+    # of settling at one attempt per BACKOFF_MAX.  The reset moved to
+    # _dispatch, which only runs when HQPlayer has actually said something.
+    $self->{proven} = 0;
 
     main::INFOLOG && $log->is_info && $log->info("$self->{name}: control link up ($self->{ip})");
 
@@ -396,6 +413,13 @@ sub _dispatch {
         $root = $1;
     }
 
+    # A complete message off the wire is the first real evidence that this
+    # link works.  See _connectResolved for why the handshake is not.
+    if ( !$self->{proven} ) {
+        $self->{proven}  = 1;
+        $self->{backoff} = BACKOFF_MIN;
+    }
+
     my $attrs = parseAttrs($raw);
     my $req   = $self->{inflight};
     my $isErr = ( $attrs->{result} || '' ) eq 'Error';
@@ -508,6 +532,7 @@ sub _dropLink {
 
     $self->{connected}  = 0;
     $self->{connecting} = 0;
+    $self->{proven}     = 0;
     $self->{wbuf}       = '';
     $self->{rbuf}       = '';
 

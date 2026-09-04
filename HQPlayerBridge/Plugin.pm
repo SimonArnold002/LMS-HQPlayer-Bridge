@@ -81,7 +81,7 @@ sub initPlugin {
     # created by the very first probe reply already has somewhere to point.
     Plugins::HQPlayerBridge::Stream->init;
 
-    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances );
+    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances, \&_linkUpFor );
 
     return;
 }
@@ -102,8 +102,28 @@ sub bridges { return \%bridges }
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
 # ---------------------------------------------------------------------------
+# Discovery asks this before it decides how hard to keep probing: an instance
+# whose control link is up needs no finding.  An instance that has been
+# discovered but has no bridge yet is deliberately NOT settled - the player is
+# still being built.
+sub _linkUpFor {
+    my $ip = shift or return 0;
+
+    for my $b ( values %bridges ) {
+        next unless $b->{instance} && ( $b->{instance}->{ip} || '' ) eq $ip;
+        return $b->{control} && $b->{control}->connected ? 1 : 0;
+    }
+
+    return 0;
+}
+
+# $partial is set when discovery is announcing a reply mid-round, before the
+# rest of the instances have had their chance to answer.  Such a list is
+# additive only: see the removal pass at the end.
 sub _onInstances {
-    my $instances = shift || [];
+    my ( $instances, $partial ) = @_;
+
+    $instances ||= [];
 
     my %seen;
 
@@ -144,7 +164,10 @@ sub _onInstances {
         };
     }
 
-    # Anything that has stopped answering goes away.
+    # Anything that has stopped answering goes away - but only when this was a
+    # complete round.  A partial list says nothing about who is absent.
+    return if $partial;
+
     for my $id ( keys %bridges ) {
         next if $seen{$id};
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
@@ -343,14 +366,23 @@ sub _onLinkState {
 
     my $b = $bridges{$id} or return;
 
-    if ($up) {
-        my $client = $b->{client} or return;
+    my $client = $b->{client} or return;
 
+    if ($up) {
         $client->refreshInfo;
+
+        # The status subscription is armed HERE, not at a track load.  It is
+        # the plugin's only liveness signal for a peer that goes quiet without
+        # closing the socket, and discovery reads that link state to decide how
+        # hard to keep probing - see _statusWatchdog in Player.pm.
+        $client->_startPolling;
 
         # Re-read the renderer description if it was not reachable earlier.
         my $upnp = $client->hqUPnP;
         $upnp->describe if $upnp && !$upnp->ready;
+    }
+    else {
+        $client->_stopPolling;
     }
 
     return;

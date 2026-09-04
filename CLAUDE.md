@@ -1754,7 +1754,7 @@ player's prefs once; the thrash cost them every round.
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all seven modules against the stub Slim
-tree, runs 407 assertions across five files, and sweeps called-vs-defined subs.
+tree, runs 505 assertions across five files, and sweeps called-vs-defined subs.
 
 | file | covers |
 |---|---|
@@ -2432,22 +2432,104 @@ Verified 2026-08-28: this sequence run five times in rapid succession over a
 playing track swapped cleanly every time, correct metadata each time, daemon
 alive throughout.
 
-### Discovery: fast until found, slow once found
+### Discovery: the CONTROL LINK decides how hard to probe
 
-`ROUND_PERIOD` is 60 s, which is right for the steady state — `INSTANCE_TTL` is
-15 minutes, so a silent round never tears a player down, and the control link is
-the real liveness signal.
+**The period is chosen from link state, not from whether anything is in
+`%found`.** `_schedule` picks one of three:
 
-But it used to apply to the **cold start** as well, and that is a different
-problem: with nothing found there is no player at all, so one lost multicast
-datagram costs a full minute of the plugin looking broken. Observed live — the
-probe went out at 09:48:49 while hqplayerd happened to be restarting, and the
-player did not appear until 09:49:49.
+| state | period | why |
+|---|---|---|
+| nothing known | ladder **2, 4, 8, 10 s** (`COLD_PERIOD` cap) | there is no player at all; be quick |
+| known, a link **down** | `COLD_PERIOD` (10 s) | "is it back yet?" — the address may have moved too |
+| known, every link **up** | `IDLE_PERIOD` (10 min) | nothing a probe could say that the link will not say sooner |
 
-`_schedule` now backs off **2, 4, 8, 16, 32, 60 s** while `%found` is empty and
-resets to `ROUND_PERIOD` the moment anything answers. Covered in `t_plugin.pl`,
-including the settle-back case (seeded by handing `_reply` a real datagram on
-loopback).
+**Why this is safe, and it is the whole design:** an instance that goes away —
+powered off, asleep, moved by DHCP — drops its control link, which puts
+discovery straight back on `COLD_PERIOD`. So the quiet period can never delay
+finding it again. That in turn depends on the link state being *true*, which is
+why `_statusWatchdog` now runs for as long as the link does — see below.
+
+`Plugin::_linkUpFor` is the predicate, passed to `Discovery->start` as a second
+argument. It is deliberately pessimistic: no predicate, no instances, or an
+instance with no bridge yet all answer false, and false only ever means "keep
+looking".
+
+**Each round sends `PROBE_BURST` (3) probes `PROBE_GAP` (0.2 s) apart, plus a
+unicast probe to every address already in `%found`.** One datagram per round was
+one point of failure — measured against a live hqplayerd, of five rounds it
+logged receiving only **three**: the probes at 17:47:49 (it was restarting) and
+17:50:54 (it was initialising its audio engine) never arrived at all, and those
+are exactly the two rounds where the plugin logged no reply.
+
+**Unicast discovery works** — VERIFIED live 2026-09-04 against hqplayerd 6.0.4.
+The same datagram sent straight to the instance's address on **4321/udp** is
+answered identically to the multicast one, so a known instance is reached
+without depending on group membership, IGMP snooping or which interface the
+kernel picked. (The vendor's own client only ever multicasts, so this is not
+in `ControlInterface.cpp`.)
+
+**A new instance is announced the moment it replies**, not at the end of the
+round — `_reply` calls `$onChange->(instances(), 1)`. That second argument is
+load-bearing: **a partial list is additive only**. `Plugin::_onInstances`
+returns before its removal pass when it is set, because a list still being
+collected says nothing about who is absent, and reading it as a complete round
+would tear down every other instance's player — playlist, prefs and sync group
+— simply because it had not answered yet.
+
+**What this fixed, measured 2026-09-04.** Simon's HQPlayer endpoint had been off
+for a week. In that time the plugin collected a probe a minute that bought
+nothing, and when hqplayerd came back the player still took **63 s** to appear:
+the cold ladder had saturated at the old 60 s cap, the probe at 17:47:49 went
+into hqplayerd's 27 s restart window, and the reply that did arrive at 17:48:51
+then waited `LISTEN_TIME` before `_roundDone` announced it. All three are gone.
+
+Covered in `t_plugin.pl`: the ladder and its cap, all three periods driven off a
+fake predicate, the immediate partial announce, and that a partial round removes
+nothing.
+
+### TRAP: hqplayerd ACCEPTS the socket and then throws — a handshake is not a link
+
+**Its control thread accepts the connection before it decides it cannot serve**,
+which is what it does whenever its output endpoint is missing — the NAA switched
+off, say. Its log says so in pairs:
+
+```
++ Control connection from 192.168.1.234:42766
+# clControlThread::HandleConnection(): std::exception
+```
+
+`_connectResolved` used to reset `backoff` to `BACKOFF_MIN` as soon as the TCP
+handshake completed, so **every one of those looked like a success and the
+ladder never climbed**. Measured over one such spell: **2,327 connections and
+2,324 exceptions in 9.5 hours** — four attempts inside two seconds, every
+minute, for as long as the endpoint stayed off.
+
+So the reset moved to `_dispatch`: a **complete message off the wire** is the
+first real evidence the link works. `proven` gates it, and `_dropLink` clears it.
+`t_control.pl` asserts both halves at source level and drives the ladder to its
+cap.
+
+### The status watchdog's lifetime is the control link's, not a track's
+
+`_statusWatchdog` (10 s) re-subscribes if the `<Status/>` stream lapses. It is
+also **the only thing that ever proves the link is alive**: `_readable` learns a
+link is dead from an EOF, and a host that is powered off, asleep or unplugged
+sends no EOF at all — the socket goes quiet and `connected` stays 1 for ever.
+The watchdog's `<Status/>` puts a command in flight, so `REPLY_TIMEOUT` drops
+the link properly. A dead peer is therefore noticed in about
+`STATUS_WATCHDOG + REPLY_TIMEOUT` ≈ **40 s**.
+
+It used to be started at a track load and stopped at a stop, so an **idle**
+player — the state a switched-off endpoint leaves you in for days — had no
+watchdog and no command in flight, and nothing could ever notice. It is now
+armed in `Plugin::_onLinkState` on the way up and stopped on the way down;
+`stop()` and `_endOfStream` no longer touch it. Discovery reads exactly this
+link state to decide how hard to probe, so a zombie "connected" would have kept
+it quiet while the instance was long gone.
+
+It never becomes a busy poll: it sends only when nothing has arrived for
+`STATUS_WATCHDOG` seconds, so against a playing instance — which pushes ~1/s —
+it fires not at all.
 
 ### TRAP: `Control::send`'s callback is `($attrs, $raw)`, not `($res, $err)`
 

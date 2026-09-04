@@ -112,8 +112,8 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
     }
 
-    is(join(',', @waits), '2,4,8,16,32,60,60',
-       'with nothing found it retries fast and doubles, capped at ROUND_PERIOD');
+    is(join(',', @waits), '2,4,8,10,10,10,10',
+       'with nothing found it retries fast and doubles, capped at COLD_PERIOD');
 
     # ...and once an instance answers it settles down. Seed %found the way a
     # real round does, by handing _reply an actual datagram on loopback.
@@ -134,11 +134,101 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         Plugins::HQPlayerBridge::Discovery::_roundDone();
         my $t = Slim::Utils::Timers::_timers()->[0];
         is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '60',
-           'once something answers it settles back to the steady-state period');
+           'with no way to ask about the link it settles to the steady-state period');
     }
 
     Plugins::HQPlayerBridge::Discovery->stop;
     Slim::Utils::Timers::_reset();
+}
+
+print "-- discovery: how hard to probe is decided by the CONTROL LINK --\n";
+{
+    # The point of the whole exercise: an instance that is connected needs no
+    # finding, and one that is not - powered off, asleep, moved - has to be
+    # found again quickly.  Simon's HQPlayer sat unused for a week; the probe a
+    # minute it collected in that time bought nothing, and when the endpoint
+    # finally came on the cold start still took a measured 63s.
+    require Plugins::HQPlayerBridge::Discovery;
+
+    no warnings 'redefine';
+    local *Plugins::HQPlayerBridge::Discovery::_round = sub { };
+
+    my $up = 1;
+    my $seen;
+
+    my $wait = sub {
+        Slim::Utils::Timers::_reset();
+        my $t0 = Time::HiRes::time();
+        Plugins::HQPlayerBridge::Discovery::_roundDone();
+        my $t = Slim::Utils::Timers::_timers()->[0];
+        return $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
+    };
+
+    Slim::Utils::Timers::_reset();
+    Plugins::HQPlayerBridge::Discovery->start(
+        sub { $seen = $_[1] ? 'partial' : 'full' },
+        sub { $up },
+    );
+
+    # Seed one instance the way a real round does.
+    my $rx = IO::Socket::INET->new( Proto => 'udp', LocalAddr => '127.0.0.1', LocalPort => 0 );
+    if ($rx) {
+        my $tx = IO::Socket::INET->new( Proto => 'udp',
+            PeerAddr => '127.0.0.1', PeerPort => $rx->sockport );
+        $tx->send('<?xml version="1.0" encoding="UTF-8"?><discover name="HQPlayerEmbedded"'
+                . ' result="OK" version="Signalyst HQPlayer Embedded 6">hqplayer</discover>');
+        select( undef, undef, undef, 0.1 );
+        Plugins::HQPlayerBridge::Discovery::_reply($rx);
+
+        is($seen, 'partial',
+           'a NEW instance is announced the moment it answers, not at the end of the round');
+        is($seen eq 'partial' ? 1 : 0, 1,
+           'and it is flagged partial, so the caller must not remove anyone on it');
+
+        $up = 1;
+        is($wait->(), '600', 'every instance connected - go quiet for IDLE_PERIOD');
+
+        $up = 0;
+        is($wait->(), '10', 'a link that is down puts it straight back on COLD_PERIOD');
+
+        $up = 1;
+        is($wait->(), '600', 'and it goes quiet again once the link is back');
+    }
+
+    Plugins::HQPlayerBridge::Discovery->stop;
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- reconcile: a partial list must never remove a player --\n";
+{
+    # The immediate announce hands the caller a list with ONE instance in it
+    # while the others have not answered yet.  Read as a complete round that
+    # says "everyone else is gone", and two seconds of a slow reply would cost
+    # another player its playlist and sync group.
+    my %b = %{ Plugins::HQPlayerBridge::Plugin::bridges() };
+
+    Plugins::HQPlayerBridge::Plugin::_onInstances(
+        [ { ip => '10.0.0.1', name => 'HQPlayerEmbedded' } ], 1 );
+
+    is(scalar keys %{ Plugins::HQPlayerBridge::Plugin::bridges() } >= scalar keys %b ? 1 : 0,
+       1, 'a partial round removes nothing');
+}
+
+print "-- the watchdog is armed by the LINK, not by a track --\n";
+{
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    $src =~ s/^\s*#.*$//mg;
+
+    my ($ls) = $src =~ /sub _onLinkState \{(.*?)\n\}/s;
+
+    is( ( defined $ls && $ls =~ /_startPolling/ ? 'yes' : 'no' ),
+        'yes', 'a link coming up arms the status subscription' );
+
+    is( ( defined $ls && $ls =~ /_stopPolling/ ? 'yes' : 'no' ),
+        'yes', 'and a link going down stops it' );
+
+    is( ( defined $ls && $ls =~ /else\s*\{[^}]*_stopPolling/s ? 'yes' : 'no' ),
+        'yes', 'the stop is on the DOWN branch, not next to the start' );
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;

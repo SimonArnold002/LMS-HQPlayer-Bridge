@@ -1478,8 +1478,9 @@ sub stop {
     $self->_cancelStartDeadline;
 
     $self->_send('<Stop/>');
-    $self->_stopPolling;
 
+    # DELIBERATELY NOT stopping the watchdog here.  Its lifetime is the CONTROL
+    # LINK's, not the track's - see _statusWatchdog.
     return 1;
 }
 
@@ -2010,8 +2011,26 @@ sub _stopPolling {
     return;
 }
 
-# Safety net only. If the subscription lapses - or never took - this pokes it
-# back into life without ever becoming a busy poll.
+# Two jobs, and the second one is why this runs for as long as the CONTROL LINK
+# does rather than for as long as a track does.
+#
+# It re-subscribes if the status stream lapses, which is what it was written
+# for.  But the `<Status/>` it sends is also the only thing that ever proves
+# the link is alive: the reader learns a link is dead from an EOF, and a host
+# that is powered off, asleep or unplugged sends no EOF at all - the socket
+# just goes quiet and `connected` stays 1 for ever.  A send with no reply trips
+# REPLY_TIMEOUT, which drops the link properly, so a dead peer is noticed in
+# about STATUS_WATCHDOG + REPLY_TIMEOUT seconds.
+#
+# It used to start at a track load and stop at a stop, so an IDLE player - the
+# state a switched-off endpoint leaves you in for days - had no watchdog and no
+# command in flight, and nothing could ever notice.  Discovery now decides how
+# hard to probe from exactly this link state, so a zombie "connected" would
+# keep it quiet while the instance was long gone.
+#
+# It never becomes a busy poll: it only sends when NOTHING has arrived for
+# STATUS_WATCHDOG seconds, so on a playing instance - which pushes ~1/s - it
+# fires not at all.
 sub _statusWatchdog {
     my $self = shift;
 
@@ -2557,8 +2576,6 @@ sub _endOfStream {
     $controller->playerEndOfStream($self);
     $controller->playerReadyToStream($self);
     $controller->playerStopped($self);
-
-    $self->_stopPolling;
 
     return;
 }

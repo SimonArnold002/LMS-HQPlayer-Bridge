@@ -2090,5 +2090,40 @@ print "-- bitrate limit: the difference between FLAC and MP3 --\n";
     is($cp2->get('maxBitrate'), '320', 'and survives untouched');
 }
 
+# ---------------------------------------------------------------------------
+# THE STATUS WATCHDOG'S LIFETIME IS THE CONTROL LINK'S, NOT A TRACK'S.
+#
+# The reader learns a link is dead from an EOF, and a host that is powered off,
+# asleep or unplugged sends no EOF: the socket goes quiet and `connected` stays
+# 1 for ever.  The watchdog's `<Status/>` is the only thing that ever puts a
+# command in flight on an idle player, so REPLY_TIMEOUT can drop it.
+#
+# It used to start at a track load and stop at a stop, so an IDLE player - the
+# state a switched-off endpoint leaves you in for days - had no watchdog at all.
+# Discovery now decides how hard to probe from this link state, so a zombie
+# "connected" would keep it quiet while the instance was long gone.
+# ---------------------------------------------------------------------------
+print "-- the status watchdog outlives the track --\n";
+{
+    my ($stop) = $src =~ /sub stop \{(.*?)\n\}/s;
+
+    ok(defined $stop && $stop !~ /_stopPolling/,
+       'stop() leaves the watchdog running - the link is still up');
+
+    my ($eos) = $src =~ /sub _endOfStream \{(.*?)\n\}/s;
+
+    ok(!defined $eos || $eos !~ /_stopPolling/,
+       'and so does the end of the playlist');
+
+    ok($src =~ /sub _statusWatchdog/,
+       'the watchdog is still there to be run');
+
+    # It must stay a re-arm, never a poll: only fire when nothing has arrived.
+    my ($dog) = $src =~ /sub _statusWatchdog \{(.*?)\n\}/s;
+
+    ok(defined $dog && $dog =~ /\$quiet\s*<\s*STATUS_WATCHDOG/,
+       'and it still sends only when the stream has actually gone quiet');
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

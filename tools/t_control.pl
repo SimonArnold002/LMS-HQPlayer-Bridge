@@ -166,5 +166,59 @@ print "-- the write buffer is octets, not characters --\n";
         'a partial write cuts by BYTE, so the remainder resumes on a byte boundary' );
 }
 
+# ---------------------------------------------------------------------------
+# A COMPLETED TCP HANDSHAKE IS NOT A WORKING LINK.
+#
+# hqplayerd ACCEPTS the socket and only then decides it cannot serve, which is
+# what it does whenever its output endpoint is missing - the NAA switched off,
+# say.  Its log says so in pairs:
+#
+#   Control connection from 192.168.1.234:42766
+#   clControlThread::HandleConnection(): std::exception
+#
+# The backoff used to reset in _connectResolved, so every one of those looked
+# like a success and the ladder never climbed.  MEASURED over one such spell:
+# 2,327 connections and 2,324 exceptions in 9.5 hours - four attempts inside
+# two seconds, every minute, for as long as the endpoint stayed off.
+# ---------------------------------------------------------------------------
+print "-- the reconnect ladder must climb against a peer that accepts and drops --\n";
+{
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Control.pm'); <> };
+    ( my $code = $src ) =~ s/^\s*#.*$//mg;
+
+    my ($resolved) = $code =~ /sub _connectResolved \{(.*?)\n\}/s;
+    my ($dispatch) = $code =~ /sub _dispatch \{(.*?)\n\}/s;
+
+    is( ( defined $resolved && $resolved !~ /backoff\}\s*=\s*BACKOFF_MIN/ ? 'no' : 'yes' ),
+        'no', 'the handshake does NOT reset the backoff' );
+
+    is( ( defined $dispatch && $dispatch =~ /backoff\}\s*=\s*BACKOFF_MIN/ ? 'yes' : 'no' ),
+        'yes', 'a message actually received from HQPlayer does' );
+
+    is( ( $code =~ /proven\}\s*=\s*0/ ? 'yes' : 'no' ),
+        'yes', 'and a dropped link goes back to unproven' );
+
+    # The ladder itself: nothing ever proves the link, so it must double to the
+    # cap rather than sitting at BACKOFF_MIN for ever.
+    my $min = Plugins::HQPlayerBridge::Control::BACKOFF_MIN();
+    my $max = Plugins::HQPlayerBridge::Control::BACKOFF_MAX();
+
+    my $ctl = bless { name => 'test', backoff => $min, closing => 0 },
+                    'Plugins::HQPlayerBridge::Control';
+
+    my @waits;
+    for ( 1 .. 7 ) {
+        Slim::Utils::Timers::_reset();
+        my $t0 = Time::HiRes::time();
+        $ctl->_scheduleReconnect;
+        my $t = Slim::Utils::Timers::_timers()->[0];
+        push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
+    }
+    Slim::Utils::Timers::_reset();
+
+    is( join( ',', @waits ), '2,4,8,16,32,60,60',
+        "it doubles from ${min}s and caps at ${max}s" );
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);
