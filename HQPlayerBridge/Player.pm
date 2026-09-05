@@ -676,14 +676,17 @@ sub _metadata {
         ( defined $gain ? ( album_gain => sprintf( '%.2f', $gain ) ) : () ),
     );
 
-    my $meta = '<metadata';
+    # $xml, not $meta: $meta above is the handler's metadata HASH and is still
+    # in scope. Reusing the name shadowed it and warned on every load, which
+    # is noise that can hide a real warning.
+    my $xml = '<metadata';
 
     while ( my ( $k, $v ) = splice( @f, 0, 2 ) ) {
         next if $v eq '';
-        $meta .= ' ' . $k . '="' . $e->($v) . '"';
+        $xml .= ' ' . $k . '="' . $e->($v) . '"';
     }
 
-    return $meta . '/>';
+    return $xml . '/>';
 }
 
 # The ReplayGain figure to hand HQPlayer, or undef to send nothing.

@@ -236,12 +236,144 @@ print "-- the watchdog is armed by the LINK, not by a track --\n";
 # a Template::Toolkit vmethod that throws takes the whole page down, and a
 # broken settings page fails quietly in LMS.
 print "-- the settings page's mime tidy --\n";
-is(Plugins::HQPlayerBridge::Settings::_shortMime('audio/x-flac'), 'FLAC',
+is(Plugins::HQPlayerBridge::Plugin::_shortMime('audio/x-flac'), 'FLAC',
    'audio/x-flac reads as FLAC');
-is(Plugins::HQPlayerBridge::Settings::_shortMime('audio/mpeg'), 'MPEG',
+is(Plugins::HQPlayerBridge::Plugin::_shortMime('audio/mpeg'), 'MPEG',
    'and a subtype with no x- prefix still loses the audio/');
-is(Plugins::HQPlayerBridge::Settings::_shortMime(undef), '(undef)',
+is(Plugins::HQPlayerBridge::Plugin::_shortMime(undef), '(undef)',
    'and no mime at all is undef, not an empty string the template would print');
+
+
+# THE MATERIAL/APPS FEED.  It exists so the settings page is reachable without
+# digging through LMS's server settings menu - a `weblink` row opens it in
+# Material's own iframe dialog.
+print "-- the apps feed --\n";
+{
+    package FeedClient;
+    sub new { bless { path => $_[1] || {} }, $_[0] }
+    sub hqRate { '44100' } sub hqBits { '16' } sub hqMime { 'audio/x-flac' }
+    sub hqPath { $_[0]->{path} }
+    sub hqTier { 1 }
+
+    package FeedCtl;
+    sub new { bless {}, shift } sub connected { 1 }
+}
+
+my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+%$reg = ( 'aa' => {
+    name     => 'HQPlayer (Test)',
+    control  => FeedCtl->new,
+    instance => { ip => '10.0.0.5' },
+    client   => FeedClient->new({
+        active_rate => '96000', active_bits => '24', active_mode => 'PCM',
+        active_filter => 'poly-sinc-gauss-long', active_shaper => 'TPDF',
+        process_speed => '30.306',
+    }),
+} );
+
+my $feed;
+Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+
+ok(ref $feed eq 'HASH', 'the feed calls its callback with a hash');
+my @i = @{ $feed->{items} || [] };
+
+is($i[0]->{name}, 'PLUGIN_HQPLAYER_SETTINGS', 'the settings row is FIRST - an action row belongs at the top');
+is($i[0]->{weblink}, '/plugins/HQPlayerBridge/settings/basic.html',
+   'and it weblinks to the page Settings.pm actually registers');
+is($i[0]->{type}, 'link', 'and it is a link, so Material opens it');
+
+is($i[1]->{name}, 'PLUGIN_HQPLAYER_REFRESH', 'a Refresh row follows it');
+is($i[1]->{nextWindow}, 'refresh',
+   "nextWindow=refresh - a browse page is a SNAPSHOT, and this re-renders it inline");
+{
+    my $got;
+    $i[1]->{url}->( undef, sub { $got = shift } );
+    is(scalar @{ $got->{items} }, '0',
+       'and it answers EMPTY, which is what makes Material re-render rather than push a page');
+}
+
+my @status = @i[2 .. $#i];
+is(scalar( grep { ($_->{type} // '') ne 'text' } @status ), '0',
+   'every status row is type=text - a non-playable row with no action gets one FORCED on by XMLBrowser');
+
+my $all = join '|', map { $_->{name} } @status;
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_SOURCE: 44100 Hz \/ 16 bit FLAC/ ), 'the source format is reported');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_OUTFORMAT: 96000 Hz \/ 24 bit PCM/ ), 'and the output format');
+ok(scalar( $all =~ /poly-sinc-gauss-long.*TPDF.*30\.3/ ),
+   'and the processing chain with the speed (labelled, via the shared formatter)');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_CONNECTED - 10\.0\.0\.5:4321/ ), 'and the link state with the address');
+
+# A player that has reported nothing must not produce empty rows.
+$reg->{aa}->{client} = FeedClient->new({});
+{
+    no warnings 'redefine';
+    local *FeedClient::hqRate = sub { undef };
+    local *FeedClient::hqMime = sub { undef };
+    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+}
+is(scalar( grep { ($_->{name} // '') =~ /:\s*$/ } @{ $feed->{items} } ), '0',
+   'a silent instance produces no half-empty rows');
+
+%$reg = ();
+
+
+# THE SIGNAL PATH IS FORMATTED ONCE. Three surfaces show these strings - the
+# Apps feed, the settings page and the `signalpath` poll - and they must never
+# disagree about what "Processing" reads like, so all three call signalPathFor.
+print "-- signalPathFor: one formatter, three surfaces --\n";
+{
+    package PathClient;
+    sub new  { bless { p => $_[1], tier => $_[2] }, $_[0] }
+    sub hqRate { '44100' } sub hqBits { '16' } sub hqMime { 'audio/x-flac' }
+    sub hqPath { $_[0]->{p} } sub hqTier { $_[0]->{tier} }
+    package PathCtl;
+    sub new { bless {}, shift } sub connected { 1 }
+}
+
+my $bridge = {
+    name     => 'HQPlayer (Test)',
+    control  => PathCtl->new,
+    instance => { ip => '10.0.0.5' },
+    client   => PathClient->new({
+        active_rate => '96000', active_bits => '24', active_mode => 'PCM',
+        active_filter => 'poly-sinc-gauss-long', active_shaper => 'TPDF',
+        process_speed => '30.306',
+    }, 1),
+};
+
+my $p = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef, $bridge );
+is($p->{source}, '44100 Hz / 16 bit FLAC', 'source is the <metadata/> child half');
+is($p->{output}, '96000 Hz / 24 bit PCM',  'output is the <Status/> root half');
+is($p->{processing},
+   'PLUGIN_HQPLAYER_FILTER poly-sinc-gauss-long - PLUGIN_HQPLAYER_SHAPER TPDF - 30.3PLUGIN_HQPLAYER_SPEED',
+   'processing joins filter, shaper and speed');
+is($p->{tier}, 'PLUGIN_HQPLAYER_TIER1', 'the tier prose follows hqTier');
+is($p->{connected}, 'PLUGIN_HQPLAYER_CONNECTED - 10.0.0.5:4321', 'and the link state carries the address');
+
+# A key must be ABSENT, not empty - a caller tests it to skip the row rather
+# than drawing a label with nothing after it.
+my $q = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef,
+    { control => PathCtl->new, instance => {}, client => PathClient->new({}, undef) } );
+ok(!exists $q->{output},     'no output reported means the key is ABSENT, not empty');
+ok(!exists $q->{processing}, 'and so does no processing');
+ok(!exists $q->{tier},       'and no tier');
+
+# A bridge with no player at all must not die.
+my $none = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef, { instance => {} } );
+is(scalar(keys %$none), '0', 'a bridge with no player yields an empty path, not a crash');
+
+# The feed and the settings page must render the SAME strings - that is the
+# whole point of the shared formatter.
+{
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    %$reg = ( aa => $bridge );
+    my $feed;
+    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+    my $names = join '|', map { $_->{name} } @{ $feed->{items} };
+    ok(scalar( index($names, $p->{source}) >= 0 ), 'the feed renders the formatter output verbatim');
+    ok(scalar( index($names, $p->{processing}) >= 0 ), 'processing included');
+    %$reg = ();
+}
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

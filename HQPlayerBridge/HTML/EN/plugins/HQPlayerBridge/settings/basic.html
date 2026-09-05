@@ -53,28 +53,20 @@
             </tr>
 
             <tr>
-                <td class="prefHead">[% "PLUGIN_HQPLAYER_STREAM" | string %]</td>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_SOURCE" | string %]</td>
+                <td class="prefBody"><span id="hqp-source-[% loop.index %]">[% IF b.source %][% b.source | html %][% ELSE %]&mdash;[% END %]</span></td>
+            </tr>
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_OUTFORMAT" | string %]</td>
+                <td class="prefBody"><span id="hqp-output-[% loop.index %]">[% IF b.output %][% b.output | html %][% ELSE %]&mdash;[% END %]</span></td>
+            </tr>
+
+            <tr>
+                <td class="prefHead">[% "PLUGIN_HQPLAYER_PROCESSING" | string %]</td>
                 <td class="prefBody">
-                    [% IF b.rate %][% b.rate | html %] Hz[% IF b.bits %] / [% b.bits | html %] bit[% END %][% IF b.mime %] [% b.mime | html %][% END %]
-                        [% IF b.outrate %]
-                            &rarr; [% b.outrate | html %] Hz[% IF b.outbits %] / [% b.outbits | html %] bit[% END %][% IF b.outmode %] [% b.outmode | html %][% END %]
-                        [% END %]
-                    [% ELSE %]&mdash;[% END %]
-                    [% IF b.filter OR b.shaper OR b.speed %]
-                        <span class="prefDesc">
-                        [% IF b.filter %][% "PLUGIN_HQPLAYER_FILTER" | string %] [% b.filter | html %][% END %]
-                        [% IF b.shaper %] &middot; [% "PLUGIN_HQPLAYER_SHAPER" | string %] [% b.shaper | html %][% END %]
-                        [% IF b.speed %] &middot; [% b.speed | html %][% "PLUGIN_HQPLAYER_SPEED" | string %][% END %]
-                        </span>
-                    [% END %]
-                    [% IF b.tier %]
-                        <span class="prefDesc">
-                        [% IF b.tier == 1 %][% "PLUGIN_HQPLAYER_TIER1" | string %]
-                        [% ELSIF b.tier == 3 %][% "PLUGIN_HQPLAYER_TIER3" | string %]
-                        [% ELSIF b.tier == 5 %][% "PLUGIN_HQPLAYER_TIER5" | string %]
-                        [% ELSE %][% "PLUGIN_HQPLAYER_TIER4" | string %][% END %]
-                        </span>
-                    [% END %]
+                    <span id="hqp-processing-[% loop.index %]">[% IF b.processing %][% b.processing | html %][% ELSE %]&mdash;[% END %]</span>
+                    <span class="prefDesc" id="hqp-tier-[% loop.index %]">[% b.tier | html %]</span>
                 </td>
             </tr>
 
@@ -97,5 +89,80 @@
     <p class="prefDesc">[% "PLUGIN_HQPLAYER_BRIDGE" | string %] v[% hqp_version | html %]</p>
 
 </div>
+
+[% IF hqp_bridges.size %]
+<script type="text/javascript">
+// Keep the signal path live without reloading the page.
+//
+// WHY CLIENT-SIDE: Material loads this page in an iframe and swallows LMS's
+// server-side `warning` channel, so anything that has to update in place has
+// to do it here. The Apps feed cannot do this at all - Material renders a
+// browse response once and never polls it, which is why that surface has a
+// manual Refresh row instead.
+//
+// WHY IT IS NOT A FLOOD:
+//   * the values are ALREADY in the server's memory, off the <Status/> push
+//     the plugin subscribes to. A poll reads a hash - NOTHING goes out to
+//     HQPlayer on 4321, so the daemon sees no traffic at all from this.
+//   * it only runs while this page is open, and dies with the page.
+//   * it stops while the tab or the Material dialog is hidden.
+//   * 2s matches HQPlayer's own ~1/s push - faster cannot be fresher.
+//   * it backs off on error and gives up rather than hammering a server that
+//     is restarting.
+(function () {
+    var PERIOD = 2000, MAX_ERRORS = 5, errors = 0, timer = null;
+
+    // The server sends the SAME display strings the page was rendered with,
+    // so this only ever assigns text. It never parses a formatted row apart -
+    // that would break the moment the strings are translated.
+    function apply(loop) {
+        for (var i = 0; i < loop.length; i++) {
+            var row = loop[i];
+            ['source', 'output', 'processing', 'tier'].forEach(function (k) {
+                var el = document.getElementById('hqp-' + k + '-' + i);
+                if (!el) return;
+                var v = row[k];
+                el.textContent = (v === undefined || v === null || v === '')
+                    ? (k === 'tier' ? '' : '\u2014') : v;
+            });
+        }
+    }
+
+    function poll() {
+        if (document.hidden) return;          // nothing to see, so ask nothing
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/jsonrpc.js', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.timeout = 5000;
+
+        xhr.onload = function () {
+            try {
+                var r = JSON.parse(xhr.responseText).result;
+                if (r && r.bridges_loop) { apply(r.bridges_loop); errors = 0; }
+            } catch (e) { errors++; }
+        };
+        xhr.onerror = xhr.ontimeout = function () { errors++; };
+        xhr.onloadend = function () {
+            if (errors >= MAX_ERRORS) { clearInterval(timer); timer = null; }
+        };
+
+        xhr.send(JSON.stringify({
+            id: 1, method: 'slim.request',
+            params: ['', ['hqplayerbridge', 'signalpath']]
+        }));
+    }
+
+    if (window.XMLHttpRequest && document.getElementById('hqp-source-0')) {
+        timer = setInterval(poll, PERIOD);
+        // Catch up immediately when the page becomes visible again rather
+        // than making the user wait out a period.
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden && timer) poll();
+        });
+    }
+}());
+</script>
+[% END %]
 
 [% PROCESS settings/footer.html %]

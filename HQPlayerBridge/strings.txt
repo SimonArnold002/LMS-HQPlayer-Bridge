@@ -22,8 +22,20 @@ PLUGIN_HQPLAYER_OUTPUT
 PLUGIN_HQPLAYER_OUTPUT_DESC
 	EN	The transport HQPlayer has selected, as its own numeric id. HQPlayer's control API does not report the output device or NAA by name, so the name of the endpoint it is feeding can only be seen in HQPlayer itself.
 
-PLUGIN_HQPLAYER_STREAM
-	EN	Current stream
+PLUGIN_HQPLAYER_SETTINGS
+	EN	Settings
+
+PLUGIN_HQPLAYER_REFRESH
+	EN	Refresh
+
+PLUGIN_HQPLAYER_SOURCE
+	EN	Source
+
+PLUGIN_HQPLAYER_OUTFORMAT
+	EN	Output format
+
+PLUGIN_HQPLAYER_PROCESSING
+	EN	Processing
 
 PLUGIN_HQPLAYER_FILTER
 	EN	Filter

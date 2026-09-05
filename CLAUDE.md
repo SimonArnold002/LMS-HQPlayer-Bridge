@@ -52,7 +52,7 @@ then plays it.
 
 | File | Role |
 |---|---|
-| `HQPlayerBridge/Plugin.pm` | Lifecycle, discovery wiring, player create/teardown |
+| `HQPlayerBridge/Plugin.pm` | Lifecycle, discovery wiring, player create/teardown, the Apps feed |
 | `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list |
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
@@ -411,6 +411,10 @@ point:**
 Measured live 2026-09-05: a `44100/16` FLAC going out as `96000/24` PCM through
 `poly-sinc-gauss-long` + `TPDF` at `30.3x`.
 
+**Three rows, not one** (0.2.56, Simon's call - the single packed row was
+messy): `Source`, `Output format`, and `Processing`, with the tier prose as the
+description under `Processing`. `PLUGIN_HQPLAYER_STREAM` is retired.
+
 **`active_filter` and `active_shaper` arrive as NAMES**, so there is no
 `GetFilters`/`GetShapers` id lookup to do. `<State/>` carries only the numeric
 ids (`filter1x=37`, `filterNx=40`, `shaper=7`) and *would* need one — which is
@@ -424,6 +428,75 @@ rather than a copy of both dropdowns in HQPlayer's UI.
 until something is stored). A push that omits the fields leaves the last known
 values alone, and nothing is cleared on stop — the same way `hqRate`/`hqBits`
 have always behaved.
+
+### Live signal path: ONE formatter, three surfaces (0.2.59)
+
+`Plugin::signalPathFor` formats the display strings, and **the Apps feed, the
+settings page and the `signalpath` query all render what it returns.** The
+template does no formatting at all. Three surfaces showing the same facts is
+exactly where one concept grows three carriers and they drift; there is one.
+
+A key is **absent, not empty**, when HQPlayer has not reported it, so a caller
+tests the key and skips the row rather than drawing a label with nothing after
+it.
+
+**The settings page polls; the Apps feed cannot.** Material renders a browse
+response once and never polls it - hence the manual Refresh row there
+(`nextWindow => 'refresh'`, 0.2.58). The settings page is ordinary HTML in an
+iframe, so a small poller updates it in place, the same client-side route LBF
+uses because Material swallows the server-side `warning` channel.
+
+**Why polling is not a flood, and costs HQPlayer NOTHING:** every value is
+already in memory from the `<Status/>` push the plugin subscribes to whether
+anyone is looking or not. A poll reads a hash - **no command goes out on 4321**.
+The poller runs only while the page is open, stops on `document.hidden`, uses a
+2s period (HQPlayer pushes ~1/s, so faster cannot be fresher), and gives up
+after 5 consecutive errors rather than hammering a restarting server.
+
+**The query returns the formatted strings, not raw fields**, so the JS only
+assigns `textContent`. Parsing a formatted row apart in JS would break the
+moment anyone translates the strings.
+
+### The Apps feed: how the settings page is reached from Material (0.2.57)
+
+**The plugin is `Slim::Plugin::OPMLBased`, not `Slim::Plugin::Base`, for exactly
+one reason:** OPMLBased is what registers a top-level app entry, and that entry
+is the only way to reach the settings page from Material without going through
+LMS's server settings menu, which is several taps deep. Reported by Simon
+2026-09-05: *"its hard to access from the main server menu"*.
+
+`topLevel` serves a read-only feed:
+
+* **the settings row FIRST**, `type => 'link'` with
+  `weblink => '/plugins/HQPlayerBridge/settings/basic.html'` — Material opens
+  that in its own iframe dialog. The same pattern LMS-Listen-to-Later and
+  LMS-ListenBrainz-New-Releases use.
+* then, per instance, the name, the link state with the address, and the same
+  Source / Output format / Processing facts the settings page shows.
+
+**Every status row is `type => 'text'`.** A non-playable item with no action
+still gets an `addAction` forced onto it by XMLBrowser, which is how a feed
+"divider" ends up navigating somewhere when tapped — `text` avoids it outright.
+
+**`menu` is DISCARDED when `is_app` is set** - checked against LMS's own
+`Slim/Plugin/OPMLBased.pm`, which does `if ($args{is_app}) { $args{menu} =
+'apps' }` before `initJive`, `initCLI` and `webPages` read it. So the value
+passed in never survives, and the four siblings that pass `'radios'` land under
+Apps because of `is_app`, not because of `'radios'`. Do not read meaning into
+that argument.
+
+**Why OPMLBased at all:** `Slim::Plugin::Base` has no menu mechanism whatsoever
+- it is `initPlugin`/`shutdownPlugin`/`getDisplayName` and nothing else - so
+there is no way to get a Material entry from it. OPMLBased `use base
+'Slim::Plugin::Base'`, so it is a strict superset and costs nothing that was
+already working; what it adds is `initJive` (the Material/Jive menu entry) and
+`initCLI` (the `[tag, 'items', ...]` dispatch Material queries). The only
+alternative is calling `Slim::Control::Jive::registerPluginMenu` and
+`addDispatch` by hand, which is reimplementing OPMLBased with less testing.
+
+**`_shortMime` lives in `Plugin.pm`, not `Settings.pm`.** Both surfaces need it
+and `Settings.pm` is only `require`d under `main::WEBUI` — calling it from the
+feed would die on a headless build.
 
 ### Material: why this is settings-page only
 
@@ -2631,6 +2704,70 @@ exactly. `<metadata>`'s `song`/`artist`/`album` are therefore belt-and-braces;
 JPEG whichever way the track was loaded, because it is HQPlayer's own web
 surface — not the channel that reaches the NAA. Judge artwork by
 `<PlaylistGet picture="1"/>`, which is the item HQPlayer forwards.
+
+## hqplayerd "crashes": it is NOT crashing, and it is not the plugin
+
+Investigated 2026-09-05 after Simon reported the daemon "keeps crashing".
+**Three separate things were being conflated.** Do not re-run this from scratch.
+
+**1. It never crashed.** macOS writes a `.ips` crash report for any segfault and
+there are **none** for hqplayerd - only a `cpu_resource.diag` from 2026-08-30
+(52% avg CPU over 175s, `Action taken: none`, which is normal for DSD256 +
+convolution). Every session ends with an orderly `Server stopping...` ->
+`Metering disabled` -> `Engine stopping...`.
+
+**2. Every stop was a Dock-issued FORCE QUIT, and the process exited cleanly.**
+From the system log (`/usr/bin/log show`, absolute path - `log` is shadowed by a
+shell function on this Mac):
+
+```
+15:01:44.586  Dock[651] [com.apple.libquit] hqplayerd [89085] force quit (caller responsible for termination)
+15:01:44.590  Dock[651] hqplayerd [89085] calling back to client to terminate
+15:01:45.284  launchd  exited due to exit(0), ran for 1970076ms
+```
+
+Identical at 12:31:59 and 14:28:38. `exit(0)` every time. The CrashReporter
+plist's `ForceQuitDate` is the same event **in UTC** - do not read it as a
+separate incident, which this file did once. No hang was recorded either: the
+`watchdogd` / WindowServer lines near those timestamps are routine noise and
+never name hqplayerd.
+
+**3. The REAL fault is hqplayerd's control thread wedging**, which is what makes
+playback stop and prompts the restart that looked like a crash. Two signatures:
+
+| signature | meaning |
+|---|---|
+| `clControlThread::HandleConnection(): std::exception` | the socket is accepted and never "starts" - no `Control started`, no `Control ended` |
+| `clControlThread::ParseMsg(): std::exception` | an established link rejects a message, and `PlaylistAdd` is the one seen failing |
+
+Once wedged it stays wedged; a restart clears it. In one session 32 connections
+were accepted and only **6 ever started**.
+
+**Why the plugin is not the cause:**
+
+* **The first failure of the 11:46 session was triggered by a bare
+  `<VolumeRange/>` probe from another machine**, with the plugin uninvolved.
+  A daemon that throws on the simplest well-formed connection from an
+  uninvolved host is broken on its own account.
+* The commands that drew `ParseMsg` are plain-ASCII tier 1 loads
+  (`"Gold on the Leaves" / "Luluc" / "Passerby"`). **Replayed verbatim on a
+  healthy daemon they answer `result="OK"`** - so does the curly apostrophe
+  (U+2019) that was briefly suspected, and `cover=` / `album_gain=` alone.
+* The reconnect backoff is correct and was measured doing 2 -> 4 -> 8 -> 16 ->
+  32 -> 60s.
+
+**What the plugin DOES make worse, and should fix.** A failed `PlaylistAdd`
+becomes `PROBLEM_OPENING`, LMS skips to the next track, that load fails too -
+**five full `Stop/Stop/PlaylistClear/PlaylistAdd` cycles in under a second** at
+15:01:29. It does not cause the wedge but it hammers a daemon that is already
+sick. **A circuit breaker after N consecutive load failures is worth building
+whatever the root cause turns out to be.** Not built yet.
+
+**The trigger is still unknown** - nothing is logged between the last healthy
+event and the first exception in any of three sessions. **To catch it, leave a
+wedged daemon RUNNING** and probe it: whether `Status`/`GetInfo` still answer
+while `PlaylistAdd` throws separates "the parser is broken" from "the playlist
+engine is broken", and that is the fork logs cannot settle.
 
 ## Still unverified
 

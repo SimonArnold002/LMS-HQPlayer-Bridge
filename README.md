@@ -104,18 +104,30 @@ The volume you start with is **HQPlayer's**, not one the plugin asserts — its 
 
 ### Seeing what HQPlayer is doing
 
-The plugin's settings page shows the **signal path** for each instance — the
+You'll find **HQPlayer Bridge under Apps** in Material (pin it to the home
+screen if you use it often) — one tap for the settings page, and the live status
+of every instance underneath it.
+
+The settings page shows the **signal path** for each instance — the
 format Lyrion handed over, the format HQPlayer is feeding its endpoint, the
 filter and shaper actually in use, and how fast it is processing:
 
 ```
-44100 Hz / 16 bit FLAC  →  96000 Hz / 24 bit PCM
-Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime
+Source          44100 Hz / 16 bit FLAC
+Output format   96000 Hz / 24 bit PCM
+Processing      Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime
 ```
 
 HQPlayer reports the filter it is *really* using, so a 44.1 kHz album shows your
-1x filter and a 96 kHz one your Nx filter. All of it rides the status stream the
-plugin is already listening to, so it costs nothing extra.
+1x filter and a 96 kHz one your Nx filter.
+
+**The page updates itself while you watch** — it refreshes about every two
+seconds, pauses when the page isn't visible, and stops when you close it.
+It costs HQPlayer nothing: the plugin is already listening to HQPlayer's status
+stream, so the page only ever asks Lyrion for figures it already has.
+
+The Apps entry shows the same information, but Material draws a browse page once
+and never refreshes it, so there's a **Refresh** row there instead.
 
 ### Pause from either end
 
