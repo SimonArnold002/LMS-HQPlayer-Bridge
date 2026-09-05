@@ -1752,8 +1752,8 @@ player's prefs once; the thrash cost them every round.
 
 ## Testing without LMS
 
-`sh tools/run_checks.sh` — syntax-checks all seven modules against the stub Slim
-tree, runs 505 assertions across five files, and sweeps called-vs-defined subs.
+`sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
+tree, runs 487 assertions across four files, and sweeps called-vs-defined subs.
 
 | file | covers |
 |---|---|
@@ -2539,7 +2539,8 @@ $req->{cb}->( undef,  $raw );   # result="Error"
 $req->{cb}->( $attrs, $raw );   # OK
 ```
 
-`UPnP.pm` and `SimpleAsyncHTTP` use the opposite shape, `($res, $err)`, and
+`SimpleAsyncHTTP` uses the opposite shape, `($res, $err)` — as did `UPnP.pm`,
+which is where the confusion came from before it was deleted in 0.2.54 — and
 0.2.13 shipped with `_queueTrack` reading the control callback that way. Every
 **successful** `PlaylistAdd` was therefore logged as
 `HQPlayer would not accept the track URI: <PlaylistAdd result="OK"/>`, reported
