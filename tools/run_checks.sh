@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 rm -rf Plugins && mkdir -p Plugins && ln -sfn ../../HQPlayerBridge Plugins/HQPlayerBridge
 
 echo "== syntax =="
-for m in Control Discovery Stream UPnP Player Plugin Settings; do
+for m in Control Discovery Stream Player Plugin Settings; do
     perl -I. syncheck.pl "Plugins::HQPlayerBridge::$m"
 done
 
@@ -21,7 +21,6 @@ echo "== unit tests =="
 perl -I. t_control.pl
 perl -I. t_player.pl
 perl -I. t_stream.pl
-perl -I. t_upnp.pl
 perl -I. t_plugin.pl
 
 echo

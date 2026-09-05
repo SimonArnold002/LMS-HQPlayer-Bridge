@@ -43,10 +43,7 @@
             <tr>
                 <td class="prefHead">[% "PLUGIN_HQPLAYER_VOLUME" | string %]</td>
                 <td class="prefBody">
-                    [% IF b.volfixed %]
-                        <span style="font-weight:bold">[% "PLUGIN_HQPLAYER_VOLUME_FIXED" | string %]</span>
-                        <span class="prefDesc">[% "PLUGIN_HQPLAYER_VOLUME_FIXED_DESC" | string %]</span>
-                    [% ELSIF b.volmin.defined %]
+                    [% IF b.volmin.defined %]
                         [% b.volmin | html %] dB &mdash; [% b.volmax | html %] dB
                         <span class="prefDesc">[% b.volstep | html %] dB [% "PLUGIN_HQPLAYER_VOLUME_STEP" | string %][% IF b.voldb.defined %], [% "PLUGIN_HQPLAYER_VOLUME_NOW" | string %] [% b.voldb | html %] dB[% END %]</span>
                     [% ELSE %]

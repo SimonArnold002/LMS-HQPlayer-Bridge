@@ -36,7 +36,6 @@ use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Discovery;
 use Plugins::HQPlayerBridge::Player;
 use Plugins::HQPlayerBridge::Stream;
-use Plugins::HQPlayerBridge::UPnP;
 
 # The version is READ from install.xml, never restated here.  A second copy is
 # a copy that goes stale: this was a hand-maintained constant sitting at 0.2.3
@@ -326,26 +325,8 @@ sub _create {
         },
     );
 
-    # The UPnP renderer runs alongside the XML control link for ONE thing: the
-    # volume RANGE.  The control API has <Volume value="-53"/>, <VolumeUp/> and
-    # <VolumeDown/> but no way to ask what the range is, and the range is a
-    # user setting - so RenderingControl's GetVolumeDBRange is read once at
-    # connect and nothing else here depends on UPnP.
-    #
-    # It used to carry the track load as well, on the belief that DIDL was the
-    # only way to get artwork to the endpoint.  It is not: PlaylistAdd takes a
-    # <metadata cover="..."/> child that produces a byte-identical playlist
-    # item.  See _metadata in Player.pm.
-    my $upnp = Plugins::HQPlayerBridge::UPnP->new(
-        ip   => $inst->{ip},
-        name => $name,
-    );
-
     $client->hqControl($ctl);
-    $client->hqUPnP($upnp);
     $client->hqInstance($inst);
-
-    $upnp->describe;
 
     $bridges{$id} = {
         instance => $inst,
@@ -376,10 +357,6 @@ sub _onLinkState {
         # closing the socket, and discovery reads that link state to decide how
         # hard to keep probing - see _statusWatchdog in Player.pm.
         $client->_startPolling;
-
-        # Re-read the renderer description if it was not reachable earlier.
-        my $upnp = $client->hqUPnP;
-        $upnp->describe if $upnp && !$upnp->ready;
     }
     else {
         $client->_stopPolling;
@@ -404,12 +381,6 @@ sub _teardown {
     if ( my $client = $b->{client} ) {
         eval {
             $client->_stopPolling;
-
-            # The renderer owns timers of its own - a describe retry, and the
-            # Play retry loop - which would otherwise keep firing at an
-            # instance that has gone away.
-            my $upnp = $client->hqUPnP;
-            $upnp->close if $upnp;
 
             $client->controller->stop if $client->controller;
         };

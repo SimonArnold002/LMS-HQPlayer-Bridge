@@ -845,35 +845,79 @@ print "-- a level set outside LMS is always followed --\n";
     $c->hqVolDb(-40);
 }
 
-# Some HQPlayer setups do not attenuate at all - the DAC or the amp holds the
-# volume - and the LMS slider must sit at the top rather than pretend.
+# FIXED VOLUME IS LMS'S SWITCH ALONE, AND THE PLUGIN NEVER WRITES IT.
+#
+# HQPlayer's own "fixed volume" is a startup LEVEL, not a lock - measured
+# 2026-09-05 with <fixed volume="-3"/> applied: <VolumeRange/> still answered
+# enabled="1" min="-100" max="0" and the volume stayed changeable.  So there is
+# no HQPlayer-side state to detect, and the detectors that used to infer one
+# (a zero-width range, and three sends that changed nothing) are gone along
+# with _setFixed, which wrote the user's digitalVolumeControl pref to 0.
 print "-- fixed volume --\n";
 my $sp = Slim::Utils::Prefs::preferences('server');
-@sent = (); @ex = ();
-$c->_setFixed(1);
-is($c->hqVolFixed, '1', 'a zero-width range locks the volume');
-is(join(',', @ex), 'mixer volume 100', 'and parks the LMS slider at the top');
-is($sp->client($c)->get('digitalVolumeControl'), '0',
-   'via the pref LMS turns into use_volume_control:0, which the skins disable the slider on');
-@sent = ();
-$c->volume(40);
-is(scalar(@sent), '0', 'nothing is sent to HQPlayer while it is not attenuating');
-$c->_setFixed(0);
-is($sp->client($c)->get('digitalVolumeControl'), '1', 'and it unlocks again');
 
-# LMS's own "Volume Control: fixed" radio means the same thing, and is the
-# user's, not ours: honour it, and never write it back to variable.
+ok(!Plugins::HQPlayerBridge::Player->can('_setFixed'),
+   'there is no _setFixed - nothing in the plugin writes digitalVolumeControl');
+ok(!Plugins::HQPlayerBridge::Player->can('_watchForFixed'),
+   'and no _watchForFixed to infer a state HQPlayer cannot be in');
+{
+    my $mod = do { local (@ARGV, $/) = ('../HQPlayerBridge/Player.pm'); <> };
+    ok(scalar( $mod !~ /set\(\s*'digitalVolumeControl'/ ),
+       'the pref is READ but never SET anywhere in Player.pm');
+}
+
+# The user's own "Volume Control: fixed" radio is honoured, and it means one
+# thing: LMS stops driving HQPlayer's volume.
 $sp->client($c)->set('digitalVolumeControl', 0);
 @sent = ();
 $c->volume(35);
-is(scalar(@sent), '0', "a user's own fixed-volume setting stops us sending too");
-$c->_setFixed(1); $c->_setFixed(0);
-is($sp->client($c)->get('digitalVolumeControl'), '0',
-   'and a 0 we did not set is never written back to 1');
+is(scalar(@sent), '0', "a user's own fixed-volume setting stops us sending");
 $sp->client($c)->set('digitalVolumeControl', 1);
+@sent = ();
+$c->hqVolDb(-40);
+$c->volume(35);
+ok(scalar(@sent) > 0, 'and setting it back to variable lets the level through again');
 
-# The range is READ, not assumed.  VERIFIED live: HQPlayer does implement UPnP
-# GetVolumeDBRange even though the XML control API calls it an unknown command.
+# THE RANGE COMES OFF THE CONTROL SOCKET, IN PLAIN dB.
+#
+# <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/> - verified live
+# 2026-08-28 and 2026-09-05 against engine 6.0.4.  UPnP's GetVolumeDBRange
+# answered the same range in 1/256 dB units (MinValue -25600) and needed a
+# fixed-point discriminator; there must be no trace of that here.
+print "-- the range over <VolumeRange/> --\n";
+{
+    @sent = (); @sentCb = ();
+    $c->hqVolMin(undef); $c->hqVolMax(undef);
+    $c->refreshVolumeRange;
+    is(join(',', @sent), '<VolumeRange/>',
+       'the range is asked for on the control socket, not over UPnP');
+
+    my $cb = shift @sentCb;
+    $cb->({ adaptive => 1, enabled => 1, max => 0, min => -100 }, '');
+    is($c->hqVolMin, '-100', 'min is stored as PLAIN dB');
+    is($c->hqVolMax, '0',    'and so is max');
+
+    # The UPnP fixed-point discriminator must not have come across with it.
+    # (_volQuantum's 1/256 is a DIFFERENT thing - the binary-fraction quantum
+    # that survives HQPlayer's 32-bit float round trip - and stays.)
+    my $mod = do { local (@ARGV, $/) = ('../HQPlayerBridge/Player.pm'); <> };
+    ok(scalar( $mod !~ /DB_FIXED_POINT|DB_PLAUSIBLE/ ),
+       'the 1/256 fixed-point discriminator did not come across from UPnP');
+
+    # enabled is measured NOT to be a fixed-volume flag, so nothing may act on
+    # it: an instance reporting enabled="0" must still be treated as variable.
+    @sent = (); @sentCb = ();
+    $c->refreshVolumeRange;
+    $cb = shift @sentCb;
+    $cb->({ adaptive => 0, enabled => 0, max => 0, min => -60 }, '');
+    is($sp->client($c)->get('digitalVolumeControl'), '1',
+       'enabled="0" does not touch the volume pref - it is not a fixed flag');
+    is($c->hqVolMin, '-60', 'but the range it carries is still read');
+
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+}
+
+# The range is READ, not assumed - over <VolumeRange/> on the control socket.
 print "-- learning the range --\n";
 @ex = ();
 $c->hqVolDb(-30);
@@ -891,17 +935,23 @@ $c->_onStatus({ state => 0, position => 0, volume => -60 }, '');
 is($c->hqVolMin, '-60', 'a clamped reply teaches us the real floor');
 is($c->hqVolMax, '0',   'and leaves the ceiling alone');
 
-# The other fixed-volume tell: it accepts the command and does not move.
+# A level that does not move used to be read as "HQPlayer is fixed" after three
+# strikes, which then wrote the user's pref.  It must now do nothing at all.
 $c->hqVolMin(-100); $c->hqVolMax(0);
-$c->hqVolDb(-50); $c->hqVolMissed(0); $c->hqVolFixed(0);
-for ( 1 .. 3 ) {
+$c->hqVolDb(-50);
+@ex = ();
+for ( 1 .. 5 ) {
     $c->hqVolSent(-70);
     $c->hqVolSentAt( Time::HiRes::time() - 5 );
     $c->_followVolume(-50);
 }
-is($c->hqVolFixed, '1', 'three sends that change nothing mark the volume fixed');
-$c->_setFixed(0);
-$sp->client($c)->set('digitalVolumeControl', 1);
+is($sp->client($c)->get('digitalVolumeControl'), '1',
+   'five sends that change nothing leave the user\'s pref alone');
+# It keeps FOLLOWING the level HQPlayer reports, which is the point: the volume
+# on startup is whatever HQPlayer holds - its own software level, or the device
+# volume on an NAA like the Eversolo - and LMS mirrors it rather than asserting.
+is(join(',', @ex), join(',', ('mixer volume 50') x 5),
+   'and keep mirroring HQPlayer\'s own level instead of parking the slider');
 $c->hqVolDb(undef);
 
 print "-- fade_volume --\n";
@@ -927,21 +977,6 @@ is($c->_tempVolume, '(undef)',
 # ---------------------------------------------------------------------------
 print "-- track changes --\n";
 {
-    package LoadUPnP;
-    sub new   { bless { ready => 1, cancels => 0, uris => [] }, shift }
-    sub ready { $_[0]->{ready} }
-    sub cancelPlay { $_[0]->{cancels}++ }
-    sub setURI {
-        my ( $s, $url, $didl, $cb ) = @_;
-        push @{ $s->{uris} }, $url;
-        $s->{didl}  = $didl;
-        $s->{uriCb} = $cb;
-    }
-    sub playWhenReady { $_[1] and $_[0]->{playCb} = $_[1] }
-    # the daemon answering, whenever the test says it does
-    sub finishURI  { my $cb = delete $_[0]->{uriCb};  $cb->( 'ok', undef ) if $cb }
-    sub finishPlay { my $cb = delete $_[0]->{playCb}; $cb->( 'ok', undef ) if $cb }
-
     package LoadController;
     sub new { bless { song => $_[1], calls => [] }, $_[0] }
     sub song { $_[0]->{song} }
@@ -961,12 +996,10 @@ print "-- track changes --\n";
     }
 }
 
-my $up  = LoadUPnP->new;
 my $one = FakeSong->new( FakeTrack->new({ title=>'One', id=>101, ct=>'flc', secs=>200, url=>'file:///one.flac' }) );
 my $two = FakeSong->new( FakeTrack->new({ title=>'Two', id=>202, ct=>'flc', secs=>200, url=>'file:///two.flac' }) );
 
 my $p = Plugins::HQPlayerBridge::Player->new('02:11:22:33:44:55', 'paddr', 1.0, undef, 12, undef);
-$p->hqUPnP($up);
 # _queueTrack refuses to load without a control link now that the load runs on
 # it.  _send itself is mocked above, so this only has to be present and true.
 $p->hqControl( bless {}, 'FakeCtl' );
@@ -1108,7 +1141,6 @@ print "-- a load that genuinely fails --\n";
     # still reach the controller.  Without this the guard above could simply be
     # inverted and both would pass.
     my $fp = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:55', 'paddr', 1.0, undef, 12, undef);
-    $fp->hqUPnP( LoadUPnP->new );
     $fp->hqControl( bless {}, 'FakeCtl' );
     my $fc = LoadController->new($one);
     $fp->controller($fc);
@@ -1138,7 +1170,6 @@ print "-- the start deadline: an ack that never becomes playback --\n";
     my $mk = sub {
         my $mac = shift;
         my $pl = Plugins::HQPlayerBridge::Player->new($mac, 'paddr', 1.0, undef, 12, undef);
-        $pl->hqUPnP( LoadUPnP->new );
         $pl->hqControl( bless {}, 'FakeCtl' );
         my $cc = LoadController->new($one);
         $pl->controller($cc);
@@ -1240,22 +1271,24 @@ $p->play({ controller => LoadController->new($two) });
 my $gen = $p->hqGen;
 $p->stop;
 ok($p->hqGen != $gen, 'stop() supersedes the load that was in flight');
-is($up->{cancels}, '3', 'and the UPnP Play retry loop is cancelled each time');
 
 $p->bufferReady(0);
 $lc->{calls} = [];
-$up->finishURI;
-$up->finishPlay;
+# NOW LET THE DAEMON ANSWER THE LOAD THAT WAS SUPERSEDED.  Until 0.2.54 this
+# drained a UPnP stub instead (finishURI/finishPlay), and production had
+# stopped calling setURI/playWhenReady in 0.2.13 - so its callbacks were never
+# armed, the calls were no-ops, and this assertion proved nothing for 40
+# builds.  The load runs on the control socket, so drain THAT.
+1 while _answer();
 is($p->bufferReady, '0',
    'the superseded load does not re-assert bufferReady after the stop');
 is($p->hqPlayAck, '0', 'nor acknowledge a track that is no longer wanted');
 
 # skip mid-load: the old track's seek must not be applied to the new one
-@sent = ();
+@sent = (); @sentCb = ();
 $p->play({ controller => LoadController->new($one), seekdata => { timeOffset => 90 } });
 $p->play({ controller => LoadController->new($two) });   # skipped before it loaded
-$up->finishURI;
-$up->finishPlay;
+1 while _answer();
 is(join(',', grep { /Seek/ } @sent), '',
    "the skipped track's seek is not sent to the track that replaced it");
 is($p->hqSeekOffset, '0', 'and no phantom seek offset is left on the elapsed time');
@@ -1280,7 +1313,6 @@ is($p->hqSeekOffset, '0', 'and no phantom seek offset is left on the elapsed tim
 print "-- gapless hand-over --\n";
 {
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:ee', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1362,7 +1394,6 @@ print "-- gapless: the spurious advance that froze LMS --\n";
     # every subsequent push as "the previous track".  Position freezes, LMS
     # shows the wrong track, nothing recovers.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f3', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1403,7 +1434,6 @@ print "-- gapless: the spurious advance that froze LMS --\n";
     # ambiguous the index is the only thing left that can tell them apart.
     {
         my $dp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f8', 'paddr', 1.0, undef, 12, undef);
-        $dp->hqUPnP( LoadUPnP->new );
         $dp->hqControl( bless {}, 'FakeCtl' );
         my $dc = LoadController->new($one);
         $dp->controller($dc);
@@ -1461,7 +1491,6 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     # an extra track, stopped, and every push after that arrived at a
     # controller in STOPPED/IDLE where TrackStarted is _Invalid.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f5', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1504,7 +1533,6 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     # END_GRACE later.  Without this the debounce would swallow a stop made at
     # HQPlayer's own UI whenever a hand-over happened to be queued.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f6', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1537,7 +1565,6 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     # With nothing queued there is nothing for HQPlayer to move into, so a stop
     # can only be real - report it at once, exactly as before gapless.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f7', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1568,7 +1595,6 @@ print "-- a stop right after a track starts is start-up noise --\n";
     # hqExpectStop covers the window BEFORE the new track is confirmed; this
     # covers the window just after it.
     my $np = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f9', 'paddr', 1.0, undef, 12, undef);
-    $np->hqUPnP( LoadUPnP->new );
     $np->hqControl( bless {}, 'FakeCtl' );
     my $nc = LoadController->new($one);
     $np->controller($nc);
@@ -1605,7 +1631,6 @@ print "-- the stale suppression is bounded --\n";
     # a wrong hqURL/hqPrevURL pair must not be able to suppress the status
     # stream forever - that is a player that can only be fixed by restarting.
     my $sp2 = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f4', 'paddr', 1.0, undef, 12, undef);
-    $sp2->hqUPnP( LoadUPnP->new );
     $sp2->hqControl( bless {}, 'FakeCtl' );
     my $sc = LoadController->new($one);
     $sp2->controller($sc);
@@ -1865,7 +1890,6 @@ print "-- gapless: the guards --\n";
     # would arrive as the start of the next.  So it is HELD and loaded the
     # ordinary way.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:ef', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1912,7 +1936,6 @@ print "-- gapless: the guards --\n";
     # perfectly well.  The track is demoted to a normal load instead, which
     # runs at end of track and reports the failure properly if it is real.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f2', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1942,7 +1965,6 @@ print "-- gapless: the guards --\n";
     # A hand-over cannot carry a seek: <Seek> acts on what is playing now, not
     # on a queued item.  The full load can, so it takes that call.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f0', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1966,7 +1988,6 @@ print "-- gapless: the guards --\n";
     # drops the rest, which is exactly a flush here.  It was a no-op stub while
     # the playlist only ever held one item.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f1', 'paddr', 1.0, undef, 12, undef);
-    $gp->hqUPnP( LoadUPnP->new );
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);

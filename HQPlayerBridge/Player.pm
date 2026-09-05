@@ -24,14 +24,12 @@ use Slim::Utils::Timers;
 use Slim::Music::Info;
 use Slim::Player::ProtocolHandlers;
 use Slim::Player::ReplayGain;
-use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Utils::Network;
 use Slim::Web::HTTP;          # forgetClient, for closeStream below
 use Time::HiRes ();
 
 use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Stream;
-use Plugins::HQPlayerBridge::UPnP;
 
 # Slim::Player::Client objects are BLESSED ARRAYS - Slim::Utils::Accessor
 # stores each field in a numbered slot ($_[0]->[$n]), not a hash key.  So
@@ -39,11 +37,11 @@ use Plugins::HQPlayerBridge::UPnP;
 # per-player state has to be a declared accessor.  ('rw' switches on argument
 # count, @_ == 2, so storing 0 and undef both work correctly.)
 __PACKAGE__->mk_accessor( 'rw', qw(
-    hqControl hqUPnP hqInstance
+    hqControl hqInstance
     hqTier hqRate hqBits hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
-    hqWanted hqVolDb hqVolMin hqVolMax hqVolFixed hqVolForced
-    hqVolSent hqVolSentAt hqVolMissed
+    hqWanted hqVolDb hqVolMin hqVolMax
+    hqVolSent hqVolSentAt
     hqGen hqPlayAck hqURL hqPrevURL
     hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt
 ) );
@@ -835,10 +833,6 @@ sub _coverURL {
 # Everything that loads a track is asynchronous, so a transport command has to
 # invalidate whatever the previous one left in flight.  Bumping the generation
 # makes every outstanding callback recognise itself as superseded.
-#
-# cancelPlay is still called even though the load no longer runs over UPnP: the
-# renderer keeps its own Play retry timer, and a describe that raced a teardown
-# could still have one armed.  It is a counter bump, so it costs nothing.
 sub _newGeneration {
     my $self = shift;
 
@@ -862,9 +856,6 @@ sub _newGeneration {
 
     my $gen = ( $self->hqGen || 0 ) + 1;
     $self->hqGen($gen);
-
-    my $upnp = $self->hqUPnP;
-    $upnp->cancelPlay if $upnp;
 
     return $gen;
 }
@@ -1683,9 +1674,8 @@ sub volume {
     # persisted path, so it still reaches HQPlayer.)
     return $vol if $temp;
 
-    # HQPlayer is not attenuating - either it told us so, or the user set this
-    # player to fixed volume in LMS's own audio settings.  Either way the level
-    # is somebody else's to move.  See _setFixed.
+    # The user set this player to fixed volume in LMS's own audio settings, so
+    # the level is somebody else's to move.  See _volumeIsFixed.
     return $vol if $self->_volumeIsFixed;
 
     my $db = $self->_lmsToDb($newvolume);
@@ -1707,116 +1697,95 @@ sub volume {
 }
 
 # ---------------------------------------------------------------------------
-# Fixed volume.
+# Fixed volume.  THE ONLY SWITCH IS LMS'S OWN, AND THE PLUGIN NEVER WRITES IT.
 #
-# Plenty of HQPlayer setups do not attenuate at all - the DAC or the amplifier
-# holds the volume - and for those the LMS slider must sit at 100 and stay
-# there rather than pretend to control something.
-#
-# LMS already has this concept, and it is worth using rather than inventing:
-# the per-player digitalVolumeControl pref, which the status query turns into
+# The per-player digitalVolumeControl pref is what the status query turns into
 #
 #     use_volume_control = (digitalVolumeControl || !hasDigitalOut) ? 1 : 0
 #
 # (Slim::Control::Queries).  Material and the other skins disable the slider on
 # that.  LMS only allows the pref to go to 0 on a player whose hasDigitalOut is
 # true, which this one is - and the same gate puts LMS's own "Volume Control:
-# fixed / variable" radio on the player's Audio settings page, so the user gets
-# a manual override for free.
+# fixed / variable" radio on the player's Audio settings page.  Setting it to
+# fixed means one thing: LMS stops driving HQPlayer's volume.  Nothing else.
 #
-# Which is why a manual 0 counts as fixed too, and is never written back to 1:
-# only a 0 that WE set is ours to clear.
+# EARLIER BUILDS TRIED TO DETECT A FIXED HQPLAYER AND SET THAT PREF THEMSELVES.
+# There is no such state to detect.  Measured 2026-09-05 against engine 6.0.4
+# with <fixed volume="-3"/> configured and applied:
+#
+#   <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>   <- unchanged
+#   hqplayerd log:  Volume max: 0 / Volume min: -100
+#                   Set volume: -3.000000
+#                   Control active volume range: -100 - 0 dB
+#
+# HQPlayer's "fixed volume" is a STARTUP LEVEL, not a lock: it sets the output
+# to that level once (bypassing the startup/default volume) and the volume
+# stays changeable afterwards, from HQPlayer's own UI or from the endpoint's
+# device volume on an NAA like the Eversolo.  The range does not collapse, no
+# flag reports it, and the word "fixed" does not appear once in 10.9MB of
+# hqplayerd log.  So the two detectors that used to live here - a zero-width
+# range, and three sends that changed nothing - were inferring a state that
+# cannot occur, and on that inference they wrote the user's digitalVolumeControl
+# pref to 0.  Simon's call 2026-09-05: "we should not be setting anything to 0".
+#
+# Do not reintroduce them.  See the Review Ledger.
 # ---------------------------------------------------------------------------
 sub _volumeIsFixed {
     my $self = shift;
-
-    return 1 if $self->hqVolFixed;
 
     my $dvc = $serverPrefs->client($self)->get('digitalVolumeControl');
 
     return ( defined $dvc && !$dvc ) ? 1 : 0;
 }
 
-sub _setFixed {
-    my ( $self, $fixed ) = @_;
-
-    $fixed = $fixed ? 1 : 0;
-
-    return if ( $self->hqVolFixed || 0 ) == $fixed;
-
-    $self->hqVolFixed($fixed);
-    $self->hqVolMissed(0);
-
-    $log->info( $self->name . ': HQPlayer volume is '
-        . ( $fixed ? 'FIXED - locking the LMS slider' : 'variable again - unlocking the LMS slider' ) );
-
-    if ($fixed) {
-        # Only a 0 that WE set is ours to clear again - a user who has already
-        # chosen fixed volume keeps that choice when HQPlayer changes its mind.
-        my $dvc = $serverPrefs->client($self)->get('digitalVolumeControl');
-
-        if ( !defined $dvc || $dvc ) {
-            $self->hqVolForced(1);
-            $serverPrefs->client($self)->set( 'digitalVolumeControl', 0 );
-        }
-
-        # Park the slider at the top: there is no attenuation to represent.
-        $self->execute( [ 'mixer', 'volume', 100 ] );
-    }
-    elsif ( $self->hqVolForced ) {
-        $self->hqVolForced(0);
-        $serverPrefs->client($self)->set( 'digitalVolumeControl', 1 );
-    }
-
-    return;
-}
-
 # ---------------------------------------------------------------------------
-# Learning the range.
+# Learning the range - on the control socket, like everything else.
 #
-# VERIFIED live: HQPlayer DOES implement UPnP GetVolumeDBRange - the -100...0
-# instance returns MinValue -25600, MaxValue 0.  Those are the AV spec's
-# 1/256 dB units, so divide; whole dB is accepted too, in case another build
-# reports it that way.  One SOAP call per connect, well off the hot path, so its
-# 300-550ms costs nothing.
-#
-# THIS IS THE LAST THING UPnP IS USED FOR, AND IT NO LONGER HAS TO BE.  The XML
-# control API answers "Unknown command" to `GetVolumeDBRange` - that much is
-# true and was measured - but that is the UPnP ACTION NAME, and the conclusion
-# drawn from it (that the control API cannot report a range) is wrong.
-# `<VolumeRange/>` is a control command and carries the same numbers:
+# `<VolumeRange/>` is a control command.  Verified live 2026-08-28 against
+# engine 6.0.4, and again 2026-09-05:
 #
 #   <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
 #
-# Reading it there retires UPnP.pm, describe, its backoff retry and the SOAP
-# client outright, which is Simon's standing ask ("get gapless tested then
-# remove it") - gapless is tested on every tier and all three services now.
-# Not done here: it is its own change, not a rider on a start-deadline build.
+# min and max are PLAIN dB.  There is no 1/256 fixed-point conversion here and
+# there must not be one: that was UPnP RenderingControl's unit (MinValue
+# -25600), and carrying its discriminator across would be one concept on two
+# carriers.  The numbers agree with hqplayerd's own log, which prints
+# `Volume max: 0` / `Volume min: -100` and `Control active volume range:
+# -100 - 0 dB` from the same settings.
+#
+# This is what retired UPnP.pm.  The control API answers "Unknown command" to
+# `GetVolumeDBRange`, which is true and was measured - but that is the UPnP
+# ACTION NAME, and the conclusion drawn from its absence (that the control API
+# cannot report a range) was wrong.  It stopped one command short of the
+# vendor's own list.
+#
+# `enabled` and `adaptive` are DELIBERATELY NOT READ.  `enabled` was assumed to
+# be a fixed-volume flag; it is measured not to be - see _volumeIsFixed.  Both
+# are logged at debug so a future engine changing them is visible without
+# anything depending on them.
 # ---------------------------------------------------------------------------
 sub refreshVolumeRange {
     my $self = shift;
 
-    my $upnp = $self->hqUPnP or return;
+    $self->_send( '<VolumeRange/>', sub {
+        my $attrs = shift or return;
 
-    if ( !$upnp->ready ) {
-        # Not described yet: describe now and probe from the callback rather
-        # than leaving the range at its fallback for the session.
-        $upnp->describe( sub { $self->refreshVolumeRange if $_[0] } );
-        return;
-    }
-
-    $upnp->getVolumeDBRange( sub {
-        my ( $min, $max ) = @_;
+        my $min = Plugins::HQPlayerBridge::Control::pick( $attrs, 'min' );
+        my $max = Plugins::HQPlayerBridge::Control::pick( $attrs, 'max' );
 
         return unless defined $min && defined $max;
 
-        # A range with no width is HQPlayer saying it will not attenuate.
-        if ( $max - $min <= 0 ) {
-            $self->_setFixed(1);
-            return;
-        }
+        main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
+            . ": VolumeRange min=$min max=$max"
+            . ' enabled=' . ( Plugins::HQPlayerBridge::Control::pick( $attrs, 'enabled' )  // '?' )
+            . ' adaptive=' . ( Plugins::HQPlayerBridge::Control::pick( $attrs, 'adaptive' ) // '?' ) );
 
-        $self->_setFixed(0);
+        # A range with no width would mean HQPlayer is not attenuating at all.
+        # No configuration is known to report one - HQPlayer's own fixed-volume
+        # setting leaves the range at full width - so this only declines to
+        # store a nonsense range, and never decides anything about the slider.
+        return if $max - $min <= 0;
+
         $self->_setRange( $min, $max );
 
         return;
@@ -1852,8 +1821,6 @@ sub _setRange {
 # How long after our own send a status push is still read as an answer to it.
 # The stream runs at ~1/s, so a couple of seconds covers the crossing case.
 use constant CLAMP_WINDOW  => 3;
-use constant MISS_DELAY    => 2;
-use constant FIXED_STRIKES => 3;
 
 # ---------------------------------------------------------------------------
 # The inbound half of the sync: HQPlayer's own level, off every <Status/>.
@@ -1861,15 +1828,12 @@ use constant FIXED_STRIKES => 3;
 sub _followVolume {
     my ( $self, $db ) = @_;
 
-    my $was = $self->hqVolDb;
-
     # hqVolDb is where HQPlayer IS, so record it before anything else decides
     # what to do about it - including the mixer command at the end, which lands
     # back in our own volume() and must find the level already current.
     $self->hqVolDb($db);
 
     $self->_learnFromClamp( $db );
-    $self->_watchForFixed( $was, $db );
 
     return if $self->_volumeIsFixed;
 
@@ -1941,46 +1905,6 @@ sub _learnFromClamp {
         $self->hqVolSent(undef);
         $self->_setRange( $self->_volMin, $db );
     }
-
-    return;
-}
-
-# The other way an instance turns out not to attenuate: it takes the command
-# and simply does not move.  One strike per send, cleared the moment any level
-# change is seen, so the state can never stick.
-sub _watchForFixed {
-    my ( $self, $was, $db ) = @_;
-
-    my $sent = $self->hqVolSent;
-
-    return unless defined $sent;
-
-    my $tol = $self->_volTol;
-
-    # It went where we asked: definitely attenuating.
-    if ( abs( $db - $sent ) <= $tol ) {
-        $self->hqVolSent(undef);
-        $self->hqVolMissed(0);
-        $self->_setFixed(0);
-        return;
-    }
-
-    # The send and the push that carries the old level cross in flight.
-    return if ( Time::HiRes::time() - ( $self->hqVolSentAt || 0 ) ) < MISS_DELAY;
-
-    $self->hqVolSent(undef);
-
-    # It moved, just not to where we asked - a clamp, or somebody else's
-    # change.  Either way the volume is live.
-    if ( defined $was && abs( $db - $was ) > $tol ) {
-        $self->hqVolMissed(0);
-        return;
-    }
-
-    my $missed = ( $self->hqVolMissed || 0 ) + 1;
-
-    $self->hqVolMissed($missed);
-    $self->_setFixed(1) if $missed >= FIXED_STRIKES;
 
     return;
 }
@@ -2673,8 +2597,7 @@ sub refreshInfo {
     my $self = shift;
 
     # The volume range does not come from here - GetInfo does not carry one.
-    # It is read over UPnP today; `<VolumeRange/>` on this socket carries the
-    # same min/max and is what should replace it.  See refreshVolumeRange.
+    # <VolumeRange/> does, on this same socket.  See refreshVolumeRange.
     $self->refreshVolumeRange;
 
     $self->assertRepeatOff;

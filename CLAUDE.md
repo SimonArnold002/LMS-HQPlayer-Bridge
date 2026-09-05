@@ -28,6 +28,10 @@ declined.
 | The headroom should be added back to every figure, so a track always lands on its ReplayGain target (`Player.pm`, `_replayGain`) | **WRONG for the NO-FIGURE case** 2026-08-30, shipped 0.2.44-0.2.46, fixed in 0.2.47 | Compensation only means something when there is a TARGET to land on. With no figure at all there is no target, and adding the headroom back turned "we know nothing" into a **+3.01 dB boost** that ate exactly the room HQPlayer reserves for its DSP. Reported by Simon — *"no replaygain no adaptive volume"* — and visible at both ends on a Qobuz album that publishes no gain: `replay gain none -> 3.01 dB` in the bridge's log, `Adaptive transport gain: 3.01 dB (1.41416)` in hqplayerd's. A 1.41× multiplier on material nobody asked to be normalised. **The distinction that survives:** a track whose figure IS `0.00` dB has a target of unity and still gets the compensation. Only the ABSENCE of a figure is inert. The unity assertion for a remote track stays — it just sends a flat `0.00` now instead of a compensated one. **SUPERSEDED by the 0.2.49 reversal** — the compensation, the log reader and the unity assertion are all gone; this row is kept for the reasoning, not the behaviour. |
 | `Volume scaler` is the headroom, in a more precise form than `Convolution gain compensation` (`Player.pm`, `_convGainFromFile`) | **WRONG** 2026-08-30, shipped 0.2.44-0.2.47, fixed in 0.2.48 | Two different numbers that coincided. `20*log10(0.707107) = -3.01` matched the compensation of the day, and that was taken as confirmation. Simon set the compensation to **0**, played a fresh track, and the plugin kept compensating — because the scaler had not moved. Across a whole log it appears **21 times, 0.707107 every time**, spanning the change, while the compensation tracked the setting (18 × −3, then 5 × 0). They live in different sections of the init: the compensation after `Playback engine ratio:` in the DSP block, the scaler after `Network endpoint has volume range` in the OUTPUT stage. 0.707107 = 1/√2, the SDM/DSD full-scale convention (hypothesis; the constancy is measured). **Two lessons.** The value is now read from the NEWEST init block only, because "last match in the tail" picks up a stale compensation when convolution is switched off. And the wrong NAME caused this: hunting for something called "headroom" is what made a −3.01-looking constant persuasive — Simon: *"its called convolution gain compensation not headroom"*. **SUPERSEDED by the 0.2.49 reversal** — the compensation, the log reader and the unity assertion are all gone; this row is kept for the reasoning, not the behaviour. |
 | The bridge should scale LMS's ReplayGain figure at all — compensate for HQPlayer's convolution gain, cap it against the peak, or assert unity when there is none (`Player.pm`, `_replayGain`) | **REVERSED** 2026-08-31, Simon's call | Every layer built over 0.2.39-0.2.48 is removed in 0.2.49 and the figure now goes out **verbatim, on every tier**, with no attribute at all when LMS has none: *"Adaptive gain for replay gain is just applied with no compensation at all as we originally had it. Do not read the gains from Convolution."* / *"all tiers operate the same, no replay gain provided by LMS no Adaptive Gain added"*. **The facts underneath the compensation were sound** — HQPlayer really does apply its convolution gain compensation on top of `album_gain`, so a -10.03 album with -3.01 of compensation really did land at -13.04 — but that is HQPlayer doing what the user configured, and cancelling it out is not the bridge's job. **The lesson is the pattern, not the arithmetic:** five builds each corrected the previous build's ceiling (volume room, then headroom, then peak-vs-0dB base) and every one was a new way to disagree with a number LMS had already computed correctly. When a correction needs its own correction three times over, the thing to question is whether to be correcting at all. `readConvGain`, `_convGainFromFile`, `_watchDsp`, `_dspSignature`, the three accessors and both constants are DELETED, and `t_player.pl` asserts their absence so a dormant reader cannot be quietly rewired. |
+| `enabled` on `<VolumeRange/>` is the fixed-volume flag, and should replace `_watchForFixed` (`Player.pm`) | **WRONG** 2026-09-05, measured | It is not, and there is no HQPlayer-side fixed-volume state for any flag to report. Probed live against engine 6.0.4 with `<fixed volume="-3"/>` configured **and applied**: `<VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>` — `enabled` unchanged, and the range did not collapse either. hqplayerd's own log agrees, printing `Volume max: 0` / `Volume min: -100` / `Control active volume range: -100 - 0 dB` at the restart that applied the setting, with `Set volume: -3.000000` alongside — and the word "fixed" appears **zero times in 10.9 MB of log**. **HQPlayer's "fixed volume" is a STARTUP LEVEL, not a lock:** it sets the output once, bypassing the startup/default volume, and the level stays changeable from HQPlayer's UI or from the endpoint's device volume on an NAA. Simon: *"It does not lock out volume control."* Signalyst's own client settles the type and nothing more — `ControlInterface.cpp:2177` parses `enabled` as a bool and `ControlApplication.cpp:668` only `qDebug`s it. **Nothing reads `enabled` or `adaptive`; both are logged at debug so a future engine changing them is visible without anything depending on them.** |
+| The plugin should detect a non-attenuating HQPlayer and set the player's `digitalVolumeControl` pref to 0 itself (`Player.pm`, `_setFixed` / `_watchForFixed`) | **REVERSED** 2026-09-05, Simon's call | Both detectors — a zero-width range, and three sends that changed nothing — were inferring the state disproven in the row above, and on that inference `_setFixed` **wrote the user's pref**. A coincidence of three (the user holding the volume on HQPlayer's own UI across three sends) would silently switch the LMS player to fixed volume. Same over-reach class as the volume guard reversed in 0.2.32, and the same ruling: *"we should not be setting anything to 0"*. **The only fixed-volume switch is LMS's own radio**, and it means one thing — LMS stops driving HQPlayer's volume. The startup level is whatever HQPlayer holds (its software volume, or the device volume on an NAA like the Eversolo) and LMS mirrors it rather than asserting one. `_setFixed`, `_watchForFixed`, `hqVolFixed`, `hqVolForced`, `hqVolMissed`, `FIXED_STRIKES` and `MISS_DELAY` are DELETED; `digitalVolumeControl` is now READ and never written, and `t_player.pl` asserts both subs' absence and that no `set('digitalVolumeControl'` survives in `Player.pm`. |
+| UPnP must stay for the volume range, because the control API cannot report one (`UPnP.pm`, `Player.pm` `refreshVolumeRange`) | **REMOVED** 2026-09-05 in 0.2.54 | `<VolumeRange/>` is a control command and answers the same range in **plain dB** on the socket that is already open, in ~9 ms against UPnP's 300-550 ms. `UPnP.pm` (414 lines), `t_upnp.pl`, the `describe` handshake and its 5s->60s backoff, the SOAP client, the dormant Play-retry loop and `cancelPlay` are all deleted, and the range now rides the control link's own reconnect via `refreshInfo` on link-up — one retry carrier instead of two. The plugin no longer speaks HTTP at all (`SimpleAsyncHTTP` had no live caller left). **The 1/256 fixed-point discriminator did NOT come across**: that was RenderingControl's unit, and `<VolumeRange/>` is plain dB. Makes the port-8019 log-flood hazard structurally unreachable. |
+
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
@@ -51,7 +55,6 @@ then plays it.
 | `HQPlayerBridge/Plugin.pm` | Lifecycle, discovery wiring, player create/teardown |
 | `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list |
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
-| `HQPlayerBridge/UPnP.pm` | Async SOAP to HQPlayer's UPnP renderer — **volume range only** since 0.2.13 |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
 | `HQPlayerBridge/Stream.pm` | Tier 4: the path-only audio endpoint HQPlayer can actually fetch |
 | `HQPlayerBridge/Settings.pm` | Read-only status page |
@@ -239,43 +242,43 @@ makes both intentional.
 * **`active_rate` is the DSD/output rate, not the source rate.** The source
   format is on the `<metadata/>` **child** (`samplerate`, `bits`).
 
-## One channel, and the one thing still on the other
+## One channel
 
-**Everything runs on the XML control API on 4321.** `<Status/>` is a subscribe
-pushing ~1/s, and a command answers in **~9–150 ms** against **300–550 ms** for
-a UPnP round trip.
+**Everything runs on the XML control API on 4321** — transport, state, track,
+metadata, artwork, volume level *and* volume range. `<Status/>` is a subscribe
+pushing ~1/s, and a command answers in **~9–150 ms**.
 
-| | XML API (4321) | UPnP (8019) |
-|---|---|---|
-| transport + state | **used** — subscribe, play, pause, stop, seek | available, unused |
-| track + metadata + artwork | **used** — `PlaylistAdd` + `<metadata cover="…"/>` | available, unused |
-| volume level | **used** — `<Volume value="-53"/>` in dB | available but slow |
-| volume **range** | no such command | **used** — `GetVolumeDBRange`, once at connect |
+| | XML API (4321) |
+|---|---|
+| transport + state | subscribe, play, pause, stop, seek |
+| track + metadata + artwork | `PlaylistAdd` + `<metadata cover="…"/>` |
+| volume level | `<Volume value="-53"/>`, in dB |
+| volume **range** | `<VolumeRange/>`, once at connect |
 
-**That last row is now WRONG, and `UPnP.pm` can be retired.** `<VolumeRange/>`
-is a control command. Verified live 2026-08-28 against engine 6.0.4:
+**UPnP is gone as of 0.2.54.** The range was the last thing on port 8019, and
+`<VolumeRange/>` answers it on the socket that is already open. Verified live
+2026-08-28 against engine 6.0.4, and again 2026-09-05:
 
 ```xml
 <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
 ```
 
-Same range UPnP's `GetVolumeDBRange` reports, in **plain dB** rather than
-1/256, on the socket that is already open, answering in ~9 ms instead of
-300–550 ms. It removes the whole UPnP device-description dance
-(`describe` and its backoff retry, `root.xml`, the SOAP client) along with the
-class of bug that lives there.
+Same range `GetVolumeDBRange` reported, in **plain dB** rather than 1/256, in
+~9 ms instead of 300–550 ms. Removing it took `UPnP.pm`, the device-description
+dance (`describe`, its 5s→60s backoff, `root.xml`, the SOAP client), the
+dormant Play-retry loop and the plugin's only HTTP client with it — and made
+the port-8019 log-flood hazard structurally unreachable.
 
-`enabled` is almost certainly the **fixed-volume** flag — the thing "Still
-unverified" below says needs a live instance with the setting flipped. That
-would replace `_watchForFixed`, which currently infers it from three sends that
-change nothing.
+**`min` and `max` are read; `enabled` and `adaptive` are NOT.** `enabled` was
+assumed to be the fixed-volume flag and is measured not to be — see the Review
+Ledger. Both are logged at debug so a future engine changing them is visible
+without anything depending on them. **Do not carry the 1/256 fixed-point
+conversion across**: that was RenderingControl's unit, not this one's.
 
 `GetVolumeDBRange` and `GetVolumeDB` really are absent from the control API —
 but they are the **UPnP action names**, and the earlier note here inferred "so
 there is no way to ask" from their absence. It stopped one command short. The
 range was always available; nobody had read the vendor's list.
-
-*(Not yet done — this is a proposal with the evidence attached, not a change.)*
 
 ### The artwork field is `cover`, and it takes a plain URL
 
@@ -362,43 +365,34 @@ blank icon, from a completely different cause.  `Slim::Player::ProtocolHandlers
 already an `/imageproxy/` path, which is what the proxy is genuinely for.  If
 the handler has no artwork, emit **no** `albumArtURI` rather than a bad one.
 
-### TRAP: Play races SetAVTransportURI
+### GONE with UPnP in 0.2.54: the Play/SetAVTransportURI race and the describe retry
 
-**Dormant since 0.2.13** — the load no longer goes over UPnP, and `<Play/>` on
-the control socket has never needed a retry (it is chained off `PlaylistAdd`'s
-reply, and answered OK first time in every live test). Kept because
-`UPnP::playWhenReady` still exists and this is why it looks the way it does.
+Two traps lived in `UPnP.pm` and are recorded here because they explain why the
+file looked the way it did, not because any of it still runs. **Both are
+deleted**, along with `UPnP.pm` itself.
 
-`SetAVTransportURI` returns as soon as it has *accepted* the URI, but HQPlayer
-then fetches and probes the media before the transport actually holds anything.
-`Play` issued too early fails with UPnP **702 "no contents"** — measured: at
-~0.5s it fails, the identical call ~1s later succeeds. Nothing in
-`GetMediaInfo` reflects it (`NrTracks` already reads 1), so
-`UPnP::playWhenReady` simply retries (8 × 0.4s).
+**Play raced SetAVTransportURI.** `SetAVTransportURI` returned as soon as it had
+*accepted* the URI, but HQPlayer then fetched and probed the media before the
+transport actually held anything, so a `Play` issued too early failed with UPnP
+**702 "no contents"** — measured: at ~0.5s it failed, the identical call ~1s
+later succeeded. Nothing in `GetMediaInfo` reflected it (`NrTracks` already read
+1), so `playWhenReady` retried blindly (8 × 0.4s), bounded by `PLAY_TIMEOUT` (5s
+per attempt) and `PLAY_DEADLINE` (12s across the loop). It was **dormant from
+0.2.13**, when the load moved to the control socket: `<Play/>` there is chained
+off `PlaylistAdd`'s reply and answered OK first time in every live test.
 
-The retry is deliberately **blind to which error came back**: a UPnP fault is an
-HTTP 500 whose `errorCode` is in the body, not in the status line the async
-client hands us, so "is this the transient 702" is not reliably answerable from
-`$err` — and guessing wrong breaks the ordinary case, where a failed first Play
-is normal. What is bounded instead is the **wait**: `PLAY_TIMEOUT` (5s) per
-attempt and a `PLAY_DEADLINE` (12s) across the loop. Eight attempts at the
-general 15s SOAP timeout was ~2 minutes of a player that looks like it is
-buffering before it admits the track failed.
-
-### TRAP: describe() must retry itself
-
-Without a device description there is no control path, and `_queueTrack` fails
-every track with `PROBLEM_OPENING` — the player exists but can never play
-anything. `describe` runs when the player is created and again when the control
-link comes **up**, and *neither of those recurs*: LMS and hqplayerd starting
+**`describe` had to retry itself.** Without a device description there was no
+control path at all. It ran when the player was created and again when the
+control link came up, and *neither of those recurs* — LMS and hqplayerd starting
 together (a server reboot) is exactly the case where the first fetch fails and
-the control link then stays up, so no further attempt would ever be made. It now
-retries itself with backoff (5s → 60s) until it succeeds, and `UPnP::close` —
-called from `_teardown` — stops that and the Play retry loop when the player
-goes away.
+the link then stays up, so no further attempt would ever be made. Hence a 5s→60s
+backoff, and `UPnP::close` from `_teardown` to stop it.
 
-Note `SetAVTransportURI` is logged by hqplayerd as `Playlist clear` +
-`Playlist add URI` — it lands on the same playlist the XML API uses.
+**That whole retry carrier is gone, not replaced.** The range now rides the
+control link, which already owns reconnect and backoff, and `refreshInfo` re-asks
+on every link-up — so the reboot case is covered by the one mechanism instead of
+two. **The lesson worth keeping: a second transport brings its own liveness
+problem, and its own retry loop to get wrong.**
 
 ## One thing HQPlayer still will not do
 
@@ -1287,9 +1281,11 @@ stranded in `mode=play` with a frozen clock, and the Eversolo's screen lit
 indefinitely. That is the state every tier 4 bug fixed in 0.2.27 produced. The
 causes were fixed; the gap was carried as an open ledger row for three days.
 
-**The `<Play/>` retry loop already covers the ack never ARRIVING** (~17s over 8
-attempts, in `UPnP::cancelPlay`'s epoch-checked timer). This covers the opposite
-case: the ack arrives, and nothing happens after it.
+**A retry loop used to cover the ack never ARRIVING** (~17s over 8 attempts, on
+the UPnP path, removed with it in 0.2.54 — `<Play/>` on the control socket is
+chained off `PlaylistAdd`'s reply and has never needed one). `START_DEADLINE`
+covers the opposite case, which is the one that actually strands LMS: the ack
+arrives, and nothing happens after it.
 
 `START_DEADLINE` is **10 seconds** — roughly 4x the worst legitimate delay. A
 track normally reports playing in ~0.33s; the slowest known real case is a
@@ -1349,9 +1345,11 @@ poll, and applying that track's `<Seek>` and `hqSeekOffset` to whatever is
 playing now, so elapsed time was wrong for the whole track.
 
 `play()` and `stop()` both call `_newGeneration`: it bumps `hqGen`, which every
-in-flight callback compares itself against (`_superseded`), and calls
-`UPnP::cancelPlay`, which bumps an epoch the Play retry loop checks — the retry
-is a timer, so it needs cancelling separately from the callback.
+in-flight callback compares itself against (`_superseded`). Until 0.2.54 it also
+called `UPnP::cancelPlay` to bump an epoch the UPnP Play retry loop checked —
+that loop was a *timer*, so it needed cancelling separately from the callback.
+With UPnP gone there is no timer in the load path and the generation bump is the
+whole mechanism.
 
 ### Two-way transport: `hqWanted`, and why not the controller's state
 
@@ -1530,24 +1528,25 @@ At −100…0 that is arithmetically `dB = lms - 100`, so this instance's feel i
 unchanged. `min`/`max` are per-player accessors (`hqVolMin`, `hqVolMax`), which
 is why `_lmsToDb` and `_dbToLms` are methods.
 
-**Where they come from.** VERIFIED live 2026-08-27 against hqplayerd 6.0.4:
+**Where they come from.** `<VolumeRange/>` on the control socket, asked once per
+link-up by `Player::refreshVolumeRange` (off `refreshInfo`). VERIFIED live
+2026-08-28 and again 2026-09-05 against hqplayerd 6.0.4:
 
 ```
-curl -s -X POST http://<hqplayer-ip>:8019/control/rendering-control \
-  -H 'Content-Type: text/xml; charset="utf-8"' \
-  -H 'SOAPACTION: "urn:schemas-upnp-org:service:RenderingControl:3#GetVolumeDBRange"' \
-  --data '<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetVolumeDBRange xmlns:u="urn:schemas-upnp-org:service:RenderingControl:3"><InstanceID>0</InstanceID><Channel>Master</Channel></u:GetVolumeDBRange></s:Body></s:Envelope>'
-
--> <MinValue>-25600</MinValue><MaxValue>0</MaxValue>
+<VolumeRange/>  ->  <VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>
 ```
 
-**HQPlayer does implement `GetVolumeDBRange`**, even though the XML control API
-answers `Unknown command` for the name — it is a UPnP RenderingControl action.
-The units are the AV spec's **1/256 dB** (−25600 = −100.0 dB). Some renderers
-report whole dB and nobody has a range past ±200 dB, so `abs(v) > 200` is a
-safe discriminator. One SOAP call per connect, off the hot path, so its
-300–550 ms costs nothing. `UPnP::getVolumeDBRange`, called from
-`Player::refreshVolumeRange` on every link-up.
+**`min` and `max` are PLAIN dB and are stored verbatim.** Only those two are
+read: see the Review Ledger for why `enabled` is not a fixed-volume flag.
+
+*Historical, for anyone reading an old build:* until 0.2.54 this came from UPnP
+RenderingControl's `GetVolumeDBRange` on port 8019, which answered
+`<MinValue>-25600</MinValue><MaxValue>0</MaxValue>` — the AV spec's **1/256 dB**
+units, needing an `abs(v) > 200` discriminator to tell them from whole dB, and
+costing a 300–550 ms SOAP round trip. **None of that came across**, and it must
+not: it was that transport's unit, not this one's. hqplayerd's own log agrees
+with the control API, printing `Volume max: 0` / `Volume min: -100` and
+`Control active volume range: -100 - 0 dB`.
 
 The **clamp** is the fallback, and the only route that survives the user
 reconfiguring HQPlayer without a reconnect: ask for a level beyond the limit
@@ -1761,7 +1760,6 @@ tree, runs 505 assertions across five files, and sweeps called-vs-defined subs.
 | `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads** |
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
-| `t_upnp.pl` | the describe retry, the bounded Play loop, cancellation |
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
@@ -2116,7 +2114,7 @@ round. Match both forms.
 
 What it settles that had been open or wrong:
 
-* **`<VolumeRange/>` IS A CONTROL COMMAND — see below. UPnP.pm can go.**
+* **`<VolumeRange/>` IS A CONTROL COMMAND — it retired `UPnP.pm` in 0.2.54.**
 * **`<Status subscribe="0|1"/>` takes an explicit flag.** Verified live:
   `subscribe="0"` is a genuine **one-shot poll** — one reply, no push stream —
   and `subscribe="1"` (or the bare `<Status/>` the plugin sends) subscribes.
@@ -2582,11 +2580,10 @@ surface — not the channel that reaches the NAA. Judge artwork by
 
 ## Still unverified
 
-* **How HQPlayer presents fixed volume.** Now has an obvious answer to test:
-  `enabled` on `<VolumeRange/>`. Flip the setting on a live instance and read
-  it back. Detection currently assumes a zero-width range, and falls back to
-  `_watchForFixed` (three sends that change nothing), which does not depend on
-  knowing.
+* ~~How HQPlayer presents fixed volume.~~ **ANSWERED 2026-09-05: it doesn't.**
+  HQPlayer's fixed volume is a startup LEVEL, not a lock — the range stays full
+  width, `enabled` stays 1, and the volume remains changeable. There is no state
+  to present. See the Review Ledger; the detectors that assumed one are deleted.
 * `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS
   shows the player as present even when the control link is down. Discovered-but-
   unreachable is a normal recurring state here (the NAA lives at home), and

@@ -76,7 +76,7 @@ That's the whole reason there's no buffer to tune, no transcoder to configure an
 
 Everything goes over **HQPlayer's own XML control API**: the track and its URL, the title, artist and album, the **cover art**, transport, volume, and a status stream coming back about once a second that drives the progress bar, the play/pause state and the volume slider.
 
-One thing still uses HQPlayer's UPnP renderer, and only at connect: reading the **volume range**. The control API can set a level but has no way to report what the range is, and the range is a setting whose top and bottom can both move.
+That is the whole conversation — **one socket, nothing else**. Even the **volume range**, which the plugin reads once at connect because the top and bottom are both settings the user can move, comes back on the same channel.
 
 ### Playing your library
 
@@ -98,7 +98,9 @@ Artwork works here too: the cover comes from the service via LMS's image proxy a
 
 HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.
 
-**One LMS step is one dB**, with LMS 100 being 0 dB — the same mapping HQPlayer applies to the 0–100 its UPnP endpoint receives, so if you're coming from the UPnP bridge the slider behaves as it did before. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled, and a fixed-volume HQPlayer shows as 100 and locked.
+**One LMS step is one dB**, with LMS 100 being 0 dB. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled.
+
+The volume you start with is **HQPlayer's**, not one the plugin asserts — its own software level, or the device volume on an NAA like an Eversolo. If you want Lyrion to stop driving the volume altogether, set **Volume Control: fixed** on the player's own Audio settings page; the plugin honours that and never changes it for you. (HQPlayer's own "fixed volume" setting is a *startup level*, not a lock — it sets the output once and the volume stays adjustable.)
 
 ### Pause from either end
 
