@@ -102,6 +102,21 @@ HQPlayer holds the real volume in dB and decides how to split it between the end
 
 The volume you start with is **HQPlayer's**, not one the plugin asserts — its own software level, or the device volume on an NAA like an Eversolo. If you want Lyrion to stop driving the volume altogether, set **Volume Control: fixed** on the player's own Audio settings page; the plugin honours that and never changes it for you. (HQPlayer's own "fixed volume" setting is a *startup level*, not a lock — it sets the output once and the volume stays adjustable.)
 
+### Seeing what HQPlayer is doing
+
+The plugin's settings page shows the **signal path** for each instance — the
+format Lyrion handed over, the format HQPlayer is feeding its endpoint, the
+filter and shaper actually in use, and how fast it is processing:
+
+```
+44100 Hz / 16 bit FLAC  →  96000 Hz / 24 bit PCM
+Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime
+```
+
+HQPlayer reports the filter it is *really* using, so a 44.1 kHz album shows your
+1x filter and a 96 kHz one your Nx filter. All of it rides the status stream the
+plugin is already listening to, so it costs nothing extra.
+
 ### Pause from either end
 
 Pause and play work from LMS, and also *at* HQPlayer — if you pause on the endpoint's remote or in HQPlayer's own interface, LMS follows within a second rather than carrying on counting time against silent audio. Stop, seek and end-of-track are likewise reported back, so the LMS progress bar tracks what's really happening.

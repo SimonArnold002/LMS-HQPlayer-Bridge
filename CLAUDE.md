@@ -57,7 +57,7 @@ then plays it.
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
 | `HQPlayerBridge/Stream.pm` | Tier 4: the path-only audio endpoint HQPlayer can actually fetch |
-| `HQPlayerBridge/Settings.pm` | Read-only status page |
+| `HQPlayerBridge/Settings.pm` | Read-only status page - connection, tier, and the signal path |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 
 ## Branches and releasing
@@ -393,6 +393,59 @@ control link, which already owns reconnect and backoff, and `refreshInfo` re-ask
 on every link-up — so the reboot case is covered by the one mechanism instead of
 two. **The lesson worth keeping: a second transport brings its own liveness
 problem, and its own retry loop to get wrong.**
+
+## The signal path on the settings page (0.2.55)
+
+**Everything HQPlayer reports about what it is doing arrives on the `<Status/>`
+push we are already subscribed to.** Reading it costs no command and no round
+trip; `_onStatus` simply stops throwing it away.
+
+**The two halves are on different elements, and showing them together is the
+point:**
+
+| half | where | fields |
+|---|---|---|
+| **source** — what LMS handed over | the `<metadata/>` **child** | `samplerate`, `bits`, `mime` |
+| **output** — what HQPlayer feeds the NAA | the `<Status/>` **root** | `active_rate`, `active_bits`, `active_mode`, `active_filter`, `active_shaper`, `process_speed` |
+
+Measured live 2026-09-05: a `44100/16` FLAC going out as `96000/24` PCM through
+`poly-sinc-gauss-long` + `TPDF` at `30.3x`.
+
+**`active_filter` and `active_shaper` arrive as NAMES**, so there is no
+`GetFilters`/`GetShapers` id lookup to do. `<State/>` carries only the numeric
+ids (`filter1x=37`, `filterNx=40`, `shaper=7`) and *would* need one — which is
+exactly why these are read off `<Status/>` and not there.
+
+**It reports the filter ACTUALLY IN USE**, so a 44.1k source shows the 1x filter
+and a 96k source the Nx one. That is the honest answer to "what is it doing now"
+rather than a copy of both dropdowns in HQPlayer's UI.
+
+`hqPath` is a lazily-created hash (`Slim::Utils::Accessor` hands back undef
+until something is stored). A push that omits the fields leaves the last known
+values alone, and nothing is cleared on stop — the same way `hqRate`/`hqBits`
+have always behaved.
+
+### Material: why this is settings-page only
+
+**Material cannot show live plugin text on the Now Playing screen**, and Simon
+has ruled out an upstream PR for it (2026-09-05), so the settings page is the
+whole feature. Checked against the installed **Material 6.4.9**:
+
+* **No NP hook.** Material builds Now Playing from track metadata; there is no
+  plugin mechanism for arbitrary status text there. It would need the
+  conditional/placement capability parked in the Material asks.
+* **`registerInfoProvider` WOULD work** — the track info menu already renders 18
+  items from Spotify/Qobuz/TIDAL/Deezer/Lyrics on this box, and it reaches every
+  control point, not just Material. It lands under **"… → More Info"**, two taps
+  from Now Playing, as a snapshot when opened. **Offered and declined** — Simon:
+  *"just stick with plugin settings"*.
+* `registerCustomAction` is fully available on 6.4.9 (PR #1257 shipped there),
+  but it delivers an ACTION ROW, not a live display — the wrong shape for this.
+
+**If this is ever revisited**, the design point to settle first is that the
+signal path belongs to the PLAYER, not the track: an info provider must only
+offer itself when the track being inspected is the one actually playing on that
+client, or it shows a path for a track that is not running.
 
 ## One thing HQPlayer still will not do
 

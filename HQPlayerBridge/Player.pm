@@ -38,7 +38,7 @@ use Plugins::HQPlayerBridge::Stream;
 # count, @_ == 2, so storing 0 and undef both work correctly.)
 __PACKAGE__->mk_accessor( 'rw', qw(
     hqControl hqInstance
-    hqTier hqRate hqBits hqTransport hqEngine hqProduct
+    hqTier hqRate hqBits hqMime hqPathData hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb hqVolMin hqVolMax
     hqVolSent hqVolSentAt
@@ -1500,6 +1500,19 @@ sub stop {
 use constant HQP_VOL_MIN_DB => -100;
 use constant HQP_VOL_MAX_DB => 0;
 
+# The signal path HQPlayer last reported, as a hash.  Lazily created, because
+# Slim::Utils::Accessor hands back undef until something is stored and
+# `$self->hqPath->{x} = 1` on an undef would autovivify nothing useful.
+sub hqPath {
+    my $self = shift;
+
+    my $p = $self->hqPathData;
+
+    $self->hqPathData( $p = {} ) unless ref $p eq 'HASH';
+
+    return $p;
+}
+
 sub _volMin  { my $v = $_[0]->hqVolMin; defined $v ? $v : HQP_VOL_MIN_DB }
 sub _volMax  { my $v = $_[0]->hqVolMax; defined $v ? $v : HQP_VOL_MAX_DB }
 sub _volSpan { my $s = $_[0]->_volMax - $_[0]->_volMin; $s > 0 ? $s : 0 }
@@ -2246,11 +2259,34 @@ sub _onStatus {
             if ( !$stale ) {
                 $self->hqRate( $meta->{samplerate} );
                 $self->hqBits( $meta->{bits} );
+                $self->hqMime( $meta->{mime} );
             }
         }
     }
 
     $self->hqRate( $self->hqRate || Plugins::HQPlayerBridge::Control::pick( $attrs, 'active_rate' ) );
+
+    # THE SIGNAL PATH, and it costs nothing: every one of these rides the
+    # <Status/> push we are already subscribed to, so reading them adds no
+    # command and no round trip.
+    #
+    # The two halves are on DIFFERENT elements, and that is the whole point of
+    # showing them together.  The <metadata/> child above is the SOURCE - what
+    # LMS handed over - while these root attributes are what HQPlayer is
+    # actually feeding the NAA after its DSP.  Measured live 2026-09-05: a
+    # 44100/16 FLAC arriving as 96000/24 PCM.
+    #
+    # `active_filter` and `active_shaper` come through as NAMES
+    # ("poly-sinc-gauss-long", "TPDF"), so no GetFilters/GetShapers lookup is
+    # needed.  <State/> carries only the numeric ids (filter1x=37, filterNx=40,
+    # shaper=7) and would need one - which is exactly why these are read here
+    # and not there.  HQPlayer reports the filter ACTUALLY IN USE, so a 44.1k
+    # source shows the 1x filter and a 96k source the Nx one; that is the
+    # honest answer to "what is it doing now", not a copy of both dropdowns.
+    for my $f (qw( active_rate active_bits active_mode active_filter active_shaper process_speed )) {
+        my $v = Plugins::HQPlayerBridge::Control::pick( $attrs, $f );
+        $self->hqPath->{$f} = $v if defined $v && $v ne '';
+    }
 
     # Volume changed at HQPlayer, or on the endpoint's own remote: mirror it
     # into LMS so the two never diverge.  Every <Status/> carries it in dB, so

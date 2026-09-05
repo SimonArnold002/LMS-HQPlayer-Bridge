@@ -884,6 +884,44 @@ ok(scalar(@sent) > 0, 'and setting it back to variable lets the level through ag
 # 2026-08-28 and 2026-09-05 against engine 6.0.4.  UPnP's GetVolumeDBRange
 # answered the same range in 1/256 dB units (MinValue -25600) and needed a
 # fixed-point discriminator; there must be no trace of that here.
+# THE SIGNAL PATH.  Its two halves come off DIFFERENT parts of one <Status/>:
+# the SOURCE from the <metadata/> child, and what HQPlayer feeds the NAA from
+# the root attributes.  Both ride a push we already receive, so this must cost
+# no extra command.  Values below are a real reading, 2026-09-05: a 44100/16
+# FLAC going out as 96000/24 PCM at 30.3x.
+print "-- the signal path --\n";
+{
+    @sent = ();
+    my $raw = q{<Status state="1" position="44" active_rate="96000" active_bits="24" }
+            . q{active_mode="PCM" active_filter="poly-sinc-gauss-long" active_shaper="TPDF" }
+            . q{process_speed="30.306143881118679">}
+            . q{<metadata samplerate="44100" bits="16" mime="audio/x-flac" }
+            . q{uri="http://lms/hqp3/1/download.flac"/></Status>};
+    $c->hqURL('http://lms/hqp3/1/download.flac');
+    $c->_onStatus({ state => 1, position => 44, active_rate => '96000',
+                    active_bits => '24', active_mode => 'PCM',
+                    active_filter => 'poly-sinc-gauss-long',
+                    active_shaper => 'TPDF',
+                    process_speed => '30.306143881118679' }, $raw);
+
+    is($c->hqRate, '44100', 'the INPUT rate comes off the metadata child');
+    is($c->hqBits, '16',    'and so do the input bits');
+    is($c->hqMime, 'audio/x-flac', 'and the source container');
+    is($c->hqPath->{active_rate},   '96000', 'the OUTPUT rate comes off the status root');
+    is($c->hqPath->{active_bits},   '24',    'and the output bits');
+    is($c->hqPath->{active_mode},   'PCM',   'and the output mode');
+    is($c->hqPath->{active_filter}, 'poly-sinc-gauss-long',
+       'the filter arrives as a NAME, so no GetFilters lookup is needed');
+    is($c->hqPath->{active_shaper}, 'TPDF',  'and so does the shaper');
+    ok(scalar( $c->hqPath->{process_speed} > 30 ), 'and the processing speed is carried');
+    is(scalar(@sent), '0', 'and reading all of it sent NOTHING - it rides the existing push');
+
+    # A push that omits them must not blank what we last knew.
+    $c->_onStatus({ state => 1, position => 45 }, '<Status state="1" position="45"/>');
+    is($c->hqPath->{active_filter}, 'poly-sinc-gauss-long',
+       'a push without the fields leaves the last known path alone');
+}
+
 print "-- the range over <VolumeRange/> --\n";
 {
     @sent = (); @sentCb = ();

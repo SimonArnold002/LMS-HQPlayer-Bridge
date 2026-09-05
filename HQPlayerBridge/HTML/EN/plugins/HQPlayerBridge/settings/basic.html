@@ -55,11 +55,24 @@
             <tr>
                 <td class="prefHead">[% "PLUGIN_HQPLAYER_STREAM" | string %]</td>
                 <td class="prefBody">
-                    [% IF b.rate %][% b.rate | html %] Hz[% IF b.bits %] / [% b.bits | html %] bit[% END %][% ELSE %]&mdash;[% END %]
+                    [% IF b.rate %][% b.rate | html %] Hz[% IF b.bits %] / [% b.bits | html %] bit[% END %][% IF b.mime %] [% b.mime | html %][% END %]
+                        [% IF b.outrate %]
+                            &rarr; [% b.outrate | html %] Hz[% IF b.outbits %] / [% b.outbits | html %] bit[% END %][% IF b.outmode %] [% b.outmode | html %][% END %]
+                        [% END %]
+                    [% ELSE %]&mdash;[% END %]
+                    [% IF b.filter OR b.shaper OR b.speed %]
+                        <span class="prefDesc">
+                        [% IF b.filter %][% "PLUGIN_HQPLAYER_FILTER" | string %] [% b.filter | html %][% END %]
+                        [% IF b.shaper %] &middot; [% "PLUGIN_HQPLAYER_SHAPER" | string %] [% b.shaper | html %][% END %]
+                        [% IF b.speed %] &middot; [% b.speed | html %][% "PLUGIN_HQPLAYER_SPEED" | string %][% END %]
+                        </span>
+                    [% END %]
                     [% IF b.tier %]
                         <span class="prefDesc">
                         [% IF b.tier == 1 %][% "PLUGIN_HQPLAYER_TIER1" | string %]
-                        [% ELSE %][% "PLUGIN_HQPLAYER_TIER2" | string %][% END %]
+                        [% ELSIF b.tier == 3 %][% "PLUGIN_HQPLAYER_TIER3" | string %]
+                        [% ELSIF b.tier == 5 %][% "PLUGIN_HQPLAYER_TIER5" | string %]
+                        [% ELSE %][% "PLUGIN_HQPLAYER_TIER4" | string %][% END %]
                         </span>
                     [% END %]
                 </td>

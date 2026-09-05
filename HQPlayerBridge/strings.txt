@@ -25,11 +25,26 @@ PLUGIN_HQPLAYER_OUTPUT_DESC
 PLUGIN_HQPLAYER_STREAM
 	EN	Current stream
 
+PLUGIN_HQPLAYER_FILTER
+	EN	Filter
+
+PLUGIN_HQPLAYER_SHAPER
+	EN	Shaper
+
+PLUGIN_HQPLAYER_SPEED
+	EN	x realtime
+
 PLUGIN_HQPLAYER_TIER1
 	EN	Playing the original file straight from Lyrion, untranscoded - tags and cover art come from the file itself.
 
-PLUGIN_HQPLAYER_TIER2
-	EN	Playing through the Lyrion player stream, used for streaming services and radio.
+PLUGIN_HQPLAYER_TIER3
+	EN	Playing a local file that HQPlayer cannot decode itself, transcoded by Lyrion on the way past. Pre-queued, so track joins stay seamless.
+
+PLUGIN_HQPLAYER_TIER4
+	EN	Playing through the Lyrion player stream, used for radio and for services that cannot hand out a direct link. One stream per player, so track joins are not pre-queued.
+
+PLUGIN_HQPLAYER_TIER5
+	EN	Playing a streaming service directly - HQPlayer fetches the service's own URL, with no Lyrion proxy or transcode in between. Pre-queued, so track joins stay seamless.
 
 PLUGIN_HQPLAYER_NONE
 	EN	No HQPlayer instances found

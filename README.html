@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
   <div class="badges">
-    <span class="badge accent">v0.2.53</span>
+    <span class="badge accent">v0.2.54</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No audio through the plugin</span>
@@ -200,6 +200,11 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <p>HQPlayer holds the real volume in dB and decides how to split it between the endpoint's hardware attenuator and its own software gain. LMS has an 0–100 slider. The plugin keeps the two in step in both directions: moving the LMS slider sets HQPlayer's level, and changing the volume anywhere else — HQPlayer's own UI, the endpoint's remote — moves the LMS slider within about a second.</p>
 <p><strong>One LMS step is one dB</strong>, with LMS 100 being 0 dB. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled.</p>
 <p>The volume you start with is <strong>HQPlayer's</strong>, not one the plugin asserts — its own software level, or the device volume on an NAA like an Eversolo. If you want Lyrion to stop driving the volume altogether, set <strong>Volume Control: fixed</strong> on the player's own Audio settings page; the plugin honours that and never changes it for you. (HQPlayer's own "fixed volume" setting is a <em>startup level</em>, not a lock — it sets the output once and the volume stays adjustable.)</p>
+<h3>Seeing what HQPlayer is doing</h3>
+<p>The plugin's settings page shows the <strong>signal path</strong> for each instance — the format Lyrion handed over, the format HQPlayer is feeding its endpoint, the filter and shaper actually in use, and how fast it is processing:</p>
+<pre><code>44100 Hz / 16 bit FLAC  →  96000 Hz / 24 bit PCM
+Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime</code></pre>
+<p>HQPlayer reports the filter it is <em>really</em> using, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. All of it rides the status stream the plugin is already listening to, so it costs nothing extra.</p>
 <h3>Pause from either end</h3>
 <p>Pause and play work from LMS, and also <em>at</em> HQPlayer — if you pause on the endpoint's remote or in HQPlayer's own interface, LMS follows within a second rather than carrying on counting time against silent audio. Stop, seek and end-of-track are likewise reported back, so the LMS progress bar tracks what's really happening.</p>
 <h3>The status page</h3>

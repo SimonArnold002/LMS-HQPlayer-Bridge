@@ -7,6 +7,7 @@ use strict; use warnings;
 BEGIN { package main; use constant DEBUGLOG=>0; use constant INFOLOG=>0; use constant WEBUI=>1; }
 use lib '.';
 require Plugins::HQPlayerBridge::Plugin;
+require Plugins::HQPlayerBridge::Settings;
 
 my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
@@ -230,6 +231,17 @@ print "-- the watchdog is armed by the LINK, not by a track --\n";
     is( ( defined $ls && $ls =~ /else\s*\{[^}]*_stopPolling/s ? 'yes' : 'no' ),
         'yes', 'the stop is on the DOWN branch, not next to the start' );
 }
+
+# The settings page tidies the source container in PERL, not in the template:
+# a Template::Toolkit vmethod that throws takes the whole page down, and a
+# broken settings page fails quietly in LMS.
+print "-- the settings page's mime tidy --\n";
+is(Plugins::HQPlayerBridge::Settings::_shortMime('audio/x-flac'), 'FLAC',
+   'audio/x-flac reads as FLAC');
+is(Plugins::HQPlayerBridge::Settings::_shortMime('audio/mpeg'), 'MPEG',
+   'and a subtype with no x- prefix still loses the audio/');
+is(Plugins::HQPlayerBridge::Settings::_shortMime(undef), '(undef)',
+   'and no mime at all is undef, not an empty string the template would print');
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);
