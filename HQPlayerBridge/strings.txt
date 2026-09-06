@@ -2,10 +2,8 @@ PLUGIN_HQPLAYER_BRIDGE
 	EN	HQPlayer Bridge
 
 PLUGIN_HQPLAYER_BRIDGE_DESC
-	EN	Presents each HQPlayer instance on your network as an ordinary Lyrion player, driven directly over HQPlayer's own control API. No UPnP bridge and no external helper binary: no audio passes through this plugin at all, because HQPlayer fetches the stream straight from Lyrion. There is nothing to configure - instances are discovered automatically.
+	EN	Presents each HQPlayer instance on your network as an ordinary Lyrion player, driven directly over HQPlayer's own control API. No UPnP bridge and no external helper binary: HQPlayer fetches the stream straight from Lyrion, so the plugin adds no audio stage of its own. Most of your library is handed over untouched, but Lyrion does still convert formats HQPlayer cannot decode, such as ALAC and AAC. There is nothing to configure - instances are discovered automatically.
 
-PLUGIN_HQPLAYER_INSTANCE
-	EN	Instance
 
 PLUGIN_HQPLAYER_STATUS
 	EN	Control link
@@ -19,14 +17,8 @@ PLUGIN_HQPLAYER_DISCONNECTED
 PLUGIN_HQPLAYER_OUTPUT
 	EN	Output transport
 
-PLUGIN_HQPLAYER_OUTPUT_DESC
-	EN	The transport HQPlayer has selected, as its own numeric id. HQPlayer's control API does not report the output device or NAA by name, so the name of the endpoint it is feeding can only be seen in HQPlayer itself.
 
-PLUGIN_HQPLAYER_SETTINGS
-	EN	Settings
 
-PLUGIN_HQPLAYER_REFRESH
-	EN	Refresh
 
 PLUGIN_HQPLAYER_SOURCE
 	EN	Source
@@ -35,7 +27,10 @@ PLUGIN_HQPLAYER_OUTFORMAT
 	EN	Output format
 
 PLUGIN_HQPLAYER_PROCESSING
-	EN	Processing
+	EN	Processing speed
+
+PLUGIN_HQPLAYER_MODE
+	EN	Output mode
 
 PLUGIN_HQPLAYER_FILTER
 	EN	Filter
@@ -58,8 +53,6 @@ PLUGIN_HQPLAYER_TIER4
 PLUGIN_HQPLAYER_TIER5
 	EN	Playing a streaming service directly - HQPlayer fetches the service's own URL, with no Lyrion proxy or transcode in between. Pre-queued, so track joins stay seamless.
 
-PLUGIN_HQPLAYER_NONE
-	EN	No HQPlayer instances found
 
 PLUGIN_HQPLAYER_NONE_DESC
 	EN	Nothing answered the discovery probe on 239.192.0.199:4321. Check that HQPlayer is running, that it is on the same network segment as this server, and that its control API is enabled.
@@ -67,12 +60,42 @@ PLUGIN_HQPLAYER_NONE_DESC
 PLUGIN_HQPLAYER_TRANSPORT_ID
 	EN	id
 
-PLUGIN_HQPLAYER_VOLUME
-	EN	Volume range
 
-PLUGIN_HQPLAYER_VOLUME_STEP
-	EN	per slider step
 
-PLUGIN_HQPLAYER_VOLUME_NOW
-	EN	now at
 
+
+PLUGIN_HQPLAYER_LIVE_TITLE
+	EN	HQPlayer Live View
+
+PLUGIN_HQPLAYER_LIVE_BACK
+	EN	Back to Material
+
+PLUGIN_HQPLAYER_CTL_PREV
+	EN	Previous track
+
+PLUGIN_HQPLAYER_CTL_NEXT
+	EN	Next track
+
+PLUGIN_HQPLAYER_CTL_PLAY
+	EN	Play
+
+PLUGIN_HQPLAYER_CTL_PAUSE
+	EN	Pause
+
+PLUGIN_HQPLAYER_CTL_MUTE
+	EN	Mute
+
+PLUGIN_HQPLAYER_CTL_UNMUTE
+	EN	Unmute
+
+PLUGIN_HQPLAYER_CTL_VOLUME
+	EN	Volume
+
+PLUGIN_HQPLAYER_CTL_VOLDN
+	EN	Decrease volume
+
+PLUGIN_HQPLAYER_CTL_VOLUP
+	EN	Increase volume
+
+PLUGIN_HQPLAYER_LIVE_WAITING
+	EN	Waiting for the player to connect

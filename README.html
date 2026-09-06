@@ -114,12 +114,12 @@
 
 <header class="hero">
   <h1>HQPlayer Bridge — LMS Plugin</h1>
-  <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio through the plugin.</strong></p>
+  <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio stage added by the plugin</strong> — HQPlayer fetches the music from LMS itself. LMS still converts the formats HQPlayer cannot decode, such as ALAC and AAC.</p>
   <div class="badges">
-    <span class="badge accent">v0.2.59</span>
+    <span class="badge accent">v0.2.76</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
-    <span class="badge">No audio through the plugin</span>
+    <span class="badge">No extra audio hop</span>
   </div>
   <div class="hero-actions">
     <a class="btn btn-primary" href="HQPlayerBridge.zip">Download latest</a>
@@ -133,7 +133,7 @@
 <div class="feature-cards">
 <div class="card"><h4>Appears as a real player</h4><p>Each HQPlayer instance shows up in LMS's player list, ready to select</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Found automatically</h4><p>Instances are discovered on the network; nothing to type in</p><span class="needs">Needs: HQPlayer reachable from the server</span></div>
-<div class="card"><h4>No audio through the plugin</h4><p>HQPlayer fetches the music from LMS itself — the bridge only moves control messages</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>No extra audio hop</h4><p>HQPlayer fetches the music from LMS itself — the bridge adds no buffer or helper of its own. LMS still converts what HQPlayer can't decode</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Your library, bit-perfect</h4><p>FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg are handed over as the original file</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Streaming, straight from the source</h4><p>Qobuz and Tidal tracks are fetched by HQPlayer directly from the service, at full rate and gapless</p><span class="needs">Needs: The matching service plugin</span></div>
 <div class="card"><h4>Everything else too</h4><p>Deezer, radio and formats HQPlayer can't read are served through LMS on the fly</p><span class="needs">Needs: The matching service plugin</span></div>
@@ -142,7 +142,7 @@
 <div class="card"><h4>Volume, both ways</h4><p>The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Pause from either end</h4><p>Pausing at HQPlayer, or on the endpoint's remote, pauses LMS too</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Stable player identity</h4><p>Prefs, playlist and sync group survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
-<div class="card"><h4>Status page</h4><p>What was discovered, whether the control link is up, and what HQPlayer is doing</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Live view</h4><p>A page of its own: what's playing, transport and volume, and the signal path — updating every second, in your Material theme</p><span class="needs">Needs: nothing</span></div>
 </div>
 </section>
 <section id="requirements">
@@ -201,19 +201,33 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <p><strong>One LMS step is one dB</strong>, with LMS 100 being 0 dB. The range is read from HQPlayer at connect, so a ceiling below 0 dB (say −60 to −20) is handled.</p>
 <p>The volume you start with is <strong>HQPlayer's</strong>, not one the plugin asserts — its own software level, or the device volume on an NAA like an Eversolo. If you want Lyrion to stop driving the volume altogether, set <strong>Volume Control: fixed</strong> on the player's own Audio settings page; the plugin honours that and never changes it for you. (HQPlayer's own "fixed volume" setting is a <em>startup level</em>, not a lock — it sets the output once and the volume stays adjustable.)</p>
 <h3>Seeing what HQPlayer is doing</h3>
-<p>You'll find <strong>HQPlayer Bridge under Apps</strong> in Material (pin it to the home screen if you use it often) — one tap for the settings page, and the live status of every instance underneath it.</p>
-<p>The settings page shows the <strong>signal path</strong> for each instance — the format Lyrion handed over, the format HQPlayer is feeding its endpoint, the filter and shaper actually in use, and how fast it is processing:</p>
-<pre><code>Source          44100 Hz / 16 bit FLAC
-Output format   96000 Hz / 24 bit PCM
-Processing      Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime</code></pre>
+<p>There are two surfaces, and they deliberately show different things.</p>
+<p><strong>HQPlayer Live View</strong> is the one to use. Open it from <strong>Apps → HQPlayer Bridge</strong>, or pin it — it registers a <strong>home-screen tile</strong> in Material that opens it in one tap. It updates <strong>every second</strong>, and shows:</p>
+<ul>
+<li><strong>What's playing</strong> — cover, title, artist and album, and a progress bar, the
+</li></ul>
+<p>same information Material shows.</p>
+<ul>
+<li><strong>Transport and volume</strong> — previous, play/pause, next, and a volume control
+</li></ul>
+<p>with a mute button, buttons either side of the slider, and the level. Clicking the level mutes too. The step buttons move by whatever volume step you have set in Material. These are Lyrion's own commands, so they behave exactly like Material's.</p>
+<ul>
+<li><strong>The signal path</strong> — the format Lyrion handed over, the format HQPlayer is
+</li></ul>
+<p>feeding its endpoint, and the filter, shaper and processing speed actually in use, one to a row:</p>
+<pre><code>Control link       Connected - 192.168.1.109:4321
+Source             44100 Hz / 16 bit FLAC
+Output format      96000 Hz / 24 bit PCM
+Filter             poly-sinc-gauss-long
+Shaper             TPDF
+Processing speed   30.3x realtime</code></pre>
 <p>HQPlayer reports the filter it is <em>really</em> using, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter.</p>
-<p><strong>The page updates itself while you watch</strong> — it refreshes about every two seconds, pauses when the page isn't visible, and stops when you close it. It costs HQPlayer nothing: the plugin is already listening to HQPlayer's status stream, so the page only ever asks Lyrion for figures it already has.</p>
-<p>The Apps entry shows the same information, but Material draws a browse page once and never refreshes it, so there's a <strong>Refresh</strong> row there instead.</p>
+<p>The page follows <strong>Material's own theme</strong> — light or dark, and your accent colour — and uses Material's icons, so it looks like part of the skin rather than a plugin page bolted on. It scales with the window, so it is readable on a phone and on a desktop. Until HQPlayer is discovered it simply says it is waiting for the player to connect.</p>
+<p>It costs HQPlayer nothing: the plugin is already listening to HQPlayer's status stream, so the page only ever asks Lyrion for figures it already has.</p>
+<p><strong>The Apps entry itself</strong> is a browse list, and Material draws one of those once and never refreshes it — so rather than show moving numbers that would go stale the moment you looked away, it shows <strong>HQPlayer's current settings</strong>: output mode, filter, shaper and transport id. Those are the things you would go into HQPlayer to change, so they are still true when the page is a minute old.</p>
+<p>It reports HQPlayer's <strong>transport id</strong> rather than your endpoint's name. HQPlayer doesn't expose the NAA name over any control command — it only appears in HQPlayer's own log — so the page says so plainly instead of guessing.</p>
 <h3>Pause from either end</h3>
 <p>Pause and play work from LMS, and also <em>at</em> HQPlayer — if you pause on the endpoint's remote or in HQPlayer's own interface, LMS follows within a second rather than carrying on counting time against silent audio. Stop, seek and end-of-track are likewise reported back, so the LMS progress bar tracks what's really happening.</p>
-<h3>The status page</h3>
-<p><strong>Settings → Advanced → HQPlayer Bridge</strong> is a read-only status page: which instances were discovered and at what address, whether the control link is currently up, and what HQPlayer last reported — state, sample rate, bit depth and output mode.</p>
-<p>It reports HQPlayer's <strong>transport id</strong> rather than your endpoint's name. HQPlayer doesn't expose the NAA name over any control command — it only appears in HQPlayer's own log — so the page says so plainly instead of guessing.</p>
 </section>
 <section id="notes-limitations">
 <h2>Notes &amp; limitations</h2>
@@ -244,7 +258,7 @@ Processing      Filter poly-sinc-gauss-long · Shaper TPDF · 30.3x realtime</co
 </li>
 <li><strong>No HTTP authentication.</strong> If your LMS server is password-protected, HQPlayer can't fetch the audio URLs it's given.
 </li>
-<li><strong>The settings page is read-only</strong> — there's nothing to configure yet.
+<li><strong>There is nothing to configure.</strong> The plugin has no settings page: instances are found on their own, and everything the live view shows is read from HQPlayer.
 </li></ul>
 </section>
 <section id="licence-and-attribution">

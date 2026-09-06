@@ -312,10 +312,42 @@ sub _flacPrelude {
 
     return '' unless ( eval { $song->streamformat } || '' ) eq 'flc';
 
-    # Only on a seek.  A stream that starts at the beginning already carries a
-    # real header, and a second one would be read as corrupt audio.
+    # ONLY WHEN THE HEADER IS ACTUALLY MISSING - AND A SEEK DOES NOT MEAN IT IS.
+    #
+    # This used to fire on `timeOffset || sourceStreamOffset`, which is any seek
+    # at all, and that was WRONG for half of them. The two are not alternatives:
+    #
+    #   sourceStreamOffset  a BYTE position. Slim::Player::Protocols::HTTP puts
+    #                       it in the Range header (`requestString`: `my $first
+    #                       = ... int($seekdata->{sourceStreamOffset})`), so the
+    #                       source re-opens PART WAY INTO the container and the
+    #                       `fLaC` marker and STREAMINFO are genuinely gone.
+    #                       THIS is the case the header below exists for, and
+    #                       the one verified live against a seeked passthrough.
+    #
+    #   timeOffset          SECONDS. Handed to a transcoder as its start time,
+    #                       or to a protocol handler that fetches from there.
+    #                       Either way the audio is ENCODED FRESH and arrives as
+    #                       a complete container with its own header.
+    #
+    # A passthrough seek sets BOTH; a transcoded or handler-driven one sets only
+    # `timeOffset`. Testing for either therefore prepended a SECOND header onto
+    # a stream that already had one - which the note above says exactly what to
+    # expect from: it is read as corrupt audio.
+    #
+    # FOUND LIVE 2026-09-06 on BBC Sounds, which is choppy on this bridge and
+    # clean on a squeezelite player (slimproto never carries this header). Its
+    # ProtocolHandler answers `getSeekData` with `{ timeOffset => $newtime }`
+    # and NOTHING ELSE, so it can never set the byte offset - and LMS opens a
+    # live station at the live edge, so `timeOffset` is set on an ordinary play.
+    # The log line below fired on every one:
+    #
+    #   Stream::_flacPrelude: seeked stream - prepending a FLAC header
+    #                         (48000Hz 16bit 2ch)
+    #
+    # The rate was right; the header simply should not have been there at all.
     my $seek = eval { $song->seekdata };
-    return '' unless $seek && ( $seek->{timeOffset} || $seek->{sourceStreamOffset} );
+    return '' unless $seek && $seek->{sourceStreamOffset};
 
     my $track = eval { $song->currentTrack };
 

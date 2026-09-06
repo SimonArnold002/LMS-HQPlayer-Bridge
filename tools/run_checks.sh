@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 rm -rf Plugins && mkdir -p Plugins && ln -sfn ../../HQPlayerBridge Plugins/HQPlayerBridge
 
 echo "== syntax =="
-for m in Control Discovery Stream Player Plugin Settings; do
+for m in Control Discovery Stream Player Plugin Live; do
     perl -I. syncheck.pl "Plugins::HQPlayerBridge::$m"
 done
 
@@ -22,12 +22,15 @@ perl -I. t_control.pl
 perl -I. t_player.pl
 perl -I. t_stream.pl
 perl -I. t_plugin.pl
+perl -I. t_live.pl
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="
 cd ../HQPlayerBridge
 grep -ho 'Plugins::HQPlayerBridge::[A-Za-z]*::[a-zA-Z_]*' ./*.pm | sort -u | while read -r c; do
     mod=${c#Plugins::HQPlayerBridge::}; mod=${mod%%::*}; fn=${c##*::}
-    grep -q "^sub $fn" "$mod.pm" 2>/dev/null || echo "  MISSING $c"
+    grep -q "^sub $fn" "$mod.pm" 2>/dev/null \
+        || grep -qE "^use constant +$fn\\b" "$mod.pm" 2>/dev/null \
+        || echo "  MISSING $c"
 done
 echo "  (clean)"

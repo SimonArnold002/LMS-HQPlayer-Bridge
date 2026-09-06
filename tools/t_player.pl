@@ -59,7 +59,7 @@ print "-- Socket context trap must stay fixed --\n";
 # LIST context, treats its two args as a request to UNPACK one, and croaks.
 # That killed player creation on a live server. Only the explicit pack_/unpack_
 # forms are allowed in this codebase.
-for my $f (qw(Plugin Player Control Discovery Settings)) {
+for my $f (qw(Plugin Player Control Discovery Live)) {
     open my $fh, '<', "../HQPlayerBridge/$f.pm" or next;
     my @bad = grep { /(?<![_\w])sockaddr_in\s*\(/ && !/^\s*#/ } <$fh>;
     ok(!@bad, "$f.pm uses only pack_/unpack_sockaddr_in".(@bad ? " (found: ".join('',@bad).")" : ""));
@@ -1301,6 +1301,152 @@ print "-- the start deadline: an ack that never becomes playback --\n";
     }
 
     Slim::Utils::Timers::_reset();
+}
+
+print "-- the circuit breaker: N consecutive failed loads stop the player --\n";
+#
+# THE HARM. A failed load reports PROBLEM_OPENING, LMS skips to the next track,
+# and that load fails the same way. Measured live against an hqplayerd whose
+# control thread had wedged: FIVE full Stop/Stop/PlaylistClear/PlaylistAdd
+# cycles in UNDER ONE SECOND. The bridge does not cause the wedge - the daemon
+# throws on a bare <VolumeRange/> from an uninvolved host - but it hammers a
+# daemon that is already sick, and turns one bad track into a whole-album race.
+#
+# So the run is counted, and past FAIL_LIMIT the bridge stops the player instead
+# of handing LMS another failure to skip past.
+{
+    my $mk = sub {
+        my $mac = shift;
+        my $pl = Plugins::HQPlayerBridge::Player->new($mac, 'paddr', 1.0, undef, 12, undef);
+        $pl->hqControl( bless {}, 'FakeCtl' );
+        my $cc = LoadController->new($one);
+        $pl->controller($cc);
+        return ( $pl, $cc );
+    };
+
+    # One load that HQPlayer refuses.  _fireAll runs the deferred stop the trip
+    # schedules; nothing else is pending, because a refused PlaylistAdd never
+    # sends <Play/> and so never arms the start deadline.
+    my $failOnce = sub {
+        my ( $pl, $cc ) = @_;
+        @sent = (); @sentCb = ();
+        $cc->{calls} = [];
+        @ex = ();
+        Slim::Utils::Timers::_reset();
+        $pl->play({ controller => $cc });
+        _answer(0);                       # PlaylistAdd -> Error
+        Slim::Utils::Timers::_fireAll();
+        return;
+    };
+    # @ex is the execute() recorder the volume block installs - a stop reaches
+    # LMS as a CLI command, which is exactly what it captures.
+    my $stopped = sub { return scalar grep { $_ eq 'stop' } @ex };
+
+    my ( $bp, $bc ) = $mk->('02:cb:00:00:00:01');
+
+    # THE CONTROL. Below the limit nothing changes: LMS is still told, and still
+    # gets to skip. Without this the breaker could simply swallow every failure
+    # and every assertion below would still pass.
+    $failOnce->( $bp, $bc );
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$bc->{calls}}),
+       'the first failed load is still reported to LMS');
+    ok(!$stopped->(), 'and the player is not stopped for one failure');
+    is($bp->hqFailRun, '1', 'the run is counted');
+
+    $failOnce->( $bp, $bc );
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$bc->{calls}}),
+       'the second is reported too');
+    ok(!$stopped->(), 'and still does not stop the player');
+
+    # THE TRIP.
+    $failOnce->( $bp, $bc );
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$bc->{calls}}),
+       'the third consecutive failure is NOT handed to LMS to skip past');
+    ok($stopped->(), 'the player is stopped instead - the stampede ends here');
+
+    # And the trip clears the run, so the player is not left permanently armed:
+    # the next thing the user asks for gets a fresh FAIL_LIMIT attempts.
+    is($bp->hqFailRun, '0', 'the trip clears the run');
+
+    # THE RESET. Consecutive means consecutive - a track that actually plays
+    # clears the count, or three unrelated failures spread over an evening would
+    # stop a healthy player.
+    my ( $rp, $rc ) = $mk->('02:cb:00:00:00:02');
+    $failOnce->( $rp, $rc );
+    $failOnce->( $rp, $rc );
+    is($rp->hqFailRun, '2', 'two failures, one short of the limit');
+
+    @sent = (); @sentCb = ();
+    Slim::Utils::Timers::_reset();
+    $rp->play({ controller => $rc });
+    _answer();                            # PlaylistAdd -> OK
+    _answer();                            # Play        -> OK
+    my ($rurl) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    status($rp, 2, $rurl, 1);
+    is($rp->hqStarted, '1', 'a good load starts as usual');
+    is($rp->hqFailRun, '0', 'and a track that actually started clears the run');
+
+    # ...so the next two failures are reported rather than tripping.
+    $failOnce->( $rp, $rc );
+    $failOnce->( $rp, $rc );
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$rc->{calls}}),
+       'the failure after a healthy track is reported, not tripped on');
+    ok(!$stopped->(), 'and the player keeps running');
+
+    # THE OTHER THREE ENTRY POINTS. A rejected <Play/> and an ack that never
+    # becomes playback are the same failure, and must count on the same run - a
+    # breaker wired to one site only would leave the other routes stampeding.
+    my ( $vp, $vc ) = $mk->('02:cb:00:00:00:03');
+    for ( 1 .. 2 ) {
+        @sent = (); @sentCb = (); $vc->{calls} = [];
+        @ex = ();
+        Slim::Utils::Timers::_reset();
+        $vp->play({ controller => $vc });
+        _answer();                        # PlaylistAdd -> OK
+        _answer(0);                       # Play        -> Error
+        Slim::Utils::Timers::_fireAll();
+    }
+    is($vp->hqFailRun, '2', 'a rejected <Play/> counts on the same run');
+
+    # ...and the start deadline is the third route: PlaylistAdd and Play both
+    # acked, HQPlayer simply never reports playing.
+    @sent = (); @sentCb = (); $vc->{calls} = [];
+    @ex = ();
+    Slim::Utils::Timers::_reset();
+    $vp->play({ controller => $vc });
+    _answer();                            # PlaylistAdd -> OK
+    _answer();                            # Play        -> OK
+    Slim::Utils::Timers::_fireAll();      # the deadline expires, then the trip
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$vc->{calls}}),
+       'an expired start deadline trips the breaker at the limit like any other failure');
+    ok($stopped->(), 'and stops the player');
+
+    # THE WIRING. Everything above would pass against a breaker bolted onto one
+    # call site, so assert there is only ONE place a failed load is reported.
+    {
+        open my $pm, '<', 'Plugins/HQPlayerBridge/Player.pm' or die $!;
+        my $mod = do { local $/; <$pm> };
+        close $pm;
+
+        my ($lf) = $mod =~ /\nsub _loadFailed \{(.*?)\n\}\n/s;
+        ok(scalar( $lf && $lf =~ /playerStreamingFailed/ ),
+           '_loadFailed is where a failed load is reported');
+
+        my @direct = grep { /playerStreamingFailed/ && !/^\s*#/ } split /\n/, $mod;
+        is(scalar(@direct), '1',
+           'and it is the ONLY place in Player.pm that calls it');
+
+        ok(scalar( $mod =~ /use constant FAIL_LIMIT => \d+;/ ),
+           'the limit is a named constant, not a bare number');
+
+        # The behavioural reset test above cannot tell a reset at the latch from
+        # a reset somewhere else that happens to run on the same path.
+        ok(scalar( $mod =~ /hqStarted\( 1 \);.*?hqFailRun\( 0 \)/s ),
+           'and the start latch is what clears the run');
+    }
+
+    Slim::Utils::Timers::_reset();
+    @ex = ();
 }
 
 print "-- a load superseded mid-flight --\n";

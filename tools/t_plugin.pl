@@ -7,7 +7,6 @@ use strict; use warnings;
 BEGIN { package main; use constant DEBUGLOG=>0; use constant INFOLOG=>0; use constant WEBUI=>1; }
 use lib '.';
 require Plugins::HQPlayerBridge::Plugin;
-require Plugins::HQPlayerBridge::Settings;
 
 my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
@@ -244,9 +243,14 @@ is(Plugins::HQPlayerBridge::Plugin::_shortMime(undef), '(undef)',
    'and no mime at all is undef, not an empty string the template would print');
 
 
-# THE MATERIAL/APPS FEED.  It exists so the settings page is reachable without
-# digging through LMS's server settings menu - a `weblink` row opens it in
-# Material's own iframe dialog.
+# THE MATERIAL/APPS FEED.  There is no settings page any more - nothing in this
+# plugin is configurable, so the only thing one was ever good for was reading
+# numbers, and it could not keep them current.
+#
+# A BROWSE LIST CANNOT REFRESH ITSELF IN MATERIAL. Settled from Material's own
+# source: every `refreshList` trigger in browse-page.js is a USER ACTION inside
+# Material, and no LMS notification is wired to it. So these rows are a
+# SNAPSHOT, permanently, and the live reading lives on its own page.
 print "-- the apps feed --\n";
 {
     package FeedClient;
@@ -254,6 +258,7 @@ print "-- the apps feed --\n";
     sub hqRate { '44100' } sub hqBits { '16' } sub hqMime { 'audio/x-flac' }
     sub hqPath { $_[0]->{path} }
     sub hqTier { 1 }
+    sub hqTransport { 5 }
 
     package FeedCtl;
     sub new { bless {}, shift } sub connected { 1 }
@@ -277,31 +282,51 @@ Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
 ok(ref $feed eq 'HASH', 'the feed calls its callback with a hash');
 my @i = @{ $feed->{items} || [] };
 
-is($i[0]->{name}, 'PLUGIN_HQPLAYER_SETTINGS', 'the settings row is FIRST - an action row belongs at the top');
-is($i[0]->{weblink}, '/plugins/HQPlayerBridge/settings/basic.html',
-   'and it weblinks to the page Settings.pm actually registers');
+is($i[0]->{name}, 'PLUGIN_HQPLAYER_LIVE_TITLE', 'the live-view row is FIRST');
 is($i[0]->{type}, 'link', 'and it is a link, so Material opens it');
 
-is($i[1]->{name}, 'PLUGIN_HQPLAYER_REFRESH', 'a Refresh row follows it');
-is($i[1]->{nextWindow}, 'refresh',
-   "nextWindow=refresh - a browse page is a SNAPSHOT, and this re-renders it inline");
-{
-    my $got;
-    $i[1]->{url}->( undef, sub { $got = shift } );
-    is(scalar @{ $got->{items} }, '0',
-       'and it answers EMPTY, which is what makes Material re-render rather than push a page');
-}
+# The route is Live.pm's own constant, not a copy of the string. A duplicated
+# literal is exactly how a working link rots into a 404.
+is($i[0]->{weblink}, Plugins::HQPlayerBridge::Live::PATH(),
+   'and it weblinks to the path Live.pm actually registers');
 
-my @status = @i[2 .. $#i];
+# THE ROWS SIMON DID NOT ASK FOR AND MUST NOT COME BACK.
+is(scalar( grep { ($_->{nextWindow} // '') eq 'refresh' } @i ), '0',
+   'there is NO manual Refresh row - a live view was asked for, not a button');
+is(scalar( grep { ($_->{weblink} // '') =~ /settings/ } @i ), '0',
+   'and nothing links to a settings page - there is not one any more');
+
+# WITH A BRIDGE PRESENT there is nothing to say about waiting - the waiting rows
+# below must not appear here as well.
+is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_LIVE_WAITING' } @i ), '0',
+   'a discovered bridge draws no waiting row');
+
+my @status = @i[1 .. $#i];
 is(scalar( grep { ($_->{type} // '') ne 'text' } @status ), '0',
    'every status row is type=text - a non-playable row with no action gets one FORCED on by XMLBrowser');
 
 my $all = join '|', map { $_->{name} } @status;
-ok(scalar( $all =~ /PLUGIN_HQPLAYER_SOURCE: 44100 Hz \/ 16 bit FLAC/ ), 'the source format is reported');
-ok(scalar( $all =~ /PLUGIN_HQPLAYER_OUTFORMAT: 96000 Hz \/ 24 bit PCM/ ), 'and the output format');
-ok(scalar( $all =~ /poly-sinc-gauss-long.*TPDF.*30\.3/ ),
-   'and the processing chain with the speed (labelled, via the shared formatter)');
-ok(scalar( $all =~ /PLUGIN_HQPLAYER_CONNECTED - 10\.0\.0\.5:4321/ ), 'and the link state with the address');
+
+# THE APPS LIST SHOWS SETTINGS, NOT THE SIGNAL PATH. This list is a snapshot
+# that can never refresh itself (Material has no plugin-reachable path to
+# re-render a browse page), so what belongs here is what is still TRUE a minute
+# later: the things you would go into HQPlayer to change. The moving signal
+# path - source and output formats per track, a speed that changes every
+# second - is the live page's job.
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_MODE: PCM/ ),                       'the output mode is reported');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_FILTER: poly-sinc-gauss-long/ ),    'and the filter');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_SHAPER: TPDF/ ),                    'and the shaper');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_OUTPUT: PLUGIN_HQPLAYER_TRANSPORT_ID 5/ ),
+   'and the transport, labelled Output with the id as its VALUE');
+ok(scalar( $all =~ /PLUGIN_HQPLAYER_CONNECTED - 10\.0\.0\.5:4321/ ),   'and the link state with the address');
+
+# THE CONTROL. Without these the change could be additive and every assertion
+# above would still pass while the stale signal path stayed on the page.
+ok(scalar( $all !~ /PLUGIN_HQPLAYER_SOURCE:/ ),
+   'the per-track SOURCE format is gone - it moves, so it belongs on the live page');
+ok(scalar( $all !~ /PLUGIN_HQPLAYER_OUTFORMAT:/ ), 'and so is the output format');
+ok(scalar( $all !~ /30\.3/ ),
+   'and the processing SPEED is gone - a number that changes every second has no business in a snapshot');
 
 # A player that has reported nothing must not produce empty rows.
 $reg->{aa}->{client} = FeedClient->new({});
@@ -326,6 +351,7 @@ print "-- signalPathFor: one formatter, three surfaces --\n";
     sub new  { bless { p => $_[1], tier => $_[2] }, $_[0] }
     sub hqRate { '44100' } sub hqBits { '16' } sub hqMime { 'audio/x-flac' }
     sub hqPath { $_[0]->{p} } sub hqTier { $_[0]->{tier} }
+    sub hqTransport { $_[0]->{tr} }
     package PathCtl;
     sub new { bless {}, shift } sub connected { 1 }
 }
@@ -344,9 +370,15 @@ my $bridge = {
 my $p = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef, $bridge );
 is($p->{source}, '44100 Hz / 16 bit FLAC', 'source is the <metadata/> child half');
 is($p->{output}, '96000 Hz / 24 bit PCM',  'output is the <Status/> root half');
-is($p->{processing},
-   'PLUGIN_HQPLAYER_FILTER poly-sinc-gauss-long - PLUGIN_HQPLAYER_SHAPER TPDF - 30.3PLUGIN_HQPLAYER_SPEED',
-   'processing joins filter, shaper and speed');
+# ONE FIELD PER FACT. These used to be joined into a single `processing` line
+# with the labels baked into the VALUE, which left the live page rendering a
+# sentence it could not lay out. Three fields, three rows.
+is($p->{filter}, 'poly-sinc-gauss-long', 'filter is its own field');
+is($p->{shaper}, 'TPDF',                 'shaper is its own field');
+is($p->{speed},  '30.3PLUGIN_HQPLAYER_SPEED',
+   'and the speed is its own field, carrying only its unit');
+ok(!exists $p->{processing},
+   'the joined processing line is GONE - two ways to say one thing is how they drift');
 is($p->{tier}, 'PLUGIN_HQPLAYER_TIER1', 'the tier prose follows hqTier');
 is($p->{connected}, 'PLUGIN_HQPLAYER_CONNECTED - 10.0.0.5:4321', 'and the link state carries the address');
 
@@ -355,24 +387,99 @@ is($p->{connected}, 'PLUGIN_HQPLAYER_CONNECTED - 10.0.0.5:4321', 'and the link s
 my $q = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef,
     { control => PathCtl->new, instance => {}, client => PathClient->new({}, undef) } );
 ok(!exists $q->{output},     'no output reported means the key is ABSENT, not empty');
-ok(!exists $q->{processing}, 'and so does no processing');
+ok(!exists $q->{filter}, 'and so does no filter');
+ok(!exists $q->{shaper}, 'and no shaper');
+ok(!exists $q->{speed},  'and no speed');
 ok(!exists $q->{tier},       'and no tier');
 
 # A bridge with no player at all must not die.
 my $none = Plugins::HQPlayerBridge::Plugin::signalPathFor( undef, { instance => {} } );
 is(scalar(keys %$none), '0', 'a bridge with no player yields an empty path, not a crash');
 
-# The feed and the settings page must render the SAME strings - that is the
-# whole point of the shared formatter.
+# ONE FORMATTER, TWO AUDIENCES. The Apps feed and the live page draw on the
+# same signalPathFor, and each renders its half VERBATIM - the feed the settings
+# (mode/filter/shaper/transport), the live page the moving signal path. Neither
+# surface formats anything itself, which is what keeps them from disagreeing
+# about what "Filter" reads like.
 {
     my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
     %$reg = ( aa => $bridge );
     my $feed;
     Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
     my $names = join '|', map { $_->{name} } @{ $feed->{items} };
-    ok(scalar( index($names, $p->{source}) >= 0 ), 'the feed renders the formatter output verbatim');
-    ok(scalar( index($names, $p->{processing}) >= 0 ), 'processing included');
+    for my $k (qw( filter shaper )) {
+        ok(scalar( defined $p->{$k} && index($names, $p->{$k}) >= 0 ),
+           "the feed renders the formatter's $k verbatim");
+    }
     %$reg = ();
+}
+
+print "-- nothing discovered yet SAYS so, in the same words as the live page --\n";
+# A bare link and nothing else leaves the user unsure whether the plugin is
+# working at all. Discovery keeps probing, and an instance that is simply
+# switched off will appear on its own - so the wording is WAITING, not failed,
+# matching the live page. The second row is the diagnostic for when it never
+# does turn up.
+{
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    %$reg = ();
+    my $feed;
+    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+    my @i = @{ $feed->{items} || [] };
+    is($i[0]->{type}, 'link', 'the live-view row is still first');
+    is($i[1]->{name}, 'PLUGIN_HQPLAYER_LIVE_WAITING',
+       'and an empty registry says it is waiting for the player');
+    is($i[2]->{name}, 'PLUGIN_HQPLAYER_NONE_DESC',
+       'with the discovery diagnostic under it');
+    is(scalar( grep { ($_->{type} // '') ne 'text' } @i[1 .. $#i] ), '0',
+       'both are plain text rows - a non-playable item with an action navigates when tapped');
+}
+
+print "-- the Material Home tile: the ONLY one-tap route to the live view --\n";
+# AN APPS ENTRY CANNOT OPEN A PAGE. Material's `apps` command builds every
+# plugin entry itself with `type => 'redirect'` and a `go` action into
+# [<tag>,'items'] - there is no weblink field a plugin can supply, and
+# browse-resp.js does not auto-open a single-item feed. So Apps always browses
+# into the feed. A "pinned" custom action carrying a weblink becomes a HOME
+# tile that opens it on one tap, and that is what postinitPlugin registers.
+my @reg;
+{
+    no warnings 'redefine', 'once';
+    *Plugins::MaterialSkin::Plugin::registerCustomAction = sub { push @reg, [@_]; return };
+}
+
+Plugins::HQPlayerBridge::Plugin::postinitPlugin();
+
+is(scalar(@reg), '1', 'exactly one action is registered');
+is($reg[0][0], 'pinned', 'in the "pinned" section - that is what becomes a Home tile');
+is($reg[0][1]{iframe}, Plugins::HQPlayerBridge::Live::PATH(),
+   'and it points at the live page via `iframe`, which opens INLINE in Material');
+ok(scalar(!exists $reg[0][1]{weblink}),
+   'NOT `weblink` - doCustomAction calls window.open for that, tearing off a separate window');
+ok(scalar(defined $reg[0][1]{title} && length $reg[0][1]{title}), 'the tile has a title');
+
+# THE TILE'S TITLE IS ITS NAME ON THE HOME SCREEN. It must be the same string
+# the Apps row uses - two labels for one destination is how they drift.
+is($reg[0][1]{title}, $i[0]->{name},
+   'and it is the SAME string as the Apps row, so the two cannot drift apart');
+ok(scalar(defined $reg[0][1]{icon}), 'and an icon');
+
+# THE TRAP. registerCustomAction PUSHES - no unregister, no de-dupe - so a
+# second call puts the tile on Home twice. It must only ever run at postinit.
+@reg = ();
+Plugins::HQPlayerBridge::Plugin::postinitPlugin();
+is(scalar(@reg), '1', 'each call registers again - so it must run ONCE per server run');
+
+print "-- and no Material means no tile, not a crash --\n";
+{
+    # ->can on a package that was never loaded answers undef. An install with
+    # no Material must get a working plugin and a silent skip.
+    no warnings 'redefine', 'once';
+    undef *Plugins::MaterialSkin::Plugin::registerCustomAction;
+    @reg = ();
+    my $ok = eval { Plugins::HQPlayerBridge::Plugin::postinitPlugin(); 1 };
+    ok($ok, 'postinitPlugin survives Material being absent');
+    is(scalar(@reg), '0', 'and registers nothing');
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;

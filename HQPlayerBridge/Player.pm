@@ -2,10 +2,15 @@ package Plugins::HQPlayerBridge::Player;
 
 # A virtual LMS player that drives HQPlayer over its XML control API.
 #
-# No audio passes through this module.  Both LMS and HQPlayer are pull
+# This module adds no audio stage of its own.  Both LMS and HQPlayer are pull
 # engines: LMS hands a player a URL and the player fetches the bytes itself,
 # and HQPlayer does exactly the same.  So the bridge only ever moves control
 # messages, and hands HQPlayer a URL pointing back at LMS's own HTTP server.
+#
+# That is NOT the same as "LMS never touches the audio", and the difference
+# matters: tier 3 is a LMS TRANSCODE of a format HQPlayer cannot decode, and
+# tier 4's bytes run through LMS's streaming machinery.  Only tiers 1 and 5 are
+# genuinely untouched.  See _resolveURL.
 #
 # We subclass Slim::Player::Player rather than Slim::Player::Squeezebox
 # deliberately: everything that assumes a live SlimProto socket ($client->
@@ -18,7 +23,6 @@ use warnings;
 use base qw(Slim::Player::Player);
 
 use Slim::Utils::Log;
-use Slim::Utils::Misc;
 use Slim::Utils::Prefs;
 use Slim::Utils::Timers;
 use Slim::Music::Info;
@@ -43,7 +47,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqWanted hqVolDb hqVolMin hqVolMax
     hqVolSent hqVolSentAt
     hqGen hqPlayAck hqURL hqPrevURL
-    hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt
+    hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt hqFailRun
 ) );
 
 my $log        = logger('plugin.hqplayerbridge');
@@ -86,6 +90,22 @@ use constant START_GRACE => 2;
 # playing in ~0.33s, and the slowest known real case is a sample-rate change
 # forcing an engine reinit at ~2.3s.
 use constant START_DEADLINE => 10;
+
+# How many CONSECUTIVE failed loads before the bridge stops the player instead
+# of handing LMS another failure to skip past.
+#
+# THE HARM THIS BOUNDS. Every failed load is reported as PROBLEM_OPENING, LMS
+# skips to the next track, and against a sick daemon that load fails the same
+# way: measured live against an hqplayerd whose control thread had wedged, FIVE
+# full Stop/Stop/PlaylistClear/PlaylistAdd cycles in UNDER ONE SECOND. The
+# bridge does not CAUSE the wedge - the daemon throws on a bare <VolumeRange/>
+# from an uninvolved host - but it hammers a daemon that is already sick, and
+# turns one bad track into a race through the whole album.
+#
+# 3 is deliberately low. One failure is an ordinary bad track and LMS skipping
+# it is right; three in a row with nothing playing in between is not a track
+# problem, it is a link or a daemon problem, and skipping cannot fix either.
+use constant FAIL_LIMIT => 3;
 
 # HQPlayer reports state as an INTEGER, not a word - verified live 2026-08-26
 # by driving a real track through Play/Pause/Stop and watching <Status/>.
@@ -144,6 +164,7 @@ sub new {
         hqTrackNo    => undef,
         hqStaleRun   => 0,
         hqStartedAt  => 0,
+        hqFailRun    => 0,
     );
 
     return $client;
@@ -1240,8 +1261,7 @@ sub _queueTrack {
 
     if ( !$self->hqControl ) {
         $log->error( $self->name . ': no control link - cannot start playback' );
-        my $c = $self->controller;
-        $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+        $self->_loadFailed('no control link');
         return;
     }
 
@@ -1277,8 +1297,7 @@ sub _queueTrack {
             if ( !$res ) {
                 $log->error( $self->name . ': HQPlayer would not accept the track URI: '
                     . ( defined $raw ? $raw : 'no reply' ) );
-                my $c = $self->controller;
-                $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+                $self->_loadFailed('PlaylistAdd refused');
                 return;
             }
 
@@ -1295,8 +1314,7 @@ sub _queueTrack {
             if ( !$r2 ) {
                 $log->error( $self->name . ': HQPlayer would not start the track: '
                     . ( defined $raw2 ? $raw2 : 'no reply' ) );
-                my $c = $self->controller;
-                $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+                $self->_loadFailed('Play refused');
                 return;
             }
 
@@ -1417,9 +1435,75 @@ sub _startDeadline {
     # whole album; one report per load, a deadline apart, is the opposite.
     $self->hqStarted( 0 );
 
+    $self->_loadFailed('acked but never started');
+
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# The circuit breaker - see FAIL_LIMIT
+# ---------------------------------------------------------------------------
+
+# THE ONE PLACE A FAILED LOAD IS REPORTED. All four routes to a failed load come
+# through here - no control link, a refused <PlaylistAdd>, a refused <Play/> and
+# a Play that was acked but never started - because the run has to be counted
+# across all of them. A breaker wired to one site leaves the other three
+# stampeding, and against a wedged daemon they do not fail one at a time.
+sub _loadFailed {
+    my ( $self, $why ) = @_;
+
+    my $run = ( $self->hqFailRun || 0 ) + 1;
+    $self->hqFailRun($run);
+
     my $c = $self->controller;
 
-    $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+    if ( $run < FAIL_LIMIT ) {
+
+        main::INFOLOG && $log->is_info && $log->info( $self->name . sprintf(
+            ': load failed (%s) - %d of %d', $why, $run, FAIL_LIMIT ) );
+
+        # As before: LMS is told, and LMS gets to skip.
+        $c->playerStreamingFailed( $self, 'PROBLEM_OPENING' ) if $c;
+
+        return;
+    }
+
+    $log->error( $self->name . sprintf(
+        ': %d consecutive failed loads (%s) - stopping the player rather than '
+      . 'skipping through the playlist', $run, $why ) );
+
+    # CLEARED ON THE TRIP, not on the next play. The player must not be left
+    # permanently armed: whatever the user asks for next gets a fresh FAIL_LIMIT
+    # attempts. Deliberately NOT reset in stop() or play() either - LMS calls
+    # both on the skip path this exists to stop, so resetting there would defeat
+    # the count entirely.
+    $self->hqFailRun(0);
+
+    # DELIBERATELY NOT playerStreamingFailed: that is the skip. LMS is left
+    # waiting on this load, so the stop below is what releases it.
+    #
+    # Deferred by one event-loop turn. Two of the four routes here are inside a
+    # call LMS made into us (play() with no link) or inside a control-socket
+    # callback, and dispatching a stop command re-entrantly from either is a
+    # tangle nobody needs. The generation guard is the same one _startDeadline
+    # uses: if anything has superseded this load by the time the turn comes
+    # round, there is nothing left to stop.
+    Slim::Utils::Timers::killTimers( $self, \&_tripStop );
+    Slim::Utils::Timers::setTimer( $self,
+        Time::HiRes::time(), \&_tripStop, $self->hqGen || 0 );
+
+    return;
+}
+
+# TRAP: setTimer calls back as ($obj, @args) - see _startDeadline.
+sub _tripStop {
+    my ( $self, $gen ) = @_;
+
+    return if $self->_superseded( $gen, 'load failure trip' );
+
+    # The user's own stop, not ours: it has to reach the CONTROLLER, or LMS
+    # sits in mode=play with nothing streaming.
+    $self->execute( ['stop'] );
 
     return;
 }
@@ -2371,6 +2455,11 @@ sub _onStatus {
         if ( $ack && !$self->hqStarted ) {
             $self->hqStarted( 1 );
             $self->hqStartedAt( Time::HiRes::time() );
+
+            # A track that actually plays is the proof the link and the daemon
+            # are healthy, so the consecutive-failure run starts again from
+            # here. This is the ONLY reset besides the trip itself.
+            $self->hqFailRun( 0 );
 
             # It started within the deadline - that is what the deadline was
             # waiting for.

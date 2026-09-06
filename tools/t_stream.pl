@@ -255,7 +255,11 @@ print "-- a seeked FLAC stream gets its container header back --\n";
     sub samplesize   { $_[0]->{bits} }
 }
 
-my $seeked = SeekSong->new( fmt=>'flc', seek=>{ timeOffset=>90 }, rate=>96000, ch=>2, bits=>24 );
+# A PASSTHROUGH seek sets BOTH offsets - Protocols::HTTP::getSeekData computes
+# `sourceStreamOffset => $offset + audio_offset` alongside the time - and the
+# byte one is what re-opens the source mid-container, losing the header.
+my $seeked = SeekSong->new( fmt=>'flc', rate=>96000, ch=>2, bits=>24,
+                            seek=>{ timeOffset=>90, sourceStreamOffset=>123456 } );
 $client->controller( FakeController->new( FakeStreamController->new($seeked) ) );
 
 Slim::Web::HTTP::_reset();
@@ -290,6 +294,20 @@ $client->streamingsocket(undef);
 call( 'GET', '/hqp/02-ab-88-42-4c-69/12.flac' );
 ok( scalar( $Slim::Web::HTTP::STREAMS[0]{headers} !~ /fLaC/ ),
     'an unseeked stream is left alone - it has a real header already' );
+
+# AND NOT ON A TIME-ONLY SEEK, WHICH IS THE OTHER HALF OF "seeked".
+# `timeOffset` alone means a transcoder or a protocol handler started at that
+# time and encoded the audio FRESH - so it arrives as a complete container and a
+# second header is read as corrupt audio. BBC Sounds is exactly this: its
+# getSeekData answers `{ timeOffset => $newtime }` and nothing else, and LMS
+# opens a live station at the live edge, so this fired on every ordinary play.
+$client->controller( FakeController->new( FakeStreamController->new(
+    SeekSong->new( fmt=>'flc', seek=>{ timeOffset=>10281 }, rate=>48000, ch=>2, bits=>16 ) ) ) );
+Slim::Web::HTTP::_reset();
+$client->streamingsocket(undef);
+call( 'GET', '/hqp/02-ab-88-42-4c-69/14.flac' );
+ok( scalar( $Slim::Web::HTTP::STREAMS[0]{headers} !~ /fLaC/ ),
+    'a TIME-only seek gets nothing - the audio was encoded fresh and has its own header' );
 
 # nor on a format that does not need one
 $client->controller( FakeController->new( FakeStreamController->new(

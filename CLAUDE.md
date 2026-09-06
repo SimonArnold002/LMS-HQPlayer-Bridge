@@ -30,6 +30,7 @@ declined.
 | The bridge should scale LMS's ReplayGain figure at all — compensate for HQPlayer's convolution gain, cap it against the peak, or assert unity when there is none (`Player.pm`, `_replayGain`) | **REVERSED** 2026-08-31, Simon's call | Every layer built over 0.2.39-0.2.48 is removed in 0.2.49 and the figure now goes out **verbatim, on every tier**, with no attribute at all when LMS has none: *"Adaptive gain for replay gain is just applied with no compensation at all as we originally had it. Do not read the gains from Convolution."* / *"all tiers operate the same, no replay gain provided by LMS no Adaptive Gain added"*. **The facts underneath the compensation were sound** — HQPlayer really does apply its convolution gain compensation on top of `album_gain`, so a -10.03 album with -3.01 of compensation really did land at -13.04 — but that is HQPlayer doing what the user configured, and cancelling it out is not the bridge's job. **The lesson is the pattern, not the arithmetic:** five builds each corrected the previous build's ceiling (volume room, then headroom, then peak-vs-0dB base) and every one was a new way to disagree with a number LMS had already computed correctly. When a correction needs its own correction three times over, the thing to question is whether to be correcting at all. `readConvGain`, `_convGainFromFile`, `_watchDsp`, `_dspSignature`, the three accessors and both constants are DELETED, and `t_player.pl` asserts their absence so a dormant reader cannot be quietly rewired. |
 | `enabled` on `<VolumeRange/>` is the fixed-volume flag, and should replace `_watchForFixed` (`Player.pm`) | **WRONG** 2026-09-05, measured | It is not, and there is no HQPlayer-side fixed-volume state for any flag to report. Probed live against engine 6.0.4 with `<fixed volume="-3"/>` configured **and applied**: `<VolumeRange adaptive="1" enabled="1" max="0" min="-100"/>` — `enabled` unchanged, and the range did not collapse either. hqplayerd's own log agrees, printing `Volume max: 0` / `Volume min: -100` / `Control active volume range: -100 - 0 dB` at the restart that applied the setting, with `Set volume: -3.000000` alongside — and the word "fixed" appears **zero times in 10.9 MB of log**. **HQPlayer's "fixed volume" is a STARTUP LEVEL, not a lock:** it sets the output once, bypassing the startup/default volume, and the level stays changeable from HQPlayer's UI or from the endpoint's device volume on an NAA. Simon: *"It does not lock out volume control."* Signalyst's own client settles the type and nothing more — `ControlInterface.cpp:2177` parses `enabled` as a bool and `ControlApplication.cpp:668` only `qDebug`s it. **Nothing reads `enabled` or `adaptive`; both are logged at debug so a future engine changing them is visible without anything depending on them.** |
 | The plugin should detect a non-attenuating HQPlayer and set the player's `digitalVolumeControl` pref to 0 itself (`Player.pm`, `_setFixed` / `_watchForFixed`) | **REVERSED** 2026-09-05, Simon's call | Both detectors — a zero-width range, and three sends that changed nothing — were inferring the state disproven in the row above, and on that inference `_setFixed` **wrote the user's pref**. A coincidence of three (the user holding the volume on HQPlayer's own UI across three sends) would silently switch the LMS player to fixed volume. Same over-reach class as the volume guard reversed in 0.2.32, and the same ruling: *"we should not be setting anything to 0"*. **The only fixed-volume switch is LMS's own radio**, and it means one thing — LMS stops driving HQPlayer's volume. The startup level is whatever HQPlayer holds (its software volume, or the device volume on an NAA like the Eversolo) and LMS mirrors it rather than asserting one. `_setFixed`, `_watchForFixed`, `hqVolFixed`, `hqVolForced`, `hqVolMissed`, `FIXED_STRIKES` and `MISS_DELAY` are DELETED; `digitalVolumeControl` is now READ and never written, and `t_player.pl` asserts both subs' absence and that no `set('digitalVolumeControl'` survives in `Player.pm`. |
+| A failed load should always be handed to LMS as `PROBLEM_OPENING`, because skipping the track is the right recovery (`Player.pm`, the four `playerStreamingFailed` sites) | **ACCEPTED 2026-09-05, BUILT in 0.2.60** | It is right for ONE bad track and wrong for a sick link. Every failure LMS is told about makes it skip and load the next track, which fails the same way: measured against a wedged hqplayerd, **five full `Stop/Stop/PlaylistClear/PlaylistAdd` cycles in under one second**, racing the whole album while hammering a daemon that is already sick. The bridge does not cause the wedge — the daemon throws on a bare `<VolumeRange/>` from an uninvolved host — but it is the thing turning one failure into a hundred. Built as `FAIL_LIMIT` (**3**) + `_loadFailed`: all four routes to a failed load funnel through one sub so the run is counted across them, below the limit nothing changes, and at the limit the bridge stops the player instead of reporting another skippable failure. **The run is cleared in exactly two places** — the `hqStarted` latch (a track that really played is proof the link is healthy) and the trip itself (so the player is never left permanently armed; the user's next play gets a fresh three). **Deliberately NOT cleared in `stop()` or `play()`**: LMS calls both on the very skip path this exists to bound, so resetting there would defeat the count entirely. |
 | UPnP must stay for the volume range, because the control API cannot report one (`UPnP.pm`, `Player.pm` `refreshVolumeRange`) | **REMOVED** 2026-09-05 in 0.2.54 | `<VolumeRange/>` is a control command and answers the same range in **plain dB** on the socket that is already open, in ~9 ms against UPnP's 300-550 ms. `UPnP.pm` (414 lines), `t_upnp.pl`, the `describe` handshake and its 5s->60s backoff, the SOAP client, the dormant Play-retry loop and `cancelPlay` are all deleted, and the range now rides the control link's own reconnect via `refreshInfo` on link-up — one retry carrier instead of two. The plugin no longer speaks HTTP at all (`SimpleAsyncHTTP` had no live caller left). **The 1/256 fixed-point discriminator did NOT come across**: that was RenderingControl's unit, and `<VolumeRange/>` is plain dB. Makes the port-8019 log-flood hazard structurally unreachable. |
 
 
@@ -37,11 +38,21 @@ Presents each HQPlayer instance on the network as a native Lyrion player,
 driven over HQPlayer's own XML control API. Replaces the `squeeze2upnp` UPnP
 bridge path.
 
-**No audio passes through this plugin.** LMS and HQPlayer are both *pull*
+**The plugin adds no audio stage of its own.** LMS and HQPlayer are both *pull*
 engines: LMS hands a player a URL and the player fetches the bytes; HQPlayer
 does the same. So the bridge only moves control messages, and hands HQPlayer a
 URL pointing back at LMS's own HTTP server. That removes the UPnP hop, the
 external binary and the bridge's own buffer.
+
+**BUT "no audio through the plugin" IS NOT TRUE, AND MUST NOT BE WRITTEN THAT
+WAY.** It was, in every description, until Simon corrected it 2026-09-05. Per
+tier: **tier 1** and **tier 5** genuinely are untouched — the file is served
+byte-for-byte and a service URL is fetched by HQPlayer from the service itself.
+**Tier 3 is a TRANSCODE**: a format HQPlayer cannot decode (m4a/ALAC/AAC, 3.8%
+of Simon's library) is converted by LMS on the fly. **Tier 4** carries its bytes
+through LMS's streaming machinery and this plugin's own `/hqp/` endpoint. So the
+honest claim is about the plugin adding no stage, never about LMS not touching
+the audio.
 
 **The core premise is verified end to end** (2026-08-26, live hqplayerd 6.0.4):
 `PlaylistAdd` accepts an arbitrary `http://` URI, and HQPlayer fetches it
@@ -57,7 +68,7 @@ then plays it.
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
 | `HQPlayerBridge/Stream.pm` | Tier 4: the path-only audio endpoint HQPlayer can actually fetch |
-| `HQPlayerBridge/Settings.pm` | Read-only status page - connection, tier, and the signal path |
+| `HQPlayerBridge/Live.pm` | The standalone live page - a raw handler owning the WHOLE document |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 
 ## Branches and releasing
@@ -1879,7 +1890,7 @@ player's prefs once; the thrash cost them every round.
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs 487 assertions across four files, and sweeps called-vs-defined subs.
+tree, runs 622 assertions across five files, and sweeps called-vs-defined subs.
 
 | file | covers |
 |---|---|
@@ -1887,6 +1898,7 @@ tree, runs 487 assertions across four files, and sweeps called-vs-defined subs.
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift |
+| `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
 one, so hash-slot mistakes fail here rather than on the server.
@@ -2761,13 +2773,1019 @@ becomes `PROBLEM_OPENING`, LMS skips to the next track, that load fails too -
 **five full `Stop/Stop/PlaylistClear/PlaylistAdd` cycles in under a second** at
 15:01:29. It does not cause the wedge but it hammers a daemon that is already
 sick. **A circuit breaker after N consecutive load failures is worth building
-whatever the root cause turns out to be.** Not built yet.
+whatever the root cause turns out to be.** **BUILT in 0.2.60** — see
+`FAIL_LIMIT` and `_loadFailed` below.
 
 **The trigger is still unknown** - nothing is logged between the last healthy
 event and the first exception in any of three sessions. **To catch it, leave a
 wedged daemon RUNNING** and probe it: whether `Status`/`GetInfo` still answer
 while `PlaylistAdd` throws separates "the parser is broken" from "the playlist
 engine is broken", and that is the fork logs cannot settle.
+
+## 0.2.60 (2026-09-05): the circuit breaker
+
+The last "owed but not built" item from the wedge investigation. No change to
+playback, transport, volume or the signal path — only to what happens when a
+load fails three times running.
+
+`FAIL_LIMIT` is **3**, and `_loadFailed` is now the ONE place a failed load is
+reported. All four routes reach it — no control link, a refused
+`<PlaylistAdd>`, a refused `<Play/>`, and the `START_DEADLINE` expiring on an
+ack that never became playback — because a wedged daemon does not fail by one
+route at a time, and a breaker wired to a single call site leaves the other
+three stampeding. `t_player.pl` asserts that count directly: exactly one
+non-comment `playerStreamingFailed` survives in `Player.pm`.
+
+Below the limit **nothing changes** — LMS is told, and LMS gets to skip, which
+is the right answer for one bad track. At the limit the failure is deliberately
+NOT reported, because reporting it *is* the skip; instead `_tripStop` runs
+`execute(['stop'])` one event-loop turn later. The defer matters: two of the
+four routes are inside a call LMS made into us (`play()` with no link) or
+inside a control-socket callback, and dispatching a stop re-entrantly from
+either is a tangle. The turn is guarded by the same generation check
+`_startDeadline` uses, so a load superseded in the meantime stops nothing.
+
+**Where the run is cleared is the whole design.** Two places only: the
+`hqStarted` latch, and the trip. Clearing it in `stop()` or `play()` would be
+the obvious thing and would defeat the breaker outright — LMS calls both on the
+skip path this exists to bound.
+
+545 assertions green; **not yet tested on the live LMS.**
+
+## 0.2.61 (2026-09-05): the live page, because the settings page could not be proved
+
+**Simon: the settings page never updated for him, and no measurement located
+the fault.** Everything checkable checked out: the `signalpath` query answers
+live and its values move (63.2 -> 68.5 -> 64.3 -> 55.0x, sampled 2s apart); the
+served script is syntactically clean and, **executed against a real server
+response with a stub DOM, writes every row correctly**; Material uses a plain
+`<iframe :src>` with **no `sandbox` and no CSP anywhere**, and its
+`applyModifications()` only adds CSS classes to a plugin page (the DOM-rewriting
+paths are gated to `server`/`player`/`extras`/`lms`). His own disproof of the
+"your browser" theory was correct and decisive: Now Playing and scan progress
+update live for him — though both run in Material's OWN document, not in the
+settings iframe, which is the distinction that kept the question open.
+
+**His call, and it is the right one:** stop defending that page and open a
+proper one. What the settings page cannot shed is its surroundings — it is a
+`Slim::Web::Settings` page rendered through `[% PROCESS settings/header.html %]`,
+so it arrives wrapped in the entire classic-skin settings shell (mousetrap,
+custom-select, the theme bootstrap, `chooseSettings`, **two nested forms**) and
+Material then loads that inside its iframe dialog.
+
+`Live.pm` removes every one of those variables rather than reasoning about
+them. It is a **raw handler at `/hqplive`**, so the bytes it returns are the
+whole document: no template, no skin, no settings chrome. The settings page
+gains a link that opens it with `target="_blank"`, so it runs as a **top-level
+document** on the same footing as any ordinary web page. It polls at 1s and
+**never stops itself** — the settings poller's `clearInterval` after five errors
+made a dead page and a frozen value look identical, which is precisely the
+ambiguity that cost several rounds — and it stamps a visible `updated HH:MM:SS`
+plus a live/error dot, so "is it alive" is never again a matter of opinion.
+
+**Two real defects fixed on the way:**
+
+* **`process_speed` was guarded on TRUTHINESS.** HQPlayer reports `0` whenever
+  it is not actively processing, and 0 is false in Perl, so the speed was
+  DELETED from the string rather than reported as `0.0x`. Caught live: one
+  sample carried no speed while samples 2s either side carried 69.2x. The row's
+  content silently depended on transport state. `active_filter` and
+  `active_shaper` had the same guard; all three now test `defined`.
+* **The query sent only `id`**, which is a MAC address, so the live page had no
+  name to head a card with. It now sends `name` too.
+
+**`Live.pm` never calls into `Plugin.pm`** - the version is handed in at
+`init`. A page module that reaches into its own Plugin.pm without `use`-ing it
+dies PART WAY THROUGH the handler, and LMS renders the half-built page with
+nothing in the log; that shipped Eversolo Screen Control 1.5.0 completely broken
+with every check green. `t_live.pl` asserts the absence.
+
+571 assertions green, and the page's own JS was **executed against a real
+`signalpath` response** before shipping - live dot, timestamp, all rows.
+**Not yet tested on the live LMS.**
+
+## 0.2.62 (2026-09-05): no settings page, and the app opens the live view
+
+**Simon: "We dont need settings at all as we dont change anything, lets have
+the app just load the signal path."** `Settings.pm`, its template and its
+registration are DELETED. Nothing in this plugin is configurable, so the page
+only ever existed to read numbers off - and it could not keep them current.
+
+**A MATERIAL BROWSE LIST CANNOT REFRESH ITSELF, and that is settled from
+Material's source rather than inferred:** every `refreshList` trigger in
+`browse-page.js` is a USER ACTION inside Material (a playlist edit, a favourite
+change, random mix), and no LMS notification is wired to it. There is no
+plugin-reachable path. So the app's rows are a snapshot permanently, and the
+live reading has to live on a page of its own.
+
+The app feed is now **one action row** that opens `/hqplive`, then the snapshot.
+**The manual Refresh row is GONE** - Simon asked for a live view, not a button
+to press - and so is the link-inside-a-link that reaching the live page used to
+require (Apps -> Settings -> another link -> the page).
+
+**0.2.61's button never worked, and the cause is worth keeping.** Material binds
+`otherClickHandler` on the settings iframe's DOCUMENT and it captures EVERY
+`<a href>` click: it reads `getAttribute('href')`, **IGNORES `target=`
+entirely**, and re-emits the href as `iframe-href`, which loads it back into
+that same iframe. So `target="_blank"` was silently discarded and the live page
+opened in the very context it exists to escape - which is why 0.2.61 looked
+identical to 0.2.60. Its own condition names the escape hatch: it skips hrefs
+starting with `#`. Material's `openWebLink` splits the same way - a RELATIVE
+weblink goes to the iframe dialog, an absolute `http://` one to `window.open`.
+An absolute URL is not available to us: `IPDetect::IP()` answers `127.0.0.1` on
+this server ([[lms-server-ip-is-loopback]]).
+
+**VERIFIED WORKING by Simon on 0.2.61**, opened directly at
+`http://plex:9000/hqplive`: *"it refreshes as I loaded the page works well"*.
+That is the first confirmed live reading on any surface.
+
+A **Back to Material** button was added at his request: `window.close()` first
+(this page is normally a script-opened window, which can close itself), then a
+fallback to `/material/` - and if it is framed, the TOP window is navigated,
+not the frame. The fallback is not optional: `window.close()` is a no-op on a
+tab the user opened and inside a frame.
+
+577 assertions green; the page's own JS was executed against a real
+`signalpath` response, back button included. **Not yet tested on the live LMS.**
+
+## 0.2.63 (2026-09-05): the description was wrong, in six places
+
+**Simon: "we have it saying LMS doesnt touch the audio this isnt 100% correct as
+it does when transcoding formats HQPlayer doesnt support."** He is right, and
+the claim had been copied into every user-facing surface.
+
+"No audio through the plugin" is true of tiers 1 and 5 and FALSE of the other
+two. **Tier 3 is an LMS transcode** of a format HQPlayer cannot decode
+(m4a/ALAC/AAC), and **tier 4** runs its bytes through LMS's streaming machinery
+and this plugin's own `/hqp/` endpoint. The defensible claim is that the plugin
+adds **no audio stage of its own** - no buffer, no helper binary, no UPnP hop -
+which is a statement about the BRIDGE, not about LMS.
+
+Corrected in `strings.txt` (the description LMS displays), `repo.xml`,
+`README.md` (tagline and the feature table), `README.html` **and
+`tools/make_readme_html.py`, which had it hardcoded as a STATIC_BADGE** - the
+generator would have put it straight back on the next regeneration. Also in
+`Player.pm`'s header and in this file, both of which now say per-tier what is
+and is not touched.
+
+**The lesson is the copy, not the sentence:** one appealing line was written
+once and then propagated to six places, including a generator, where correcting
+the visible copies would have left it to come back.
+
+## 0.2.64 (2026-09-05): a Home tile, because an Apps entry CANNOT open a page
+
+**Simon: "its loading a page I still need to click on to open up the live view.
+We agreed to load straight to the view."** He is right that 0.2.62 did not do
+that, and here is why it could not.
+
+**AN APPS ENTRY CAN NEVER OPEN A URL.** Material's `apps` command builds every
+plugin entry itself, hardcoded (`MaterialSkin/Plugin.pm`):
+
+```perl
+$request->addResultLoop('item_loop', $cnt, 'type', 'redirect');
+my $actions = { go => { cmd => [ $app->tag, 'items' ], params => {...} } };
+```
+
+There is **no `weblink` field a plugin can supply**, and `browse-resp.js` does
+not auto-open a single-item feed (its one special case just wraps a lone `text`
+item in a div). So tapping an app in Apps ALWAYS browses into its feed. One tap
+to a page is not achievable from that surface, by anyone.
+
+**What IS achievable is a HOME TILE.** Material 6.4.6+ takes plugin-registered
+custom actions, and `loadCustomPinned` in `browse-page.js` turns any action in
+the **`pinned`** section carrying a `weblink` into a tile on the Home screen
+that opens that link **on one tap**. `postinitPlugin` now registers exactly
+that. Simon reached the same place independently by pinning it by hand.
+
+**TRAP: `registerCustomAction` PUSHES** - no unregister, no de-dupe - so
+registering twice puts the tile on Home twice. It runs once per server run,
+from `postinitPlugin`, and `t_plugin.pl` asserts a second call would add a
+second entry (which is why nothing re-enterable may call it). Registration goes
+through the `->can` code ref, and `->can` on a package that was never loaded
+answers undef, so no Material means no tile and no error - asserted too.
+
+The idiom, including the two-argument-only call, is LMS-Listen-to-Later's;
+**the dangerous one-argument `registerCustomAction($section)` form is NOT used
+here** - on Material 6.4.6/6.4.7 it pushes undef and takes out every custom
+action in that section, other plugins' included.
+
+**Still open:** a relative `weblink` goes to Material's iframe dialog rather
+than a real window (`openWebLink` uses `window.open` only for an absolute
+`http(s)://` URL, and `IPDetect::IP()` answers 127.0.0.1 here, so an absolute
+one cannot be built). Whether the live page ticks inside that dialog is
+UNTESTED - the page's `updated HH:MM:SS` clock answers it in one look.
+
+## 0.2.65 (2026-09-05): the tile is named "HQPlayer Live View"
+
+**Simon: "the name of the link is whats added to the homepage."** It is - Material
+writes the custom action's `title` straight onto the Home tile - so the string
+has to NAME THE PLUGIN, not describe an action. "Open live view" was fine as a
+row inside the app and useless as a tile sitting next to Albums and Radio.
+
+`PLUGIN_HQPLAYER_LIVE_OPEN` -> `PLUGIN_HQPLAYER_LIVE_TITLE`, EN **"HQPlayer
+Live View"**. The Apps row uses the SAME string deliberately, and `t_plugin.pl`
+asserts the two are identical: two labels for one destination is how they drift
+apart. `PLUGIN_HQPLAYER_LIVE_DESC` is deleted - it was the settings page's hint
+text and that page is gone.
+
+## 0.2.66 (2026-09-06): the Apps list shows SETTINGS, the live page shows the path
+
+**Simon: "the page when entered from apps shows the signal path and the link.
+So we should just show the current settings for HQPlayer at this point with the
+button link to open the live view."**
+
+The Apps list was showing a stale copy of what the live page now does properly.
+It is a snapshot that **can never refresh itself** - Material has no
+plugin-reachable path to re-render a browse page - so a per-track source format
+and a speed that moves every second were guaranteed to be wrong there.
+
+**The split is by how long a fact stays TRUE**, and it falls out of the same
+formatter:
+
+| surface | shows | why |
+|---|---|---|
+| Apps list (snapshot) | output mode, filter, shaper, transport | still true a minute later - these are what you would go into HQPlayer to change |
+| `/hqplive` (1s poll) | source format, output format, processing + speed | moves per track and per second |
+
+`signalPathFor` now returns `mode`, `filter`, `shaper` and `transport` as
+individual fields alongside the live `processing` line, so **neither surface
+formats anything itself** - the thing that keeps them from disagreeing about
+what "Filter" reads like. `t_plugin.pl` asserts BOTH halves: the settings rows
+are present AND the source/output/speed rows are gone, so the change cannot
+pass as merely additive.
+
+**`PLUGIN_HQPLAYER_TRANSPORT_ID` is the word "id", not a label** - it is a
+VALUE ("id 5"), which is why the old settings page paired it with
+`PLUGIN_HQPLAYER_OUTPUT` as the heading. The row reads "Output transport: id 5".
+That is the closest thing to naming the NAA that exists: `<GetTransport/>`
+answers a single value+arg and **there is no `TransportItem` response at all**,
+so the available endpoints cannot even be enumerated (verified in Signalyst's
+own client - see below).
+
+## HQPlayer's control API: what is settable, and the one thing that is not
+
+Read out of `hqp-control-601-src.zip` (Signalyst's own client), 2026-09-06,
+against Simon's proposal to make output mode, filter, shaper and the NAA
+editable. **Not built - he parked it - but the reference is settled.**
+
+**Enumerable, so a picker is buildable:**
+
+| what | list -> item | set |
+|---|---|---|
+| PCM / SDM | `<GetModes/>` -> `ModesItem index name value` | `<SetMode value="N"/>` |
+| filter | `<GetFilters/>` -> `FiltersItem` | `<SetFilter value="N" value1x="M"/>` |
+| shaper | `<GetShapers/>` -> `ShapersItem` | `<SetShaping value="N"/>` |
+| output rate | `<GetRates/>` -> `RatesItem` | `<SetRate value="N"/>` |
+| junk filter | `<GetJunkFilters/>` -> `JunkFiltersItem` | `<SetJunkFilter value="N"/>` |
+| saved configs | `<ConfigurationList/>` -> `ConfigurationItem` | `<ConfigurationLoad/>` |
+
+Also `<SetConvolution>`, `<SetInvert>`, `<SetAdaptiveVolume>`, `<SetTransportPath>`,
+`<SetTransportRate>`, `<MatrixListProfiles/>`/`<MatrixSetProfile>`.
+
+**NOT enumerable - the NAA.** `<GetTransport/>` answers ONE current
+value + arg, and the complete set of `*Item` responses is
+`ConfigurationItem, FiltersItem, InputsItem, JunkFiltersItem, ModesItem,
+PlaylistItem, RatesItem, ShapersItem`. **There is no `TransportItem`.** So the
+current transport can be read and a specific one can be set, but the available
+endpoints cannot be discovered - a picker is not buildable from this API. The
+practical route to switching endpoints is `ConfigurationList`/`ConfigurationLoad`,
+since a saved HQPlayer configuration bundles the output device.
+
+**Three things to settle before any of it is built:** these are GLOBAL HQPlayer
+settings (they apply when LMS is not driving it too, a real departure from
+"the bridge only reflects"); changing mode or filter mid-playback forces an
+engine reinit, which is the same ~2.3s of silence a sample-rate change costs;
+and `SetFilter` carries TWO values, because HQPlayer keeps separate filters for
+1x and Nx rates (hence `filter1x` on `<State/>`).
+
+**The live lists are UNPROBED.** Confirming what Simon's daemon actually offers
+needs `GetModes`/`GetFilters`/`GetShapers`/`ConfigurationList` on 4321, and a
+bare read-only probe once preceded a control-thread wedge - so it must not be
+run while he is listening. See [[hqplayerd-control-thread-wedge]].
+
+## 0.2.67 (2026-09-06): the Home tile opens INLINE
+
+`weblink` -> **`iframe`** on the registered custom action. One key, and it is
+the whole behaviour, because a pinned tile is dispatched as a CUSTOM ACTION and
+not as a browse row:
+
+```js
+// browse-functions.js
+if (item.isPinned) { if (item.custom) { performCustomAction(item, ...); return; } }
+// customactions.js doCustomAction
+if (action.iframe)       bus.$emit('dlg.open', 'iframe', ...);   // INLINE dialog
+else if (action.weblink) window.open(...);                       // separate window
+```
+
+**`weblink` ALWAYS tears off a separate browser window on this path** - there is
+no relative-vs-absolute test here. That test lives in `openWebLink`, which is
+the BROWSE-ROW route, and confusing the two is what made 0.2.64 open a window
+when the earlier reasoning said it would embed. Two dispatch paths, opposite
+answers, same-looking data. `loadCustomPinned` accepts either key, so the tile
+appears either way; only where it opens changes.
+
+**The Back button is now removed when framed.** Simon: *"its not needed though
+as you use materials back"* - and it was worse than redundant: from inside the
+frame the only exit is `window.top.location`, which navigates the WHOLE Material
+app away and throws out whatever the user was doing. Standalone (opened by URL,
+or by anything using `weblink`) it stays, because there is no browser Back in a
+fresh window; there `window.close()` runs first and falls back to `/material/`.
+Both paths were EXECUTED against a real `signalpath` response before shipping -
+framed: button removed, no listener, poller live; standalone: button present,
+click closes then navigates.
+
+## 0.2.68 (2026-09-06): now playing on the live page, in Material's theme
+
+Two asks. **Now playing, laid out like Material's** — small cover left,
+title/artist/album right, a progress bar and elapsed/total — **and the page
+matching Material's own light/dark theme and accent colour.**
+
+**The now-playing resolution is LMS-NowPlayingDisplay's, reused rather than
+re-derived.** Simon: *"we have a now playing project local, you can check there
+as we did the same."* That plugin has already been through these traps in this
+order, and the ARTWORK ORDER in particular is not guessable:
+
+1. **`artwork_url` wins** — streaming and remote tracks set it to an LMS
+   imageproxy path, already server-relative.
+2. **`/music/<coverid>/cover.jpg`** otherwise — but ONLY when the coverid does
+   not start with `-`. LMS mints synthetic NEGATIVE ids for remote tracks and
+   `/music/` **404s** on them, so a URL built from one is a BROKEN image, which
+   is worse than none.
+
+`remoteMeta` is the other half: for a remote track the useful metadata sits at
+the TOP LEVEL of the status result, not in `playlist_loop`, so every field falls
+back to it. Position comes from `Slim::Player::Source::songTime`, which is not
+in the status result at all. Nothing playing yields an **empty hash**, so the
+page draws no panel rather than an empty one. All of it rides the SAME
+`signalpath` poll — one round trip, and the page never has to know which player
+id belongs to which bridge.
+
+**The theme follows Material, by LMS's own recipe** — the classic skin's
+settings header does exactly this, and it is the supported way for a non-Material
+page to match. Material records the choice in `localStorage` on the same origin:
+`lms-material::theme` (`dark|darker|light|auto|<name>[-colored]|user:<name>`) and
+`lms-material::color`. The normalisation is copied in behaviour — `darker`
+renders as dark, `auto` follows `prefers-color-scheme`, a trailing
+`-colored`/`-standard` is a VARIANT and not part of the name, `user:` themes
+live under `/material/usertheme/`. The page then loads Material's own
+`/html/css/themes/<name>.min.css` and `/html/css/colors/<col>.min.css` and
+styles from `--std-background-color`, `--std-popup-background-color`,
+`--primary-color` and `--accent-color`. **Those stylesheets carry no TEXT
+colour** (Vuetify supplies it inside Material), so the page sets its own from
+the light/dark decision, and every variable has a real Material value as a
+fallback so a server without Material still renders correctly. The
+`localStorage` read is wrapped — it THROWS in some privacy modes, and the theme
+is decoration while the signal path is the point.
+
+### TRAP: the JS lives in an INTERPOLATING Perl heredoc
+
+`<<"HTML"` means **every backslash escape is Perl's before it is JavaScript's**.
+`\u2014` is not an em dash here — it is Perl's *titlecase the next character* —
+and it shipped as the literal text `2014`, rendering live as
+**"Luluc 2014 Passerby"**. Caught by executing the served page against a real
+payload, not by reading it.
+
+`\d`, `\.`, `\x` and `\U` are the same hazard, so **a JS regex cannot be
+written literally in this file either**. Build such characters at runtime
+(`String.fromCharCode`, `new RegExp` with a doubled backslash). `t_live.pl`
+asserts the SERVED BYTES carry no `\uXXXX` anywhere — and note the first cut of
+that assertion failed against this file's own comment explaining the trap, which
+is the second time a crude source-grep has matched its own warning.
+
+622 assertions green; the page was executed against a real payload with
+now-playing fields, both framed and standalone. **Not yet tested on the live
+LMS** — and HQPlayer was off while this was built, so the now-playing panel has
+never been seen against a real track.
+
+## 0.2.69 (2026-09-06): the live page scales, and gains Material's transport + volume
+
+Simon: *"the now playing is very small on a pc screen, looks ok on mobile so its
+not scaling properly which material does. I also think we need transport
+controls and volume control controls need to match to material skin so reuse
+those icons if possible."*
+
+### It was two problems, not one
+
+The cover was a hard `96px` **and** the page was full-bleed, so on a desktop a
+phone-sized cover sat at the end of a 1900px row. Both are fixed: every size is
+now `clamp(min, <viewport>, max)` with the OLD MOBILE SIZE AS THE FLOOR — which
+is why nothing changes on a phone, exactly as asked — and `.wrap` centres the
+content at `max-width: 1100px`. Artwork `clamp(96px, 15vw, 208px)`, title
+`clamp(17px, 1.5vw, 25px)`, and the body, gaps and label column scale with them
+so the proportion holds rather than a big cover next to small type.
+
+`vw` inside Material's iframe dialog resolves against the IFRAME's width, not
+the screen's, so the page scales to the dialog it is shown in.
+
+### The controls send Material's own commands, read from Material's source
+
+Not equivalents — the same ones, so a button here behaves like the one on
+Material's Now Playing page:
+
+| | command | why not the obvious one |
+|---|---|---|
+| prev | `['button','jump_rew']` | restart-then-previous, like the hardware button. `['playlist','index','-1']` SKIPS a track the user expected to restart |
+| next | `['playlist','index','+1']` | |
+| play/pause | `['pause']` when playing, else `['play']` | |
+| mute | `['mixer','muting', muted ? 0 : 1]` | |
+| volume | `['mixer','volume', v]` on `change` | firing per `input` puts a request on the wire for every pixel of the drag |
+
+A command is addressed to the **player id**, added to the query as `playerid`.
+`id` in `bridges_loop` is the INSTANCE key and the two are not interchangeable —
+sending to the wrong one silently controls nothing.
+
+### Volume state: the SIGN is the mute flag
+
+There is no muting field in a status result. LMS stores the level **negated**
+while muted, so `abs()` is the level and `< 0` is the flag — Material's own rule
+(`server.js`: `player.muted = ... player.volume<0`). A reader that misses this
+shows `-69` on the slider and never lights the mute button.
+
+Whether a slider should exist at all is `use_volume_control`, which
+`Slim::Control::Queries` computes as
+`(digitalVolumeControl || !hasDigitalOut) ? 1 : 0` — so it already accounts for
+the user setting this player to **fixed volume** in LMS's audio settings, the one
+switch that means LMS stops driving HQPlayer's level (see
+`Player::_volumeIsFixed`). Every skin hides its slider on that flag and so does
+this page. **Both fields ride the status request `nowPlayingFor` ALREADY makes**
+— no extra round trip, no pref read. Verified live before writing the code:
+
+    'mixer volume' = 69    'use_volume_control' = 1    'digital_volume_control' = 1
+
+An ABSENT `use_volume_control` is read as 1, not 0 — reading missing as "fixed"
+would hide a working slider.
+
+### Nothing playing drops the TRACK, not the player
+
+`nowPlayingFor` used to `return {}` with no title. It now deletes only the track
+keys and keeps `state`, `volume`, `muted`, `volctl`, because those describe the
+ENDPOINT and are exactly what the controls need while the queue is stopped — a
+mute button that cannot know whether it is muted is not a control. The panel
+still draws no artwork, no title and no progress bar; the card takes an `idle`
+class and collapses to its control row. The rule that an empty panel is worse
+than none is unchanged.
+
+### The icons are Material's actual font
+
+`/material/html/font/font.css` — verified serving (200, and the `.ttf` beside it
+200), so the glyphs are the same artwork as Material's, at whatever size this
+page asks for. Roboto comes with it, so the type matches too.
+
+**A Material Icons glyph is selected by its LIGATURE**, so the element's text is
+the literal word `play_circle_filled`. On a server with no MaterialSkin that
+stylesheet 404s and **that word is what the user reads**. So the page checks
+`document.fonts.check('24px "Material Icons"')`, sets `html.noicons` when the
+font never arrived, and a CSS rule then hides the word and draws a Unicode
+stand-in from each glyph's `data-alt`. Built with `String.fromCharCode` — this
+is still the interpolating heredoc.
+
+### The panel is now built ONCE and updated in place
+
+It used to be an `innerHTML` string guarded by a signature — but the POSITION was
+in that signature, so it was rebuilt every second regardless. That was survivable
+for a cover and some text; it is not survivable with controls, because
+rebuilding the markup under a slider replaces the element mid-drag and a focused
+button loses focus once a second. The DOM and its handlers are created once and
+each poll writes values into it.
+
+And a volume reply races the poll that already left, which carries the OLD level;
+written back, that reads as the slider snapping backwards. So the server's volume
+is ignored for 1.2s after we set it, while the thumb is held, and while the
+slider has focus.
+
+### Executed against the real page, not just grepped
+
+The served bytes were extracted, both `<script>` blocks syntax-checked, and the
+whole page RUN against a live `signalpath` payload (Patti Smith, "Gone Again")
+under a DOM shim whose element ids come out of the markup `build()` writes — so
+the harness cannot agree with a typo'd id. It caught a real defect no source
+assertion would have: the mute button was reached as `el.imute.parentNode`, one
+assumption about the markup away from a TypeError that aborted the entire
+update. Every element the updater touches is now held directly.
+
+Rendered: title, `Patti Smith — Gone Again` (em dash correct), bar `33.4%`,
+`1:05 / 3:16`, `play_circle_filled` for a paused player, volume 69. Idle, muted
+and fixed-volume payloads were run through the same page: `card np idle`,
+`volume_off`, and `np-vol off` respectively. All five buttons put the right
+command on the wire addressed to the right player id.
+
+**A fourth crude source-grep matched its own explanatory comment** — the `2014`
+assertion failed against the new JS comment describing the bug. The comment now
+says the digits cannot be repeated there, and why.
+
+652 assertions green. **Not yet tested on the live LMS.**
+
+## 0.2.70 (2026-09-06): volume buttons, and a startup message that is not alarming
+
+Simon: *"would prefer buttons for volume rather than a slider or both if
+possible as material offers both, also we get some error message when it starts
+up and not connected which is alarmist, it should say waiting for player to
+connect."*
+
+### The volume widget is now Material's, arrangement and all
+
+Material's `volume-control.js` is `volume_down | slider | volume_up | level`, so
+that is what this is — both, as asked. The mute button is gone as a separate
+control and the **level itself is the mute toggle**, which is where Material puts
+that gesture (`toggleMuteLabel`); it is a real `<button>` with a Mute/Unmute
+title, so it is more discoverable here than Material's middle-click. **Both step
+buttons show `volume_off` while muted**, which is how Material shows the muted
+state.
+
+**The step is the user's own, not one picked here.** Material keeps it at
+`lms-material::volumeStep` in localStorage — the same origin this page already
+reads the theme from — so its buttons and these move by the same amount. Default
+5, Material's own, when Material has never run in that browser.
+
+The command is **relative** (`["mixer","volume","+5"]`), like Material's, so the
+server and not this page decides where the ends of the range are. But the slider
+moves **locally first**: a volume reply is held off for 1.2s (see 0.2.69), so
+without the local move a second press would step from a stale value and the
+widget would look stuck while the level was actually moving.
+
+### The alarming startup was a real defect, not just wording
+
+`signalpath` **omits `bridges_loop` entirely** when it has nothing to put in it —
+`addResultLoop` is simply never called — and the page treated a missing loop as a
+malformed reply. So for the whole window between the server starting and
+HQPlayer being discovered it painted a **red dot and a bad-reply string naming
+the missing key**. Nothing was wrong: the poll answered, and the answer was that
+the player had not turned up yet.
+
+Now `r.bridges_loop || []`, a green dot, and
+`PLUGIN_HQPLAYER_LIVE_WAITING` — *"Waiting for the player to connect"* — which
+also replaces the hardcoded English "No HQPlayer instances found." and the
+"Starting…" placeholder. **A genuinely malformed reply is still an error**: a
+missing `result` throws as before.
+
+Executed against a pre-discovery reply (`{"count":0}` and no loop): panel hidden,
+`dot live`, empty error, waiting card. Against the live playing payload: the
+three volume gestures put `["mixer","volume","-5"]`, `["mixer","volume","+5"]`
+and an absolute set on the wire, and the muted payload flips both buttons to
+`volume_off` with the label offering Unmute.
+
+**A fifth crude source-grep matched its own explanatory comment** — the new
+comment naming the old bad-reply string failed the assertion that the string is
+gone. Same fix as the `2014` one: the comment says the wording cannot be
+repeated there, and why.
+
+664 assertions green. **Not yet tested on the live LMS.**
+
+## 0.2.71 (2026-09-06): the ticker goes, and a cleanup pass
+
+### The "updated HH:MM:SS" ticker is gone
+
+It existed to prove the page was ticking while the settings page's poller was
+being diagnosed. That question is settled and the page visibly moves on its own,
+so it was a number changing in the corner. **The dot and the failure text stay** —
+live/failed and the reason for a failure were never decoration. Proven by
+execution, not grep: the shim no longer pre-registers a `stamp` element and the
+page never asks for one.
+
+### Optimisation and cleanup pass
+
+**Dead code removed** (all confirmed unreferenced first, not assumed):
+
+| Removed | Where | How it was confirmed |
+|---|---|---|
+| `PLUGIN_HQPLAYER_INSTANCE` label | `Live.pm` | resolved by `cstring`, shipped into the page's `L` object, **never read** |
+| `my $log` + `use Slim::Utils::Log` | `Live.pm` | one occurrence in the whole file — the declaration |
+| `use Slim::Utils::Timers`, `use Slim::Utils::Prefs` | `Plugin.pm` | zero `::` and zero `->` references |
+| `use Slim::Utils::Misc` | `Player.pm` | zero references, and none of its exports (`assert`/`bt`/`msg`/`msgf`/`errorMsg`/`specified`) called bare either — checked, because removing a `use` DOES break a bare imported call |
+| 6 orphaned strings | `strings.txt` | `_NONE`, `_OUTPUT_DESC`, `_VOLUME`, `_VOLUME_NOW`, `_VOLUME_STEP`, `_INSTANCE` — all settings-page leftovers |
+| `ICON_SETTINGS` -> `ICON` | `Plugin.pm` | there is no settings page for it to be the icon of |
+
+Every `sub` was checked for references too. **Nothing dead**: the 16 that look
+unreferenced (`model`, `isPlayer`, `hasVolumeControl`, `playPoint`,
+`pauseForInterval`, `getDisplayName`, `shutdownPlugin` …) are all called by LMS
+by name. Every accessor in the `mk_accessor` list is used, and `hqPath` — which
+looks undeclared — is a real sub wrapping `hqPathData`.
+
+**A regression found by the orphan sweep.** `PLUGIN_HQPLAYER_NONE` / `_NONE_DESC`
+being orphaned meant the Apps feed had **stopped saying anything at all** when
+nothing was discovered — just a bare live-view link and no explanation. Restored,
+in the live page's wording: *"Waiting for the player to connect"* plus the
+discovery diagnostic under it. Waiting, not failed: discovery keeps probing and
+a switched-off instance appears on its own.
+
+**One optimisation.** `render()` rewrote the signal-path card's `innerHTML`
+**every second regardless**, which drops any text selection inside it — a user
+copying a filter name could never finish, and the waiting screen was rewriting
+itself once a second saying the same thing. Now written only when it differs.
+While a track plays the processing speed really does change every second and it
+rewrites anyway; stopped, paused or waiting, the card holds still. Same class of
+defect as the panel rebuild fixed in 0.2.69, in the half that was left.
+
+### Docs: the README described a page that no longer exists
+
+`Settings -> Advanced -> HQPlayer Bridge` was still documented as a read-only
+status page, along with a **Refresh** row that was removed and a poller that
+"refreshes about every two seconds, pauses when the page isn't visible, and
+stops when you close it" — none of which is true of the live page (1s, never
+gives up). Rewritten: the two surfaces and why they differ, the live view's now
+playing / transport / volume / signal path, the Material theming, and the
+waiting state. `README.html` and `index.html` regenerated.
+
+**Stale comments in the source too** — `Plugin.pm` still justified its dispatch
+registration as *"registered here rather than in Settings.pm because Settings.pm
+is only required under main::WEBUI"* for a module deleted several builds ago,
+and `signalPathFor` claimed **three** surfaces when there are two. `Live.pm`
+said the page is *"opened from the settings page with target=_blank"*. All
+corrected. The remaining settings-page mentions are deliberate: Live.pm's header
+explains why this route exists at all, and `Player.pm:1809` means LMS's own
+per-player Audio settings page.
+
+### Bugs looked for and NOT found
+
+Recorded so the next pass does not repeat them: no `each %hash` iteration (safe
+against `delete`), no `delete` while iterating anything but a `keys` snapshot, no
+`my $x = @_` scalar-context slips, no `return eval {}` in an argument list, no
+`$client->{field}` hash access on a blessed ARRAY, and no `setTimer` callback
+mis-signature.
+
+709 assertions green (62 + 370 + 63 + 68 + 109). **Not yet tested on the live
+LMS.**
+
+## 0.2.72 (2026-09-06): a mute button, and design is signed off
+
+Simon: *"its all worked and looks good, lets just add a mute button as well and
+design is complete."*
+
+### One control, one meaning
+
+Material has **no** mute button in its volume widget: it hides that gesture on
+the level label (middle-click, or long-press) and shows the muted state by
+flipping **both** step buttons to `volume_off`. Undiscoverable, so this adds a
+real button in front of the widget.
+
+**Once there is a button, the step buttons have to stop flipping.** Three
+`volume_off` glyphs in a row state the muted state three times and leave the
+user guessing which one un-mutes it. So:
+
+| control | shows | changes |
+|---|---|---|
+| mute button | `volume_off` always, **accent-coloured while muted** | mute |
+| step buttons | `volume_down` / `volume_up`, **never change** | volume |
+| level | the number, **dimmed while muted** | mute (kept - Material's own gesture) |
+
+The dim is Material's own treatment for that label (`'dimmed':muted`). Between
+the lit button and the dimmed level the state is unmistakable without any other
+control having to change meaning.
+
+**The button and the label share one `toggleMute`.** Two copies of a toggle is
+how they drift apart.
+
+Executed against the live payload in both states: unmuted `tbtn vol` /
+`np-volv` / title Mute; muted `tbtn vol on` / `np-volv dimmed` / title Unmute;
+step glyphs `volume_down`/`volume_up` in **both**; and both the button and the
+label send `["mixer","muting",1]` unmuted and `["mixer","muting",0]` muted.
+
+678 assertions green. **Design signed off by Simon at this build.**
+
+## 0.2.73 (2026-09-06): the signal path is three rows
+
+Simon: *"Split processing out into three sections - Filter, Shaper, Processing
+Speed."*
+
+They used to be joined by `signalPathFor` into one `processing` string,
+`"Filter X - Shaper Y - 30.3x realtime"`, which put the LABELS INSIDE THE VALUE
+and left the page a sentence it could not align. Each is its own field now
+(`filter`, `shaper`, `speed`) and each gets its own row:
+
+```
+Filter             poly-sinc-gauss-hires-lp
+Shaper             ASDM7EC-light
+Processing speed   2.3x realtime
+```
+
+**The joined string is deleted, not kept alongside.** Two ways to say one thing
+is how they drift apart, and nothing rendered it any more - the Apps feed draws
+only the settings half (mode/filter/shaper), because a speed that changes every
+second has no business in a snapshot that can never tick.
+
+`row()` already draws nothing for a fact HQPlayer has not reported, so a missing
+shaper leaves no empty label behind. `PLUGIN_HQPLAYER_PROCESSING` is now
+"Processing speed"; no key was added or orphaned.
+
+**A stale assertion surfaced doing this.** `t_live.pl` still asserted the page
+"stamps a visible time" - and it was PASSING, on the comment that explains the
+ticker's removal in 0.2.71. It now asserts the dot instead. That is the second
+false pass of this shape and the SIXTH self-matching grep: the new comment
+describing the joined string quoted its unit, which the "never re-formats a
+server value" assertion greps for.
+
+684 assertions green.
+
+## 0.2.74 (2026-09-06): FOUND - the FLAC header was being prepended to streams that already had one
+
+**BBC Sounds is choppy on this bridge and clean on squeezelite. This is why.**
+
+`Stream::_flacPrelude` synthesises a `fLaC` + STREAMINFO header for a stream
+that arrives without one. Its guard was:
+
+```perl
+return '' unless $seek && ( $seek->{timeOffset} || $seek->{sourceStreamOffset} );
+```
+
+i.e. **any seek at all**. But the two offsets are not alternatives, and only one
+of them loses the header:
+
+| | what it is | does the header survive? |
+|---|---|---|
+| `sourceStreamOffset` | a **byte** position. `Protocols::HTTP::requestString` puts it in the Range header, so the source re-opens PART WAY INTO the container | **No** - this is the case the prelude exists for |
+| `timeOffset` | **seconds**. Handed to a transcoder as its start time, or to a protocol handler that fetches from there. The audio is encoded FRESH | **Yes** - a complete container with its own header |
+
+A passthrough seek sets **both**; a transcoded or handler-driven one sets **only
+`timeOffset`**. So testing for either prepended a **second** header onto a stream
+that already had one - and `_flacPrelude`'s own comment already said what that
+does: *"a second one would be read as corrupt audio."*
+
+### How it was pinned down
+
+Simon's test settled the half that mattered: **"iPlayer plays fine in Kitchen."**
+A squeezelite player is fed over slimproto - no HTTP, no Content-Type, and it
+never sees this header - so a fault appearing only here is in the hand-over.
+
+Then, live, with the station playing:
+
+* `signalpath` -> `source: 48000 Hz / 16 bit FLAC`. **The rate is RIGHT**, which
+  killed the previous candidate (a hardcoded 44100 fallback) outright.
+* hqplayerd's log: correct init at `Rate: 48000`, `Stream buffer 960000/262144`,
+  and **no decoder error of any kind** - it syncs on our header, eats the real
+  one as audio, and resyncs.
+* LMS's log, at the moment of the play:
+
+```
+Stream::_flacPrelude (339) 02:ab:88:42:4c:69: seeked stream -
+    prepending a FLAC header (48000Hz 16bit 2ch)
+```
+
+* And BBC Sounds **cannot** set the byte offset. Its `ProtocolHandler::getSeekData`
+  is `return { timeOffset => $newtime };` - that and nothing else. LMS opens a
+  live station at the live edge (`time` was 10281 of 10803), so `timeOffset` is
+  set on an ORDINARY PLAY and the prelude fired every single time.
+
+### The fix
+
+```perl
+return '' unless $seek && $seek->{sourceStreamOffset};
+```
+
+The original case is untouched and still verified by its own test: a passthrough
+seek sets both offsets, gets its 42-byte header, and every field is still
+asserted. The new control asserts a **time-only** seek gets nothing - which is
+the assertion that would have FAILED before the change, so it cannot pass against
+a fix that does nothing.
+
+### Two things NOT yet explained
+
+* A duplicate header is ~50 bytes at the START of the stream, so on its own it
+  predicts a glitch at the beginning rather than continuous choppiness. If it is
+  still choppy after this, that difference is the clue.
+* `Stream reader freewheel mode disabled` appears for this stream where a local
+  file gets `freewheel mode enabled`. The bridge sends `freewheel="1"` on every
+  `PlaylistAdd`, so HQPlayer is turning it off itself - reasonable for live
+  content, but it means no read-ahead, and `input_fill` is not currently exposed
+  anywhere the page or the log can see it. **That is the next thing to
+  instrument** if this is not the whole story.
+
+685 assertions green.
+
+## 0.2.75 (2026-09-06): the live page could starve Material's own Now Playing
+
+Simon, after switching sources with the live page open: *"materials now playing
+... didnt update to show the file playing from Qobuz and also when I paused the
+BBC stream it was slow to respond to play. It rectified itself with a browser
+refresh but ive not seen it do this before."*
+
+**This is a defect this page introduced, and the mechanism reaches outside it.**
+
+### What was wrong
+
+The poller was a fixed one-second repeating timer with **nothing stopping a
+second request going out while the first was still open**. A `signalpath` answer
+costs a full `status` query per bridge, so as soon as the server takes longer
+than a second the polls OVERLAP - and with a 5s timeout several can be open at
+once. A command made it worse: it polled straight back, ADDING a request on top
+of whatever was already in flight.
+
+### Why that hurts MATERIAL and not just this page
+
+A browser allows about **six concurrent connections per origin** over HTTP/1.1,
+which is all LMS speaks. Material holds one of those open permanently for its
+**CometD subscription** - that long poll is how its Now Playing learns anything
+at all. And the Home tile opens **this page as an iframe INSIDE Material**, so it
+is not a separate tab competing at arm's length: same origin, same pool.
+
+A stack of overlapping polls can starve that subscription, and the symptoms are
+exactly the three reported - Now Playing stops updating, commands are slow to
+take, and a **browser refresh** (fresh connections) clears it.
+
+Modelled with a 2.5s server and a 5s timeout:
+
+```
+OLD  repeating timer, no guard    peak concurrent = 3   requests in 20s = 20
+NEW  single-flight, chained       peak concurrent = 1   requests in 20s = 6
+```
+
+### The fix
+
+One request at a time, and **the period is a GAP, not a cadence**: the next poll
+is scheduled only once the last has SETTLED. A tick that finds a request still
+open reschedules instead of adding one, and a command now brings the next poll
+FORWARD rather than stacking a new one. At worst this page costs one connection.
+
+**"Never gives up" is preserved and now asserted properly**: both outcomes go
+through one `done()` which clears the flag, reports, and always schedules the
+next - so a timeout reschedules rather than quietly ending the page, which would
+have been the settings page's failure with extra steps.
+
+### CONFIRMED by Simon, 2026-09-06
+
+Shipped as a strong hypothesis that could not be proven from the logs - Material's
+CometD connection can also drop on its own, so the plan was to watch for a
+recurrence with the live page CLOSED. **Simon confirmed the fix worked**, so the
+starvation was the cause. The rule generalises beyond this repo and is recorded
+in memory as [[plugin-page-shares-material-connection-pool]]: a plugin's own
+polling page runs in Material's connection pool - and a Home tile makes it an
+IFRAME INSIDE Material - so an unguarded poller starves the subscription its Now
+Playing runs on.
+
+### Two stale assertions surfaced
+
+`t_live.pl` required `setInterval(` to be present - correct before, wrong after.
+And the new comment naming that call tripped the assertion that it is gone: the
+**seventh** time a crude source-grep has matched its own explanation.
+
+691 assertions green.
+
+## 0.2.76 (2026-09-06): the volume level sat outside the card on a phone
+
+Simon, with a screenshot from an iPhone on 0.2.74: *"We have a slight rendering
+issue on the UI on iphone, volume level is outside the box."*
+
+**It was not the breakpoint.** The `@media (max-width: 480px)` rule is served
+correctly and was applying - measured off the screenshot, the row started at the
+left edge of `.np-txt`, which is what `margin-left: 0` does. The fault was flex
+SIZING inside the row.
+
+### Exactly one thing may give, and it has to be the slider
+
+A flex item defaults to `flex: 0 1 auto` - **shrink: 1**. So all four buttons
+were offering to shrink, and none of them can: an icon glyph is its own content
+width. The browser distributes the overflow across items that refuse it, and the
+remainder runs off the end of the card.
+
+The slider made it worse: `flex: 1 1 auto` means it STARTS at its intrinsic
+width - a range input carries a UA-defined one of about 130px - and then shrinks
+only pro-rata, so it stays far wider than the space actually left.
+
+```
+viewport 393   card content 345   .np-txt 237
+volume row: 3 buttons 78 + gaps 40 + level 29 = 147 fixed
+
+BEFORE  slider ~130 intrinsic -> needs 277 against 237  -> OVERFLOW 40px
+AFTER   slider basis 0        -> takes the leftover 90  -> fits exactly
+```
+
+The measured overflow off the screenshot was the same order and direction.
+
+**The fix:** `.tbtn { flex: 0 0 auto }` pins every button, and
+`input[type=range] { flex: 1 1 0 }` gives the slider a ZERO basis so it takes
+precisely what remains. `min-width: 0` stays - it defeats the automatic
+content-based minimum a flex item gets.
+
+**And `.np-volv` is now `flex: 0 0 auto; min-width: 2.4em`** rather than a fixed
+`2.4em` basis, which would have clipped a three-digit volume. That one had not
+been reported yet; it was sitting there.
+
+### What tipped it over
+
+The mute button, added in 0.2.72. Three buttons plus a level need 147px of the
+237px that a 96px cover leaves on a 393px screen - the row had been surviving on
+very little slack, and one more control spent it.
+
+696 assertions green.
+
+## BBC Sounds ("iPlayer") choppy playback - what is established
+
+Reported 2026-09-06: *"iPlayer doesnt play correctly ... they sound choppy and
+like its a sample rate mismatch somewhere as to how its transcoded. I believe it
+uses DASH or HLS."* **NOT diagnosed.** Recorded so the next session does not
+re-derive it.
+
+### The chain, from source
+
+The plugin is **expectingtofly's LMS_BBC_Sounds_Plugin**, installed here as the
+`bbcsounds` radio app. Its `ProtocolHandler.pm` confirms Simon's guess:
+
+* It is **DASH**, not HLS - it parses an **MPD manifest** (`getMPD`).
+* The audio is **AAC**: `push @allowDASH, ([ 'audio_eng=320000', 'aac', 320_000 ]...)`,
+  and `contentType` answers that format.
+* It reports the rate it read from the manifest -
+  `samplingRate => $selRepres->{'audioSamplingRate'}` - which for BBC content is
+  **48 kHz**. Fragments go through its own `M4a.pm`.
+
+Its URLs are `sounds://_LIVE_bbc_radio_fourfm` - a **custom protocol handler**,
+so there is no URL HQPlayer could ever fetch itself. That rules out tiers 1, 3
+and 5 by construction: it is **tier 4**, LMS's own player stream on the plugin's
+endpoint.
+
+### What the bridge does on that path - and does not
+
+`formats` is `flc pcm aif mp3`, so **LMS must transcode AAC to FLAC**; HQPlayer
+never sees AAC (it has no decoder for it at all). Tier 4 then serves whatever
+`$song->streamformat` already decided - `_contentType` READS that, it does not
+choose. **There is no format selection, no rate logic and no resampling anywhere
+on this path**, so the bridge has no code that could produce a rate mismatch.
+
+What it CAN do is make a **framing** fault audible, and this repo has already
+been bitten by exactly that: HQPlayer does not de-chunk, and a chunked transcode
+made tier 3 produce `ReadFLACErrorCB(): lost sync / unparseable stream / CRC
+error` - which sounds like choppy audio, not like an error. Tier 4 sends
+`Connection: close` with no `Content-Length`, which should terminate by close
+rather than chunk, but that has not been VERIFIED on this path.
+
+The one thing the bridge does that no other player does is `initBitrateLimit`,
+which sets `maxBitrate` to 0 (unlimited) when the pref was never set - so this
+player gets FLAC where a capped player would get MP3 320.
+
+### Upstream evidence
+
+The plugin's own wiki documents this symptom class and ties it to the rate:
+*"Most BBC content is in a 48000 sample rate. If your player is having problem
+with the (slightly) unusual sample rate of 48000, try selecting the 'hide sample
+rate from LMS' in the BBC Sounds preference settings."* **That preference is not
+in the current source** (no sample-rate string in `strings.txt`), so it looks to
+have been removed - the wiki may be stale. Issue #134 ("stuttering sound") is
+open and unresolved, reported on a **Squeezebox Radio** - i.e. with no bridge
+involved.
+
+### UPDATE 2026-09-06: it IS the bridge, and two causes are now RULED OUT
+
+Simon ran the test: **"iPlayer plays fine in Kitchen."** A squeezelite player is
+fed over slimproto - no HTTP, no Content-Type, no synthesised header, and it is
+told the format out of band - so a fault that appears only on this bridge is in
+the HTTP hand-over, not in the plugin or the AAC->FLAC transcode.
+
+**RULED OUT - chunked framing.** This was the leading hypothesis, because
+HQPlayer does not de-chunk and that is exactly what garbled tier 3. It is wrong:
+tier 4 does not go through `addHTTPResponse` at all. It stringifies its own
+headers and calls `Slim::Web::HTTP::addStreamingResponse`, which is LMS's raw
+streaming path - the same one `/stream.mp3` uses - and never chunks.
+
+**RULED OUT - decoder failure.** hqplayerd's own log for 2026/09/05 19:47 to
+2026/09/06 12:36 carries **no** `ReadFLACErrorCB`, no `lost sync`, no CRC error
+and no `not available`. If the bytes were being mis-framed the decoder would be
+screaming, and it is silent.
+
+**AND THE LOG CONTAINS NO `/hqp/` URI AT ALL** in that whole 17-hour window -
+only `/music/<id>/download.flac` (tier 1) and Qobuz direct (tier 5). So no BBC
+Sounds play has reached HQPlayer since the daemon started. **There is no
+evidence of the failure yet**; everything above is elimination.
+
+### CANDIDATE, NOT CONFIRMED: the synthesised FLAC header is hardcoded to 44100
+
+`Stream::_flacPrelude` builds a `fLaC` + STREAMINFO header for a stream that
+arrives without one, and takes its rate from the TRACK:
+
+```perl
+my $rate = ( eval { $track->samplerate } ) || 44100;
+```
+
+A REMOTE track usually has no `samplerate`, so that falls to **44100**. BBC
+content is **48 kHz** (confirmed from the plugin's own MPD parsing). A STREAMINFO
+declaring 44.1 on 48 kHz audio is precisely "choppy, like a sample rate mismatch"
+- and it is invisible to a squeezelite player, which never sees this header.
+
+**Why it is only a candidate:** the prelude fires ONLY when `$song->seekdata` is
+set - a seek. Whether a BBC Sounds play sets seekdata (it supports live rewind
+and start offsets) is UNVERIFIED, and on a plain live start no prelude is written
+at all and the transcoder's own header would carry the right rate.
+
+**Note the 44100 fallback has never yet been wrong by luck**: tier 5 does not use
+Stream.pm, and the tier 4 sources tested (Deezer, radio) are 44.1.
+
+### THE TEST THAT SPLITS IT - do this before writing any code
+
+~~Play the same station on a squeezelite player.~~ **DONE - it is the bridge.**
+
+What is needed now is **one BBC Sounds play on the HQPlayer player**, watched
+live. Two things to capture while it runs, both available without touching the
+box:
+
+1. `["hqplayerbridge","signalpath"]` - the `source` row is the rate HQPlayer
+   believes it is decoding. **44100 against a 48 kHz BBC stream confirms the
+   candidate above outright.**
+2. `http://192.168.1.109:8088/log` - reachable from here (verified). Look for the
+   `/hqp/` URI, the `Stream buffer` line beside it, and any decoder error.
+
+**Judge by that log, never by the control API** - `state`, `process_speed` and
+`input_fill` all read healthy through the tier 3 garbling. See the Review
+Ledger.
+
+The live page's **Source** row now shows what HQPlayer thinks it is decoding,
+which is a diagnostic that did not exist when this class of bug was last chased.
 
 ## Still unverified
 
@@ -2779,6 +3797,23 @@ engine is broken", and that is the fork logs cannot settle.
   shows the player as present even when the control link is down. Discovered-but-
   unreachable is a normal recurring state here (the NAA lives at home), and
   tying the two together would risk LMS churning prefs and sync groups.
+* ~~Whether the track-boundary lag survived 0.2.34/0.2.35/0.2.37.~~
+  **CLOSED 2026-09-06, Simon: *"Not noticed any issues with track boundaries."***
+  The uri-as-veto plus `STALE_LIMIT` (5) is doing its job in normal listening.
+* ~~The hqplayerd control-thread wedge TRIGGER.~~ **CLOSED 2026-09-06, Simon's
+  call:** *"I think 3 is hqplayer itself, its temperamental when changing things
+  and I am switching from wired to wireless which often doesnt help."* The
+  network transition is a far better explanation than anything in the bridge,
+  and it fits the evidence that nothing is logged between the last healthy event
+  and the first exception. **The circuit breaker (0.2.60) stands regardless** -
+  it bounds the damage whatever the cause, which was always the argument for
+  building it. Do not reopen this without new evidence: the probe-a-wedged-daemon
+  plan is retired.
+
+### OPEN: BBC Sounds ("iPlayer") streams sound choppy
+
+Reported 2026-09-06. **Not diagnosed - see the 0.2.72 note for what is
+established and the one test that splits it.**
 
 ## Not in v1
 

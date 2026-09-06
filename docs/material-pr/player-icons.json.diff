@@ -1,0 +1,12 @@
+--- a/MaterialSkin/HTML/material/html/misc/b/MaterialSkin/HTML/material/html/misc/player-icons.json	2026-09-02 10:15:00
++++ b/MaterialSkin/HTML/material/html/misc/player-icons.json	2026-09-02 10:15:38
+@@ -145,6 +145,9 @@
+     },
+     "Squeeze connect":{
+         "svg":"eversolo"
++    },
++    "hqplayer":{
++        "svg":"hqplayer"
+     }
+ }
+ 

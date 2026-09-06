@@ -22,7 +22,7 @@ import sys
 ZIP_NAME = "HQPlayerBridge.zip"
 GITHUB_URL = "https://github.com/SimonArnold002/LMS-HQPlayer-Bridge"
 # The version badge is read live from install.xml; the rest are static.
-STATIC_BADGES = ["LMS 8.0.0+", "HQPlayer Embedded 6", "No audio through the plugin"]
+STATIC_BADGES = ["LMS 8.0.0+", "HQPlayer Embedded 6", "No extra audio hop"]
 
 
 def read_version(root):
