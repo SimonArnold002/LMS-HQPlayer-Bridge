@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server (LMS)</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause it, seek it, set its volume and see its artwork from Material or any LMS control point — while HQPlayer does the upsampling, filtering and modulation exactly as it always has. It replaces the <code>squeeze2upnp</code> UPnP bridge: <strong>no external helper, and no audio stage added by the plugin</strong> — HQPlayer fetches the music from LMS itself. LMS still converts the formats HQPlayer cannot decode, such as ALAC and AAC.</p>
   <div class="badges">
-    <span class="badge accent">v0.2.76</span>
+    <span class="badge accent">v0.2.77</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -222,7 +222,7 @@ Filter             poly-sinc-gauss-long
 Shaper             TPDF
 Processing speed   30.3x realtime</code></pre>
 <p>HQPlayer reports the filter it is <em>really</em> using, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter.</p>
-<p>The page follows <strong>Material's own theme</strong> — light or dark, and your accent colour — and uses Material's icons, so it looks like part of the skin rather than a plugin page bolted on. It scales with the window, so it is readable on a phone and on a desktop. Until HQPlayer is discovered it simply says it is waiting for the player to connect.</p>
+<p>The page follows <strong>Material's own theme</strong> — light or dark, and your accent colour — and uses Material's icons, so it looks like part of the skin rather than a plugin page bolted on. It scales with the window, so it is usable on a phone in either orientation and on a desktop. Until HQPlayer is discovered it simply says it is waiting for the player to connect.</p>
 <p>It costs HQPlayer nothing: the plugin is already listening to HQPlayer's status stream, so the page only ever asks Lyrion for figures it already has.</p>
 <p><strong>The Apps entry itself</strong> is a browse list, and Material draws one of those once and never refreshes it — so rather than show moving numbers that would go stale the moment you looked away, it shows <strong>HQPlayer's current settings</strong>: output mode, filter, shaper and transport id. Those are the things you would go into HQPlayer to change, so they are still true when the page is a minute old.</p>
 <p>It reports HQPlayer's <strong>transport id</strong> rather than your endpoint's name. HQPlayer doesn't expose the NAA name over any control command — it only appears in HQPlayer's own log — so the page says so plainly instead of guessing.</p>

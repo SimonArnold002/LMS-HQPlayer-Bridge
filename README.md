@@ -135,8 +135,8 @@ HQPlayer reports the filter it is *really* using, so a 44.1 kHz album shows your
 
 The page follows **Material's own theme** — light or dark, and your accent
 colour — and uses Material's icons, so it looks like part of the skin rather
-than a plugin page bolted on. It scales with the window, so it is readable on a
-phone and on a desktop. Until HQPlayer is discovered it simply says it is
+than a plugin page bolted on. It scales with the window, so it is usable on a
+phone in either orientation and on a desktop. Until HQPlayer is discovered it simply says it is
 waiting for the player to connect.
 
 It costs HQPlayer nothing: the plugin is already listening to HQPlayer's status

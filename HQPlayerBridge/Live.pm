@@ -300,8 +300,18 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
 .np-ctl { display: flex; align-items: center; gap: var(--gap);
           margin-top: 10px; flex-wrap: wrap; }
 .np-tr  { display: flex; align-items: center; gap: 4px; }
+/* THE BASIS MUST COVER THE ROW'S FURNITURE PLUS A USABLE SLIDER.
+   Three buttons, four gaps and the level come to about 147px at the base font
+   size, and NONE of that can shrink - so whatever is left of the basis is the
+   slider. 22vw was picked when this row had four controls; the mute button made
+   it five and nothing re-derived it, so on an iPhone in LANDSCAPE (~800px, above
+   the breakpoint below) 22vw gave a 176px basis and a 29px slider - a dot with a
+   thumb on it, reported by Simon. `flex-grow` is 0 and `margin-left: auto` eats
+   the free space, so the box never grows out of it either.
+   t_live.pl now does this arithmetic against the SERVED css, so the next control
+   added here fails a test rather than a screenshot. */
 .np-vol { display: flex; align-items: center; gap: 10px; min-width: 0;
-          margin-left: auto; flex: 0 1 clamp(160px, 22vw, 280px); }
+          margin-left: auto; flex: 0 1 clamp(250px, 30vw, 360px); }
 .np-vol.off { display: none; }
 /* The level doubles as the mute toggle, so it is a real <button> - Material
    puts that gesture on this label too. It must not look like a form control,
@@ -373,7 +383,10 @@ input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; backgroun
 input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
                     border-radius: 50%; background: var(--accent); }
 
-\@media (max-width: 480px) {
+/* Below this the volume takes a line of its own and fills it. Raised from 480px
+   with the basis above: a 500px screen would otherwise sit just above the
+   breakpoint AND just below the width needed to share a line comfortably. */
+\@media (max-width: 600px) {
   .np-vol { margin-left: 0; flex-basis: 100%; }
 }
 </style>

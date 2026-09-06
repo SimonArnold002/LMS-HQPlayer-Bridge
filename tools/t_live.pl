@@ -285,6 +285,70 @@ ok(scalar($SENT =~ /\.np-volv \{[^}]*flex: 0 0 auto; min-width: 2\.4em/s),
 ok(scalar($SENT =~ /\.np-vol \{[^}]*min-width: 0;/s),
    'and the volume box itself may shrink below its content');
 
+print "-- the volume basis covers its furniture at EVERY width --\n";
+# THE ARITHMETIC, DONE AGAINST THE SERVED CSS - because doing it by eye has now
+# failed twice on the same row. The furniture (buttons, gaps, the level) cannot
+# shrink, so whatever is left of the flex basis IS the slider. 22vw was chosen
+# when the row had four controls; the mute button made it five and nothing
+# re-derived it, so an iPhone in LANDSCAPE got a 29px slider - a dot.
+#
+# The button COUNT is read from the markup, so adding a fourth control to this
+# row fails here instead of arriving as a screenshot.
+{
+    my ($vlo, $vvw, $vhi) =
+        $SENT =~ /\.np-vol \{[^}]*flex: 0 1 clamp\((\d+)px, ([\d.]+)vw, (\d+)px\)/s;
+    my ($szlo, $szvw, $szhi) =
+        $SENT =~ /\.tbtn\.vol \{ --sz: clamp\((\d+)px, ([\d.]+)vw, (\d+)px\)/;
+    my ($blo, $bvw, $bhi) =
+        $SENT =~ /font: clamp\((\d+)px, ([\d.]+)vw, (\d+)px\)/;
+    my ($lblem) = $SENT =~ /\.np-volv \{[^}]*min-width: ([\d.]+)em/s;
+    my ($gap)   = $SENT =~ /\.np-vol \{[^}]*gap: (\d+)px/s;
+    my $nbtn    = () = $SENT =~ /class="tbtn vol"/g;
+
+    ok(scalar( $vlo && $szlo && $blo && $lblem && $gap && $nbtn ),
+       'every number the volume row is built from is readable from the page');
+
+    sub cl { my ($lo,$v,$hi) = @_; return $v < $lo ? $lo : $v > $hi ? $hi : $v }
+
+    # Below the breakpoint the volume takes a full line, so the clamp basis does
+    # not govern - only check the widths where it does.
+    # The MEDIA QUERY's breakpoint specifically - a bare /max-width: (\d+)px/
+    # matches `.wrap { max-width: 1100px }` first, which silently skipped almost
+    # every viewport below and left this assertion checking nothing.
+    my ($bp) = $SENT =~ /[@]media \(max-width: (\d+)px\)/;
+    my $worst = 1e9;
+    my $at    = 0;
+
+    for my $vw ( 640, 700, 800, 852, 1024, 1180, 1400 ) {
+        next if $vw <= ( $bp || 0 );
+        my $base  = cl( $blo,  $vw / 100,        $bhi );
+        my $sz    = cl( $szlo, $szvw * $vw / 100, $szhi );
+        my $furn  = $nbtn * ( $sz + 4 )          # buttons, 2px padding each side
+                  + ( $nbtn + 1 ) * $gap         # gaps: buttons + slider + level
+                  + $lblem * ( 0.86 * $base );   # the level, at its own font size
+        my $basis = cl( $vlo, $vvw * $vw / 100,  $vhi );
+        my $slide = $basis - $furn;
+        if ( $slide < $worst ) { $worst = $slide; $at = $vw }
+    }
+
+    # 72px is the floor for something you can actually put a thumb on. The 0.2.76
+    # basis gave 29px at 800px wide, which is what a dot looks like.
+    ok(scalar( $worst >= 72 ),
+       sprintf( 'the slider keeps a usable width at every shared-line size (worst %dpx at %dpx wide)',
+                $worst, $at ) );
+
+    # THE CONTROL: the basis that shipped in 0.2.76 must FAIL this, or the
+    # assertion is passing against a rule that changed nothing.
+    my $old = cl( 160, 22 * 800 / 100, 280 );
+    my $oldbase = cl( $blo, 800 / 100, $bhi );
+    my $oldsz   = cl( $szlo, $szvw * 800 / 100, $szhi );
+    my $oldfurn = $nbtn * ( $oldsz + 4 ) + ( $nbtn + 1 ) * $gap
+                + $lblem * ( 0.86 * $oldbase );
+    ok(scalar( $old - $oldfurn < 72 ),
+       sprintf( "and 0.2.76's own basis would NOT have (%dpx at 800px wide)",
+                $old - $oldfurn ) );
+}
+
 print "-- transport and volume, using MATERIAL's own commands --\n";
 # Read from Material's source rather than invented, so these buttons behave
 # exactly like the ones on its Now Playing page. `jump_rew` is the

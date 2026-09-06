@@ -3667,6 +3667,59 @@ very little slack, and one more control spent it.
 
 696 assertions green.
 
+## 0.2.77 (2026-09-06): the volume slider collapsed to a dot in landscape
+
+Simon, screenshot from an iPhone rotated: *"slider disappears into a dot and is
+unusable."*
+
+**Same row, same root cause as 0.2.76, different viewport - and that is the
+point.** Landscape is about 800px, which is ABOVE the 480px breakpoint, so the
+volume box kept its `clamp(160px, 22vw, 280px)` basis:
+
+```
+basis 22vw of 800  = 176px
+furniture          = 147px   (3 buttons + 4 gaps + the level - NONE of it shrinks)
+slider             =  29px   <- a thumb with nothing either side of it
+```
+
+`flex-grow` is 0 and `margin-left: auto` eats the free space, so the box never
+grows out of it even with room to spare on the line.
+
+**22vw was chosen when this row had FOUR controls.** The mute button in 0.2.72
+made it five and nothing re-derived it. 0.2.76 fixed the portrait overflow from
+the same oversight; this is the landscape half of the same mistake, and after
+that build the note said *"worth me checking that arithmetic next time I add a
+control to that row"* - which is exactly the promise a comment cannot keep.
+
+### So the arithmetic is now a test
+
+`t_live.pl` reads the numbers out of the SERVED css - the basis clamp, the button
+size clamp, the base font clamp, the level's min-width and the gap - **counts the
+buttons in the markup**, and asserts the slider keeps at least 72px at every
+width where the row shares a line. Adding a fourth control to that row now fails
+a test instead of arriving as a screenshot.
+
+```
+the slider keeps a usable width at every shared-line size (worst 103px at 640px wide)
+and 0.2.76's own basis would NOT have (29px at 800px wide)
+```
+
+The second line is the control: without it the assertion could pass against a
+rule that changed nothing.
+
+**The first cut of that guard was itself broken and passing.** It took the
+breakpoint from a bare `/max-width: (\d+)px/`, which matches
+`.wrap { max-width: 1100px }` long before the media query - so it skipped every
+viewport below 1100 and reported its worst case as 203px. Caught only because
+the assertion PRINTS the number and 203 was implausible for a worst case. An
+assertion that reports a figure is worth more than one that reports a verdict.
+
+Basis is now `clamp(250px, 30vw, 360px)`, and the breakpoint moves 480px -> 600px
+so a ~500px screen gets its own full-width line rather than sitting just above
+the breakpoint and just below a comfortable shared line.
+
+699 assertions green.
+
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
 Reported 2026-09-06: *"iPlayer doesnt play correctly ... they sound choppy and
