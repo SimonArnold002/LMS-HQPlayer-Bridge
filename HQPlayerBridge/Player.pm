@@ -576,6 +576,13 @@ sub _addAttrs {
 # load was routed over UPnP for months on the belief that DIDL was the only
 # channel that could carry a cover.  It is not.
 #
+# ARTWORK IS CAPPED AT ART_SIZE ON THE LOCAL ROUTE - see _coverURL.  The
+# endpoint's display is the consumer, and it has to hold whatever is sent;
+# Simon's read on the Eversolo is that it does not like anything larger.  This
+# bounds the LOCAL route only.  A REMOTE track's cover is the service's own URL
+# and goes out untouched (Qobuz already serves 600, others are not checked).
+use constant ART_SIZE => '600x600';
+
 # THE ARTWORK FIELD IS `cover`, AND IT TAKES A PLAIN URL.  Verified against the
 # live daemon (engine 6.0.4) on 2026-08-28 by writing an item both ways and
 # reading it back with <PlaylistGet picture="1"/>.  The two are byte-identical:
@@ -914,7 +921,22 @@ sub _coverURL {
     # on the endpoint.
     my $id = eval { $track->coverid } || eval { $track->id } or return undef;
 
-    return $self->_serverBase . '/music/' . $id . '/cover.jpg';
+    # ASK FOR A BOUNDED SIZE.  A bare `cover.jpg` serves the STORED ORIGINAL,
+    # whatever that happens to be - measured on Simon's library 2026-09-11, the
+    # largest is 3000x3000 / 8.33 MB, and the endpoint has to hold it.  The
+    # same cover at ART_SIZE is 36 KB.  Nothing downstream asked for the
+    # original: HQPlayer hands the URL to the endpoint's display.
+    #
+    # THE MODE LETTER IS NOT DECORATION, and the two obvious ones are wrong:
+    #   _o  fit inside the box, aspect preserved   <- this
+    #   _m/_p  pad to a forced square with black bars, and the padding made
+    #          the file SIX TIMES larger in the measurement
+    #   a bare `cover_600` (no `x<height>`) silently serves the original -
+    #          it looks like it works and caps nothing
+    #
+    # LMS resizes on demand and caches the result, so this costs one resize per
+    # album, once.
+    return $self->_serverBase . '/music/' . $id . '/cover_' . ART_SIZE . '_o.jpg';
 }
 
 # --- artwork continuity -----------------------------------------------------

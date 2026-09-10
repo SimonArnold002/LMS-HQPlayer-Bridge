@@ -51,6 +51,8 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `_endOfStream` `mode eq 'queue'`, "the held track has NEVER PLAYED", missed advance | INCOMPLETE — fixed 0.2.82, CLOSED as unprovable in the wild; the guard SELF-REPORTS | `A pending hand-over proves the held track has NEVER PLAYED` |
 | `_teardown` leaving `_startDeadline` / `_tripStop` / `_endOfStream` / `_fadeDone` armed on a forgotten client | NOT A DEFECT — already guarded via `controller->stop` | `Timer balance` |
 | `_completeResponse` vs `_extractMessage`, two framers in `Control.pm` | REMOVED in 0.2.83 — it was dead, kept alive only by its own test | `was dead, and only its own test kept it alive` |
+| `nowPlayingFor` still building an UNBOUNDED `/music/<id>/cover.jpg` for the live page | DELIBERATE 0.2.84 — its consumer is a browser, not the endpoint | `THE SECOND CARRIER, LEFT ALONE ON PURPOSE` |
+| a remote track's cover not being size-capped like the local one | DELIBERATE 0.2.84 — scoped out, service URLs differ per service | `THE REMOTE ROUTE IS DELIBERATELY UNTOUCHED` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -4339,6 +4341,81 @@ are recorded so a later pass can skip them:
   command documented to kill the daemon. It is deliberate, and the entry above
   says why: `tools/probe_gapless.py` re-tests it on a future engine behind a
   default-off arm. Confirmed the probe still carries that arm.
+
+## 0.2.84 (2026-09-11): the local cover went out at whatever size it was stored
+
+Simon, on the endpoint: *"i dont think Eversolo likes artwork larger than
+600x600 as it might have impact on memory."* He was right, and the bridge was
+asking for no size at all.
+
+### What was actually being sent
+
+`_coverURL` built the local route as `/music/<coverid>/cover.jpg`. **A bare
+`cover.jpg` serves the STORED ORIGINAL** - LMS resizes only when asked, and
+nothing here asked. Measured against the live library 2026-09-11, sampling 50
+random albums:
+
+| | dimensions | bytes |
+|---|---|---|
+| largest local cover in the library | 3000x3000 | 8.33 MB |
+| the same cover at `cover_600x600_o` | 600x600 | 36 KB |
+| a non-square original (1000x986) | 600x591 | 141 KB |
+
+HQPlayer hands that URL to the endpoint's display, so the endpoint is what has
+to hold it. Nothing downstream ever wanted the original.
+
+### The mode letter is not decoration
+
+Tested all of them against a NON-SQUARE cover, because that is where they
+diverge and a square test would have shown nothing:
+
+* `_o` - fits inside the box, aspect preserved, no padding. **This one.**
+* `_m` / `_p` - pad to a forced square with black bars. Also measured **six
+  times larger** than `_o` on the same source (863 KB vs 141 KB).
+* `cover_600` with no `x<height>` - **silently serves the original.** It looks
+  like a cap, returns 200, and caps nothing. This is the trap worth remembering.
+
+LMS resizes on demand and caches, so the cost is one resize per album, once.
+
+### The number has ONE carrier
+
+`ART_SIZE` in `Player.pm`, next to the artwork notes. The size is now a single
+constant rather than a string baked into the URL, so there is one place to
+change it if 600 turns out to be the wrong ceiling. **The Eversolo limit is
+Simon's read, not a measured figure** - it has not been confirmed against the
+device, and if it is ever measured, `ART_SIZE` is the line to edit.
+
+### THE REMOTE ROUTE IS DELIBERATELY UNTOUCHED
+
+A remote track's cover is the service's own URL and goes out verbatim. Qobuz
+already serves 600 (confirmed live: the currently playing item was
+`..._600.jpg`, 600x600 / 99 KB). **The other services are NOT checked**, and
+capping them means either rewriting a service URL - which differs per service -
+or pushing it through the image proxy. That is a bigger change than this one and
+was scoped out, not overlooked. If an endpoint ever chokes on a remote cover,
+this is the paragraph that says where to start.
+
+### THE SECOND CARRIER, LEFT ALONE ON PURPOSE
+
+`Plugin.pm`'s `nowPlayingFor` builds its own local cover URL for the live page
+(`$np{artwork} = "/music/$cover/cover.jpg"`), and it is STILL UNBOUNDED. That is
+a deliberate divergence, decided 2026-09-11: **its consumer is a browser, not
+the endpoint**, so the memory argument that motivated this change does not apply
+to it. Recorded here so the next sweep reads it as a decision rather than drift.
+Capping it would be a bandwidth optimisation for the page, nothing more.
+
+### The tests pin the traps, not just the happy path
+
+Three assertions in `t_player.pl`, and each was confirmed to FAIL against the
+form it is guarding - the fix was reverted three ways and the suite re-run each
+time, rather than trusting that a passing test means anything:
+
+* the unbounded `cover.jpg` - caught by two assertions
+* the bare-width `cover_600.jpg` - caught, and this is the one that would
+  otherwise have shipped looking correct
+* the padding mode `cover_600x600_m.jpg` - caught by its own assertion
+
+The suite is 425, up 3.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

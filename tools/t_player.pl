@@ -115,8 +115,27 @@ ok(scalar($meta =~ /^<metadata\b/) && scalar($meta =~ m{/>$}), 'metadata is a co
 ok(scalar($meta =~ m{\bsong="Colony &amp; &quot;Collapse&quot;"}), 'song is XML-escaped');
 ok(scalar($meta =~ m{\bartist="Johanna &lt;Warren&gt;"}), 'artist is XML-escaped');
 ok(scalar($meta =~ m{\balbum="Gemini I"}), 'album present');
-ok(scalar($meta =~ m{\bcover="[^"]*/music/abc123/cover\.jpg"}),
+ok(scalar($meta =~ m{\bcover="[^"]*/music/abc123/cover_600x600_o\.jpg"}),
    'cover points at the LMS cover - this is what lights up the endpoint');
+
+# THE SIZE IS THE POINT, AND EACH OF THESE IS A WAY TO LOSE IT.
+#
+# A bare `cover.jpg` serves the STORED ORIGINAL - 3000x3000 / 8.33 MB at the
+# top of Simon's library, measured 2026-09-11 - and the endpoint's display has
+# to hold it.  The three ways to write this wrong all LOOK right:
+#
+#   cover.jpg          no cap at all
+#   cover_600.jpg      no `x<height>`, so LMS ignores it and serves the original
+#   cover_600x600_m    pads to a forced square with black bars, and measured
+#                      SIX TIMES larger than _o on a non-square cover
+#
+# So assert the whole spec, not just that a size is present somewhere.
+ok(scalar($meta !~ m{\bcover="[^"]*/cover\.jpg"}),
+   'the local cover is NOT the unbounded original');
+ok(scalar($meta =~ m{/cover_\d+x\d+_o\.jpg"}),
+   'it carries BOTH dimensions and the aspect-preserving mode, not a bare width');
+ok(scalar($meta !~ m{/cover_\d+x\d+_[mp]\.jpg"}),
+   'and not a padding mode, which squares the art with black bars');
 
 # THE regression guard for 2026-08-28.  HQPlayer base64-encodes the cover URL
 # into the playlist item's `picture` field ITSELF; handing it base64 gets that
@@ -1273,7 +1292,7 @@ ok(scalar($addCmd =~ m{\bqueued="0"}), 'and queued stays 0 - queued="1" kills th
 # into the item's `picture` itself - verified byte-identical to the DIDL path
 # against engine 6.0.4 on 2026-08-28.  picture=/albumArtURI=/art= and a
 # <picture> child are all silently ignored.
-ok(scalar($addCmd =~ m{<metadata\b[^>]*\bcover="https?://[^"]*/cover\.jpg"}),
+ok(scalar($addCmd =~ m{<metadata\b[^>]*\bcover="https?://[^"]*/cover_600x600_o\.jpg"}),
    'the load carries <metadata cover="..."> - this is what sets the picture field');
 is($p->hqExpectStop, '1',
    'play() leaves the stop guard ARMED - the stop that ended the previous track is still in flight');
