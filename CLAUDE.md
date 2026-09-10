@@ -47,8 +47,8 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `playerStreamingFailed`, `PROBLEM_OPENING` on a failed load | ACCEPTED — BUILT in 0.2.60 | `A failed load should always be handed to LMS as `PROBLEM_OPENING`` |
 | HQPlayer's playlist showing the whole LMS queue | DECLINED, Simon's call: "stick with it as is" | `HQPlayer's playlist should show the whole LMS queue` |
 | `UPnP.pm`, `refreshVolumeRange`, keeping UPnP for the range | REMOVED in 0.2.54 | `UPnP must stay for the volume range` |
-| `_onStatus` `HQP_STOPPED` branch ORDER, held tier 4 track vs abandoned stop | WRONG — fixed 0.2.82 | `The abandoned-stop test can sit anywhere` |
-| `_endOfStream` `mode eq 'queue'`, "the held track has NEVER PLAYED", missed advance | INCOMPLETE — fixed 0.2.82 | `A pending hand-over proves the held track has NEVER PLAYED` |
+| `_onStatus` `HQP_STOPPED` branch ORDER, held tier 4 track vs abandoned stop | WRONG — fixed 0.2.82, **CONFIRMED LIVE** | `The abandoned-stop test can sit anywhere` |
+| `_endOfStream` `mode eq 'queue'`, "the held track has NEVER PLAYED", missed advance | INCOMPLETE — fixed 0.2.82, CLOSED as unprovable in the wild; the guard SELF-REPORTS | `A pending hand-over proves the held track has NEVER PLAYED` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -101,8 +101,8 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | Two albums are told apart by the album id, so `_artMatch` can compare the raw value (`Player.pm`, `_artMatch` / `_metadata`) | **WRONG across services** 2026-09-10, fixed same day | Within ONE service it is sound, and that is the case the rule was written for. Across two it is not: Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes, and the id test short-circuits **ahead of** the album name — so an id shared by chance overrode even a different title and one service's cover landed on another service's album. The name half collides far more easily still, and was the already-documented "residual risk": Deezer and Spotty publish no id at all, so any album title shared across two services matched on the name alone. Fixed by recording the **url scheme** on the art identity and treating a difference as a veto ahead of both tests — it costs nothing, it is already on the track, and it is stable across an album because an album is served by one service, so the Various Artists case the album key exists for is untouched. Vetoed only when BOTH sides name a service, the same shape as the id rule. The old fixtures had been writing `qobuz:111` into the id field, which is the namespace the production path never applied. Controlled in `t_player.pl` (the same service and album must still reuse, so the veto cannot pass by simply switching the feature off); **offline suite only, not yet run against a live daemon**. |
 | A stop with a hand-over pending is resolved by waiting `END_GRACE`, and on expiry it is the end of the playlist (`Player.pm`, `_onStatus` / `_endOfStream`) | **WRONG** 2026-09-10, observed live, fixed in 0.2.81 | Simon's challenge, and he was right: *"we should not be sending end of playlist unless last track is reached"*. The timer is armed ONLY when `hqNext` is set, and `hqNext` exists only because LMS resolved a NEXT TRACK — so on that path the playlist provably has more to come and end-of-playlist is the one answer that CANNOT be true. **Seen in the wild the same evening**: 20:47:59, track 5 of an 11-track playlist with track 6 already queued, LMS told the playlist had finished. Four grace arms were observed that evening; three were cancelled by a normal advance and the ONE that expired was wrong. **The genuine end never uses the timer** — at the last track LMS arms no hand-over, `hqNext` stays undef and the stop is reported immediately (confirmed twice). The debounce itself is NOT the mistake and stays: measured raw, a boundary push and an end-of-playlist push are byte-identical (`state=0 track=0 tracks_total=0`, everything zeroed), so "did playback resume" is a fair question to ask with a short wait. Only the CONCLUSION changed. |
 | `tracks_total`, or `track_serial`, can tell a track boundary from the end of the playlist | **WRONG** 2026-09-10 — proposed here, disproven here, do not re-propose | Both were measured off port 4321 and both fail. **`tracks_total` is NOT the playlist length**: it is HQPlayer's OWN accumulated list (played + playing + the one pre-queued), because `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load. Measured simultaneously: LMS `playlist_tracks`=**11**, HQPlayer `tracks_total`=**3**. Since LMS hands over exactly one track ahead, `track < tracks_total` means only "a hand-over is pending", which `hqNext` already says. **`track_serial` is not an advance signal either**: it stepped 5→6 at the END of a one-track list where no next track existed. It counts PLAYLIST-CURSOR ADVANCES, including the step past the final item. Three boundary observations agreed with the advance hypothesis and the first end-of-list observation killed it — every sample had been the same event type. What the serial DOES say is whether the track ran out or was abandoned, which is what 0.2.81 uses it for. |
-| The abandoned-stop test can sit anywhere in the `HQP_STOPPED` branch, because the held tier 4 track above it is only ever consumed at a REAL end of track (`Player.pm`, `_onStatus`) | **WRONG** 2026-09-10, fixed in 0.2.82 | Order matters, and it was the wrong way round. The held-track branch does not read the cursor at all, so with a tier 4 track already handed over it answered a stop made at HQPlayer's own UI by LOADING AND PLAYING THE NEXT TRACK. The window is narrow — it needs the CURRENT track on tier 1/3/5, the NEXT one on tier 4, and the stop to land after LMS handed it over — which is why Simon's live stop test (0.2.81, tier 1 throughout) followed the stop correctly and did not reach it. **Not observed live; traced in code and reproduced in `t_player.pl`.** Fixed by testing the cursor FIRST. Safe in that direction because a track that genuinely RAN OUT moves the cursor, so the abandoned test cannot fire at a real end of track and the tier 4 load still runs there untouched — pinned by a control assertion. |
-| A pending hand-over proves the held track has NEVER PLAYED, so loading it at expiry restarts nothing the listener has heard (`Player.pm`, `_endOfStream`) | **INCOMPLETE** 2026-09-10, fixed in 0.2.82 | True whenever `_handedOver` is right, and `_handedOver` can be wrong in the MISSING direction: it returns 0 before the `PlaylistAdd` ack, it treats a non-matching uri as a **veto** rather than a hint, and on tier 5 every reported uri strips to the same string so the index is all it has. A real advance that trips one of those leaves `hqNext` set on a track HQPlayer then plays to the end — and 0.2.81's new `mode eq 'queue'` branch would load it again, replaying a song just heard. **Not observed live; the missing-advance routes are the sub's own stated limits.** Fixed by stamping the cursor onto the held item at append time and reloading only when it has since moved AT MOST ONCE. **This is not row 38 re-proposed** — see §0.2.82. |
+| The abandoned-stop test can sit anywhere in the `HQP_STOPPED` branch, because the held tier 4 track above it is only ever consumed at a REAL end of track (`Player.pm`, `_onStatus`) | **WRONG** 2026-09-10, fixed in 0.2.82 | Order matters, and it was the wrong way round. The held-track branch does not read the cursor at all, so with a tier 4 track already handed over it answered a stop made at HQPlayer's own UI by LOADING AND PLAYING THE NEXT TRACK. The window is narrow — it needs the CURRENT track on tier 1/3/5, the NEXT one on tier 4, and the stop to land after LMS handed it over — which is why Simon's live stop test (0.2.81, tier 1 throughout) followed the stop correctly and did not reach it. **CONFIRMED LIVE 2026-09-10 23:38**, on the third attempt — the first two never reached it because Qobuz is tier 5 and a local file is tier 3, so the playlist needed **Deezer** (the one service that declines the direct hook) behind a local track. Sequence: `23:36:56` tier 1 playing, `23:37:59` tier 4 resolved and `the next track is tier 4 - holding it`, `23:38:26` stop at HQPlayer's own UI 27s into that window -> `stopped outside LMS part way through the track - following`. **The load line is ABSENT**, which is the whole verdict: on 0.2.81 the next entry would have been `end of track - loading the tier 4 track LMS handed over early` and Deezer would have started playing. Nothing loaded afterwards either. Fixed by testing the cursor FIRST. Safe in that direction because a track that genuinely RAN OUT moves the cursor, so the abandoned test cannot fire at a real end of track and the tier 4 load still runs there untouched — pinned by a control assertion. |
+| A pending hand-over proves the held track has NEVER PLAYED, so loading it at expiry restarts nothing the listener has heard (`Player.pm`, `_endOfStream`) | **INCOMPLETE** 2026-09-10, fixed in 0.2.82 | True whenever `_handedOver` is right, and `_handedOver` can be wrong in the MISSING direction: it returns 0 before the `PlaylistAdd` ack, it treats a non-matching uri as a **veto** rather than a hint, and on tier 5 every reported uri strips to the same string so the index is all it has. A real advance that trips one of those leaves `hqNext` set on a track HQPlayer then plays to the end — and 0.2.81's new `mode eq 'queue'` branch would load it again, replaying a song just heard. **Not observed live, and CLOSED that way deliberately: it cannot be provoked from outside.** Every route needs `_handedOver` to fail spontaneously, which no playlist, service or transport action can force. **So the guard reports itself instead of being tested**: whenever it suppresses a reload it logs `the hand-over was entered after all (cursor N -> M) - not reloading it`. That line appearing in the wild IS the measurement. If it never appears, the case never happens and the guard costs one comparison. Fixed by stamping the cursor onto the held item at append time and reloading only when it has since moved AT MOST ONCE. **This is not row 38 re-proposed** — see §0.2.82. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -4199,15 +4199,69 @@ still pending when the track ends at 9.
 `sh tools/run_checks.sh`: 759 assertions across five suites, 0 failed, sweep
 clean.
 
-### What is NOT established
+### CLOSED 2026-09-10: the reorder is confirmed live, the guard is closed unprovable
 
-* **Neither defect was seen live.** Both are traced in code and reproduced in
-  the offline harness only. The harness is a stub tree, not a simulator.
-* **Neither fix has run against a live daemon.** In particular the tier 4 stop
-  needs a remote track queued behind a local one to exercise at all.
-* **How often a real advance is actually missed is unmeasured.** The three
-  routes are the sub's own documented limits, not observed failures. If it turns
-  out never to happen, the guard costs one comparison and changes nothing.
+**The reorder — CONFIRMED LIVE, 23:38.** It took three attempts to reach, and the
+two failures are the useful part: Qobuz is **tier 5** and a local file is **tier
+3**, so neither can ever produce the hold. The branch needs a service that
+DECLINES the direct hook, and per the verified table above that is **Deezer**.
+Local track playing, Deezer queued behind it:
+
+```
+23:36:56.447  tier 1 (native passthrough) .../music/537912/download.flac
+23:37:59.529  tier 4 (plugin stream endpoint) .../hqp/02-ab-88-42-4c-69/1.flac
+23:37:59.529  the next track is tier 4 - holding it for a normal load at end of track
+23:38:26.658  stopped outside LMS part way through the track - following
+```
+
+The stop landed 27s into the hold window, `streaming=STREAMING` — LMS was still
+feeding the local track, which is the mid-track abandonment the cursor test
+exists to recognise. **The verdict is the line that is ABSENT**: on 0.2.81 the
+next entry would have been `end of track - loading the tier 4 track LMS handed
+over early`. Nothing loaded afterwards; the only later activity is the idle
+watchdog. Done.
+
+**The guard — CLOSED, and deliberately not "pending".** It cannot be provoked
+from outside. Every route into it requires `_handedOver` to fail spontaneously,
+and no playlist, service or transport action can force that: the ack either
+arrives or the link is down (which clears `hqNext` anyway), and the uri either
+matches or the track is genuinely a different one. **Simulating it needs a
+DEBUG BUILD that breaks the check on purpose** — see below — which proves the
+guard's arithmetic, something `t_player.pl` already proves more cheaply.
+
+**So the guard reports itself instead.** When it suppresses a reload it logs:
+
+```
+the hand-over was entered after all (cursor N -> M) - not reloading it
+```
+
+That line appearing in the wild IS the measurement, and it is the only honest
+one available. If it never appears, the case never happens and the guard costs
+one comparison. **Do not reopen this as an open question** — grep the log for
+that phrase and let the answer arrive.
+
+### If it ever needs simulating anyway
+
+Three ways, in order of faithfulness. All need a temporary build; none can be
+done from the wire.
+
+1. **Poison `want` after the append.** In `_appendTrack`, store a deliberately
+   wrong `url` on `hqNext` while sending the REAL one to HQPlayer. The gapless
+   advance then genuinely happens and every `_handedOver` check answers "not
+   yet". Use two LOCAL tracks: tier 1 urls are unique, so the uri veto is the
+   discriminator and nothing else interferes. Expected on 0.2.82: at the end of
+   track 2, `the hand-over was entered after all (cursor N -> N+2)` and end of
+   stream. On 0.2.81: **track 2 plays a second time.**
+2. **Swallow the ack.** Ignore the `PlaylistAdd` reply so `acked` never sets.
+   Faithful to route 1, but `_handedOver` then returns at its first line, so it
+   tests less of the sub than (1) does.
+3. **Starve the index.** Only reachable on tier 5, where the stripped uris are
+   identical and the index is the only evidence: clear `hqTrackNo` just before
+   the advance so `$seen` is undef. The narrowest route, and the least like
+   anything that happens by itself.
+
+(1) is the one worth doing if the self-reporting line ever shows up and the
+arithmetic needs confirming against real audio rather than the harness.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
