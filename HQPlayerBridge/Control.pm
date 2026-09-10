@@ -57,6 +57,7 @@ use constant CONNECT_TIMEOUT => 5;
 use constant REPLY_TIMEOUT   => 30;
 use constant BACKOFF_MIN     => 2;
 use constant BACKOFF_MAX     => 60;
+use constant SLOW_COMMAND    => 1;
 
 # The complete verified command vocabulary, extracted from the hqplayerd
 # binary.  Anything not in here must not go on the wire - see the note about
@@ -104,10 +105,11 @@ use constant BACKOFF_MAX     => 60;
 #
 # Same range UPnP GetVolumeDBRange reports, in plain dB rather than 1/256, on
 # the socket that is already open and answers in ~9ms instead of 300-550ms.
-# `enabled` is very likely the fixed-volume flag the plugin currently infers
-# from three sends that change nothing.  GetVolumeDBRange/GetVolumeDB really
-# are absent - those are the UPnP action names, and the earlier note inferring
-# "so there is no way to ask" from their absence stopped one command short.
+# `enabled` is not a fixed-volume flag and is deliberately ignored; that was
+# measured with HQPlayer's configured startup level applied and the range still
+# fully active. GetVolumeDBRange/GetVolumeDB really are absent - those are the
+# UPnP action names, and the earlier note inferring "so there is no way to ask"
+# from their absence stopped one command short.
 #
 # PlayNextURI IS IN THE LIST BUT MUST NOT BE SENT.  It answers result="OK" and
 # then TAKES HQPLAYERD DOWN - see CLAUDE.md.  It is whitelisted only so that
@@ -164,9 +166,13 @@ sub connected { $_[0]->{connected} }
 #   $cmd is the bare element, e.g. '<Play/>' or '<Seek position="30"/>'
 #   $cb  is called as $cb->($attrs_hashref, $raw_xml) on success,
 #        or $cb->(undef, undef) if the command failed or the link dropped.
+#   $opts->{scope} groups commands which may be cancelled before they reach
+#        the wire; the player uses 'track' for generation-bound load work.
 # ---------------------------------------------------------------------------
 sub send {
-    my ($self, $cmd, $cb) = @_;
+    my ($self, $cmd, $cb, $opts) = @_;
+
+    $opts = {} unless ref $opts eq 'HASH';
 
     my ($verb) = $cmd =~ /^<([A-Za-z]\w*)/;
     if ( !$verb || !$KNOWN{$verb} ) {
@@ -175,7 +181,13 @@ sub send {
         return;
     }
 
-    push @{ $self->{queue} }, { cmd => $cmd, cb => $cb, verb => $verb };
+    push @{ $self->{queue} }, {
+        cmd      => $cmd,
+        cb       => $cb,
+        verb     => $verb,
+        scope    => $opts->{scope},
+        queuedAt => Time::HiRes::time(),
+    };
 
     if ( !$self->{sock} && !$self->{connecting} ) {
         $self->connect;
@@ -185,6 +197,40 @@ sub send {
     }
 
     return;
+}
+
+# Drop work which is still WAITING behind the command on the wire. An
+# in-flight request cannot be cancelled safely: the only way to do that would
+# be to tear down the ordered control connection, and its late side effects
+# would then race the replacement load. Queued commands have not reached
+# HQPlayer, though, so a new track generation can remove them cleanly.
+sub cancelQueued {
+    my ( $self, $scope ) = @_;
+
+    return 0 unless defined $scope && $scope ne '';
+
+    my ( @keep, @drop );
+
+    for my $req ( @{ $self->{queue} || [] } ) {
+        if ( defined $req->{scope} && $req->{scope} eq $scope ) {
+            push @drop, $req;
+        }
+        else {
+            push @keep, $req;
+        }
+    }
+
+    $self->{queue} = \@keep;
+
+    # Preserve send()'s callback contract. Player callbacks are generation-
+    # stamped, so after _newGeneration they recognise this as superseded and
+    # do not turn a deliberate cancellation into a failed load.
+    $_->{cb}->( undef, undef ) for grep { $_->{cb} } @drop;
+
+    main::DEBUGLOG && $log->is_debug && @drop && $log->debug(
+        "$self->{name}: cancelled " . scalar(@drop) . " queued $scope command(s)" );
+
+    return scalar @drop;
 }
 
 # ---------------------------------------------------------------------------
@@ -300,6 +346,7 @@ sub _pump {
     my $next = shift @{ $self->{queue} } or return;
 
     $self->{inflight} = $next;
+    $next->{sentAt} = Time::HiRes::time();
 
     # ENCODE TO OCTETS HERE, AND NOWHERE ELSE.  `wbuf` is a BYTE buffer from
     # this line on.
@@ -443,6 +490,22 @@ sub _dispatch {
     return unless $root eq $req->{verb};
 
     main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: <- [$root] for <$req->{verb}>");
+
+    my $now   = Time::HiRes::time();
+    my $queue = defined $req->{sentAt} && defined $req->{queuedAt}
+        ? $req->{sentAt} - $req->{queuedAt} : 0;
+    my $wire  = defined $req->{sentAt} ? $now - $req->{sentAt} : 0;
+    my $total = $queue + $wire;
+
+    # PlaylistAdd is the only ordinary command which makes HQPlayer fetch and
+    # probe media before replying. When a load feels intermittent, these two
+    # figures distinguish waiting behind older control work from the media
+    # probe itself without requiring DEBUG logging (which includes signed
+    # service URLs). Fast replies remain debug-only noise.
+    if ( $req->{verb} eq 'PlaylistAdd' && $total >= SLOW_COMMAND ) {
+        $log->info( "$self->{name}: <PlaylistAdd> took "
+            . sprintf( '%.2fs (queue %.2fs, HQPlayer %.2fs)', $total, $queue, $wire ) );
+    }
 
     delete $self->{inflight};
     Slim::Utils::Timers::killTimers( $self, \&_replyTimeout );

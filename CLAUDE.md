@@ -32,6 +32,8 @@ declined.
 | The plugin should detect a non-attenuating HQPlayer and set the player's `digitalVolumeControl` pref to 0 itself (`Player.pm`, `_setFixed` / `_watchForFixed`) | **REVERSED** 2026-09-05, Simon's call | Both detectors — a zero-width range, and three sends that changed nothing — were inferring the state disproven in the row above, and on that inference `_setFixed` **wrote the user's pref**. A coincidence of three (the user holding the volume on HQPlayer's own UI across three sends) would silently switch the LMS player to fixed volume. Same over-reach class as the volume guard reversed in 0.2.32, and the same ruling: *"we should not be setting anything to 0"*. **The only fixed-volume switch is LMS's own radio**, and it means one thing — LMS stops driving HQPlayer's volume. The startup level is whatever HQPlayer holds (its software volume, or the device volume on an NAA like the Eversolo) and LMS mirrors it rather than asserting one. `_setFixed`, `_watchForFixed`, `hqVolFixed`, `hqVolForced`, `hqVolMissed`, `FIXED_STRIKES` and `MISS_DELAY` are DELETED; `digitalVolumeControl` is now READ and never written, and `t_player.pl` asserts both subs' absence and that no `set('digitalVolumeControl'` survives in `Player.pm`. |
 | A failed load should always be handed to LMS as `PROBLEM_OPENING`, because skipping the track is the right recovery (`Player.pm`, the four `playerStreamingFailed` sites) | **ACCEPTED 2026-09-05, BUILT in 0.2.60** | It is right for ONE bad track and wrong for a sick link. Every failure LMS is told about makes it skip and load the next track, which fails the same way: measured against a wedged hqplayerd, **five full `Stop/Stop/PlaylistClear/PlaylistAdd` cycles in under one second**, racing the whole album while hammering a daemon that is already sick. The bridge does not cause the wedge — the daemon throws on a bare `<VolumeRange/>` from an uninvolved host — but it is the thing turning one failure into a hundred. Built as `FAIL_LIMIT` (**3**) + `_loadFailed`: all four routes to a failed load funnel through one sub so the run is counted across them, below the limit nothing changes, and at the limit the bridge stops the player instead of reporting another skippable failure. **The run is cleared in exactly two places** — the `hqStarted` latch (a track that really played is proof the link is healthy) and the trip itself (so the player is never left permanently armed; the user's next play gets a fresh three). **Deliberately NOT cleared in `stop()` or `play()`**: LMS calls both on the very skip path this exists to bound, so resetting there would defeat the count entirely. |
 | UPnP must stay for the volume range, because the control API cannot report one (`UPnP.pm`, `Player.pm` `refreshVolumeRange`) | **REMOVED** 2026-09-05 in 0.2.54 | `<VolumeRange/>` is a control command and answers the same range in **plain dB** on the socket that is already open, in ~9 ms against UPnP's 300-550 ms. `UPnP.pm` (414 lines), `t_upnp.pl`, the `describe` handshake and its 5s->60s backoff, the SOAP client, the dormant Play-retry loop and `cancelPlay` are all deleted, and the range now rides the control link's own reconnect via `refreshInfo` on link-up — one retry carrier instead of two. The plugin no longer speaks HTTP at all (`SimpleAsyncHTTP` had no live caller left). **The 1/256 fixed-point discriminator did NOT come across**: that was RenderingControl's unit, and `<VolumeRange/>` is plain dB. Makes the port-8019 log-flood hazard structurally unreachable. |
+| A refused pre-queue is safely demoted to a held load, because "the ordinary load runs at end of track" (`Player.pm`, `_appendTrack` / `_endOfStream`) | **WRONG inside the grace window** 2026-09-10, fixed same day | The demotion is right; the promise it rests on had one hole. `PlaylistAdd` is the ONE ordinary command that makes HQPlayer fetch and probe the media before replying, so a refusal can arrive AFTER the track it was queued behind has ended — i.e. inside the `END_GRACE` window that its own lateness opened. `_endOfStream` then cleared `hqNext` and reported the end of the playlist over a song LMS had already handed over and was still streaming, so **a single refused append stopped an album mid-way**. Nothing recovered it: the held-track branch in `_onStatus` needs a fresh `state=0`, and a stopped instance says nothing until the watchdog speaks `STATUS_WATCHDOG` (10s) later — long after the 3s timer has fired. Fixed by loading a demoted hand-over at expiry, reporting nothing to LMS, exactly as the tier 4 branch in `_onStatus` already does. **Note the trigger is a `result="Error"` REPLY, not a timeout** — `REPLY_TIMEOUT` is 30s and cannot land inside a 3s grace. **The remedy as reported said "the expiry OR failure callback"; only the expiry is correct** — at demotion time the current track is normally still playing, and loading from the callback would cut it off, which is the exact thing that callback's comment refuses to do. Reproduced and controlled in `t_player.pl`; **offline suite only, not yet run against a live daemon**. |
+| Two albums are told apart by the album id, so `_artMatch` can compare the raw value (`Player.pm`, `_artMatch` / `_metadata`) | **WRONG across services** 2026-09-10, fixed same day | Within ONE service it is sound, and that is the case the rule was written for. Across two it is not: Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes, and the id test short-circuits **ahead of** the album name — so an id shared by chance overrode even a different title and one service's cover landed on another service's album. The name half collides far more easily still, and was the already-documented "residual risk": Deezer and Spotty publish no id at all, so any album title shared across two services matched on the name alone. Fixed by recording the **url scheme** on the art identity and treating a difference as a veto ahead of both tests — it costs nothing, it is already on the track, and it is stable across an album because an album is served by one service, so the Various Artists case the album key exists for is untouched. Vetoed only when BOTH sides name a service, the same shape as the id rule. The old fixtures had been writing `qobuz:111` into the id field, which is the namespace the production path never applied. Controlled in `t_player.pl` (the same service and album must still reuse, so the veto cannot pass by simply switching the feature off); **offline suite only, not yet run against a live daemon**. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -67,7 +69,7 @@ then plays it.
 | `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list |
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
-| `HQPlayerBridge/Stream.pm` | Tier 4: the path-only audio endpoint HQPlayer can actually fetch |
+| `HQPlayerBridge/Stream.pm` | Tier 4: the plugin's own audio endpoint, serving LMS's transcoded stream. Its paths carry no query string, but that is a convention, NOT the constraint the ledger disproves at the top of this file |
 | `HQPlayerBridge/Live.pm` | The standalone live page - a raw handler owning the WHOLE document |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 
@@ -2283,7 +2285,7 @@ What it settles that had been open or wrong:
 **VERIFIED live 2026-08-28, engine 6.0.4.** Two mechanisms were candidates and
 the probe settled it — decisively, in both directions.
 
-### `PlaylistAdd queued="1"` — this is the one. It works.
+### `PlaylistAdd queued="0"` — appending is the mechanism, and this spelling is safe.
 
 ```
 t      state track  of   queued  position  uri
@@ -2302,9 +2304,12 @@ Track A is 12.7 s and the advance is at 12.5 s; A+B is 30.6 s and the stop is at
 * `state` still reaches **0 at the end of the last item**, repeat off
 * the daemon was **alive** afterwards (`GetInfo` answered)
 
-`queued` on `<Status/>` reads 1 from the advance onward, so it appears to mean
-"this track came off the queue" rather than "a hand-over is pending" — either
-way `track` is the signal `_handedOver` should keep using.
+The `queued="0"` sent on `PlaylistAdd` is deliberate: `queued="1"` on a
+mid-playback append kills engine 6.0.4 at the end of its playlist (see the trap
+above). The `queued` field on `<Status/>` nevertheless reads 1 from the advance
+onward, so the request attribute and status field do not mean the same thing.
+The status field appears to mean "this track came off the queue"; either way
+`track` is the signal `_handedOver` should keep using.
 
 ### `<PlayNextURI>` — DO NOT SEND IT. IT KILLS THE DAEMON.
 
@@ -2346,7 +2351,7 @@ whole of it:
 | | trigger | what it sends |
 |---|---|---|
 | **start this track** | any ordinary `play()` | the four-command load in `_startTrack` / `_queueTrack` |
-| **here is the next one** | `play()` after **we** asked, via `_armNextTrack` | one `<PlaylistAdd … queued="1">`, nothing else |
+| **here is the next one** | `play()` after **we** asked, via `_armNextTrack` | one `<PlaylistAdd … queued="0">`, nothing else |
 
 The request is recognised by **our own flag** (`hqArmNext`), never guessed from
 the controller's state — a guess would misread the first `play()` after a
@@ -3719,6 +3724,214 @@ so a ~500px screen gets its own full-width line rather than sitting just above
 the breakpoint and just below a comfortable shared line.
 
 699 assertions green.
+
+## 0.2.79 (2026-09-09): slow pre-queues stay pre-queues, and album art holds steady
+
+Two intermittent symptoms were reported together: some album and playlist
+boundaries took the full load path, and the Eversolo's artwork flashed off and
+back on. There was no live playback trace to time in this session — HQPlayer was
+offline and LMS's archived log contained discovery only — so this build fixes
+the deterministic races visible in the code and adds timing evidence for the
+next occurrence rather than claiming a measured live cure.
+
+### A slow `PlaylistAdd` could lose the very pre-queue it was building
+
+HQPlayer fetches and probes a URI before answering `PlaylistAdd`, so an append
+can still be in flight when the playing item reaches `state=0`. The end path
+only waited when `hqNext->{queued}` was already true — which is set by the
+callback that had not arrived. It therefore discarded the pending append and
+started the next song as a full Stop/Clear/Add/Play load. That is both the slow
+boundary and a credible artwork blank: HQPlayer temporarily has no playlist
+item while the clear/re-add runs.
+
+An unresolved pre-queue now gets the same bounded `END_GRACE` (3s) already used
+for an acknowledged append. A refusal or a genuinely slow origin still falls
+back after the deadline; normal playback no longer converts a near-complete
+append into the expensive recovery path.
+
+### Superseded loads no longer sit in front of the current one
+
+Every track command is tagged with a `track` scope. `_newGeneration` advances
+the generation first and then removes older commands that are still waiting in
+the control queue, invoking their callbacks as superseded. This matters when a
+skip or playlist edit arrives behind a slow append: stale Stop/Clear/Add/Play
+work no longer runs before the load the user actually requested.
+
+The command already on the wire is deliberately not cancelled. HQPlayer permits
+one request in flight and tearing down that socket to interrupt a media probe
+would also discard reply framing, status subscription and ordering. What can be
+cancelled safely is cancelled; the unavoidable in-flight time is now visible.
+
+Every `PlaylistAdd` taking at least one second logs one line splitting total
+latency into **control-queue wait** and **HQPlayer/media-probe time**. It does not
+log the URI, so signed service URLs are not exposed. The next live slow load can
+therefore be assigned to the bridge queue or to HQPlayer/the origin instead of
+being inferred from the audible pause.
+
+### The next track no longer changes the current track's tier early
+
+Resolving an armed item called `_resolveURL`, which writes `hqTier`, before the
+item had handed over. The player could therefore describe the current song as
+the next song's tier for minutes. The resolver's result is now stored on
+`hqNext`; the current tier is restored immediately and the next tier is promoted
+only when `_handedOver` confirms the transition.
+
+### Artwork has a narrow continuity rule
+
+Remote metadata can briefly omit its cover while the protocol handler refreshes.
+Sending that omission replaces a valid picture with no picture at all. The
+bridge now remembers the artwork of the last item HQPlayer accepted and reuses
+it only when the new item's non-empty album name is an exact match. A different
+album, or an item with no trustworthy album identity, still sends no cover — so
+radio art and unrelated playlist items cannot inherit stale artwork merely to
+avoid a blank.
+
+The same cached pair is promoted with a pre-queued hand-over. It is
+deliberately retained across a full-load generation so another track from that
+album can use it. Tests cover same-album reuse, refusal across albums and
+unknown albums, current/next tier separation, pending-append grace, command
+scopes and cancellation order.
+
+### What the anchor is keyed on, and the two ways the first cut got it wrong
+
+The continuity cache above was first written as **two parallel accessors
+(`hqAlbum`, `hqArtwork`) written at three sites**, with the storage rule stated
+at none of them. One concept on four carriers, and it failed in both of the
+ways that shape always fails. Neither fault ever reached a release — 0.2.77 is
+the last tag and the review that found them ran before this build left the
+working tree — but they are recorded because the SHAPE is the lesson:
+
+* **The anchor was overwritten with an empty pair.** `hqTier` was guarded on
+  `defined`; the album and cover were not. A pre-queued item whose handler
+  cache was still cold carries `album=''` and `cover=''`, so it wiped the
+  anchor — and the *next* cold append then had nothing to fall back on and sent
+  no cover at all, which is the exact blank the feature exists to prevent. The
+  same wipe reached it from `_handedOver` and from `_metadata`'s early return,
+  which leaves `%item` unpopulated and stored `undef`.
+* **Reuse was keyed on the album NAME alone.** Two different albums sharing a
+  title — *Live*, *Greatest Hits*, anything self-titled — compared equal, so in
+  a mixed playlist one artist's cover was written into another's `PlaylistAdd`
+  and stayed for the whole track. That contradicts the invariant the comment
+  directly above it claimed.
+
+Both are now structural rather than remembered. The concept lives on **one
+carrier, `hqArt`** (`{ id, album, cover }` or undef), it is written **only**
+through `_rememberArt` and read **only** through `_reusableArt`, and the
+storage rule lives inside the writer: a pair without a non-empty cover *and* an
+identity to key it on is ignored, **leaving the existing anchor standing**. A
+stale anchor cannot cause the opposite fault, because the reader only ever
+hands it back for the same album.
+
+The key is the album, **not the artist**. Keying on the artist would look
+stricter and would break the case the feature is for: on a compilation the
+track artist changes from track to track while the album does not, so every
+hand-over inside a Various Artists album would decline its own cover. What
+tells two same-named albums apart is the **album id**, which `_handlerMeta` now
+carries off the hash `getMetadataFor` already returned — `albumId` on Qobuz,
+`album_id` on Tidal (verified 2026-07-25 from each plugin's source). This is
+not a reach into plugin internals; it is one more key alongside the four
+artwork keys already read there, and it never goes on the wire.
+
+| both sides have an album id | ids must be equal |
+|---|---|
+| either side has none | album names must be equal and non-empty |
+| neither has an identity | no anchoring, no reuse — radio cannot inherit art |
+
+Deezer and Spotty flatten their album to a title before the bridge ever sees
+it, so they take the name row. **The residual risk is stated, not hidden:** on
+an id-less service, two *adjacent* items sharing an album title can still
+inherit each other's art. That was the accepted trade — the alternative
+(matching the artist too) blanks the cover on every id-less compilation, which
+is the more common case by far.
+
+The stale source comments and this file's contradictory gapless recipe were
+also corrected: HQPlayer supports query strings, and the safe mid-playback
+append is `queued="0"`, not `queued="1"`.
+
+732 assertions green (67 + 395 + 64 + 73 + 133), called-vs-defined sweep clean.
+**Not yet tested on the live LMS — HQPlayer was offline while this build was
+made.**
+
+## 0.2.80 (2026-09-10): the two ways 0.2.79's own fixes could still lose the thing they protected
+
+A review of the 0.2.79 working tree raised two findings against the code that
+build had just written. Both were real, both were reproduced in the offline
+suite before anything was changed, and both are the same shape: a rule that is
+correct inside the case it was written for, applied one step outside it.
+
+**Neither has been run against a live daemon.** HQPlayer was not available in
+this session. What follows is verified by `t_player.pl` driving the real subs,
+with a control assertion on each so the test cannot pass against a build that
+does nothing.
+
+### A refused pre-queue was dropped by the grace period 0.2.79 gave it
+
+0.2.79 extended `END_GRACE` to an append that had not acknowledged yet, because
+`PlaylistAdd` makes HQPlayer fetch and probe the media before replying and the
+playing item can reach `state=0` inside that window. That is right. What it did
+not cover is the other thing that can arrive in the same window: **the refusal**.
+
+`_appendTrack` answers `result="Error"` by demoting the item to a held load
+rather than reporting a failed load, on the stated promise that *the ordinary
+load runs at end of track*. When the refusal lands inside the grace period, the
+end of that track has already happened. `_endOfStream` then cleared `hqNext` and
+reported the end of the playlist — over a song LMS had handed over a track
+earlier and was still streaming. **One refused append stopped an album mid-way.**
+
+Nothing recovered it. The held-track branch in `_onStatus` needs a fresh
+`state=0`, and a stopped instance says nothing at all until the watchdog speaks
+`STATUS_WATCHDOG` (10s) later, long after the 3s timer has fired.
+
+`_endOfStream` now loads a demoted hand-over at expiry and reports nothing to
+LMS, exactly as the tier 4 held-track branch in `_onStatus` already does. A load
+that cannot run is not silent either — `_queueTrack` answers a missing control
+link with `_loadFailed`, and a second refusal is reported properly there, which
+is the entire point of demoting to a load instead of failing at append time.
+
+**The trigger is a reply, not a timeout.** `REPLY_TIMEOUT` is 30s and cannot
+land inside a 3s grace; only `result="Error"` arrives fast enough. The finding
+as reported offered "the expiry or the failure callback" as the place to fix it.
+**Only the expiry is correct**: at demotion time the current track is normally
+still playing, and loading from the callback would cut it off — which is the
+exact thing that callback's own comment refuses to do.
+
+### An album id is not a global identifier, and neither is a title
+
+The artwork anchor from 0.2.79 tells two same-named albums apart by the album
+id, and `_artMatch` returns on the id **before** it looks at the name. Within
+one service that is sound, and that is the case it was written for. Across two
+it is not: Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering
+schemes, so an id shared by chance overrode even a different album title and one
+service's cover landed on another service's album.
+
+The name half collides far more easily, and it was already written down as the
+feature's "residual risk": Deezer and Spotty publish no id at all, so **any**
+album title shared across two services matched on the name alone.
+
+The identity now records the **url scheme**, and a difference is a veto ahead of
+both tests. It costs nothing, it is already on the track, and it is stable
+across an album because an album is served by one service — so the Various
+Artists case the album key exists for is untouched. The veto applies only when
+both sides name a service, the same shape as the id rule and for the same
+reason: an anchor with no service recorded is not evidence of a *different* one.
+
+A detail worth keeping: the old fixtures had been writing `qobuz:111` into the
+id field. **The tests had been describing a namespace the production path never
+applied** — which is why a test suite this size did not catch it.
+
+### What the two findings have in common
+
+Both fixes are one branch each, and both were found by asking what happens one
+step outside the window a rule was written for. 0.2.79 wrote the grace period
+for a *slow* append and the anchor for a *single service*, and each was right
+about that. The failures were the neighbouring case in the same code, arriving
+by a route nobody had walked.
+
+Both tests carry a control assertion, because both fixes are of the kind that
+passes trivially: an end-of-stream test passes against a build that loads the
+track *and* wrongly tells LMS the playlist ended, and an artwork veto passes
+against a build that has simply switched artwork reuse off. The tests assert
+what must **not** happen alongside what must.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

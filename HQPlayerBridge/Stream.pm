@@ -1,26 +1,15 @@
 package Plugins::HQPlayerBridge::Stream;
 
-# TIER 4 - a path-only audio endpoint, so that streaming services play.
+# TIER 4 - the bridge player's own audio endpoint.
 #
 # WHY THIS EXISTS
 #
-# LMS serves a player's audio on `/stream.mp3?player=<mac>`, and HQPlayer
-# CANNOT FETCH A URL CONTAINING A QUERY STRING.  Isolated live 2026-08-28
-# against engine 6.0.4, the same file each time:
-#
-#   /music/458773/download.flac             -> plays  (state 2, proc 3.27)
-#   /music/458773/download.flac?x=1         -> silent (state 0)
-#   /stream.mp3?player=02:ab:88:42:4c:69    -> silent (state 0)
-#
-# `PlaylistAdd` answers result="OK" in every case and then simply never fetches
-# it, which is why this read as a transcoding problem and then a single-
-# consumer-stream problem for the whole of development: every command succeeds,
-# and the only evidence is the HEAD that never arrives.
-#
-# A redirect does not rescue it either.  Pointed at a server answering 302, the
-# HEAD arrived and NO GET EVER CAME - HQPlayer does not follow redirects.  So
-# the URL handed over has to be fetchable exactly as it is, and the fix has to
-# be on our side: a path with no `?` in it.
+# LMS normally serves a player's audio on `/stream.mp3?player=<mac>`. This
+# endpoint gives each track a unique URL and resolves the player explicitly
+# before handing the socket to LMS's streaming machinery. HQPlayer DOES fetch
+# query strings; the older explanation that it did not was disproved on the
+# wire by tier 5's signed service URLs. It does not follow redirects, so the URL
+# handed over still has to be final and directly fetchable.
 #
 # WHAT IT DOES
 #
@@ -467,8 +456,9 @@ sub _fail {
 # none`.  Same as before; _queueTrack does not send <Seek> for this tier.
 
 # The url HQPlayer is given.  It has to contain `download.<ext>` because that
-# is the regex downloadMusicFile reads the output format out of, and no `?`
-# because HQPlayer will not fetch one (see the header).
+# is the regex downloadMusicFile reads the output format out of. Keep this
+# generated route path-only; it needs no parameters and a stable canonical URL
+# is easier for both LMS and HQPlayer to identify.
 sub downloadUrlFor {
     my ( $class, $base, $id, $ext ) = @_;
 

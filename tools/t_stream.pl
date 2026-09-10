@@ -1,11 +1,8 @@
 # Regression tests for the tier 4 audio endpoint.
 #
-# The bug this whole module exists to fix is invisible from inside the plugin:
-# HQPlayer will not fetch a URL containing a query string, and answers
-# result="OK" to the PlaylistAdd anyway. Nothing about the plugin's own state
-# looks wrong; the track simply never gets requested. So the assertion that
-# matters most here is the dullest one in the file - THE MINTED URL HAS NO `?`
-# IN IT - and it is worth keeping even though it looks tautological.
+# The route maps a unique URL to the one player stream LMS owns. Keep the
+# generated URL canonical and path-only even though HQPlayer supports query
+# strings: this endpoint needs no parameters and its path is its identity.
 #
 # The rest guards the socket handover, which reaches into Slim::Web::HTTP's
 # package variables. Those are `our` in LMS 9.1 and that is what makes this
@@ -117,9 +114,8 @@ my $base = 'http://lms:9000';
 my $u1 = $S->urlFor( $client, $base, FakeSong->new('flc') );
 my $u2 = $S->urlFor( $client, $base, FakeSong->new('flc') );
 
-# THE ONE THAT MATTERS. A query string here means the track silently never
-# gets fetched and every command still answers OK.
-ok( index( $u1, '?' ) == -1, 'the url has NO query string - HQPlayer will not fetch one' );
+# No parameters are needed: the player and sequence both live in the path.
+ok( index( $u1, '?' ) == -1, 'the url is canonical and path-only' );
 ok( index( $u1, '&' ) == -1, 'and no stray separator either' );
 ok( scalar( $u1 =~ m{^\Qhttp://lms:9000/hqp/\E} ), 'it is under the endpoint prefix' );
 ok( $u1 ne $u2, 'every track gets a url of its own, so HQPlayer cannot mistake it for the one it holds' );
@@ -349,7 +345,7 @@ is( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303, 'flac
     'http://s:9000/hqp3/303/download.flac', 'the tier 3 url is path-only and carries download.<ext>' );
 
 ok( scalar( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303, 'flac' ) !~ /\?/ ),
-    'and no query string - HQPlayer silently refuses those' );
+    'and needs no query string' );
 
 is( Plugins::HQPlayerBridge::Stream->downloadUrlFor( 'http://s:9000', 303 ),
     'http://s:9000/hqp3/303/download.flac', 'the extension defaults to flac' );

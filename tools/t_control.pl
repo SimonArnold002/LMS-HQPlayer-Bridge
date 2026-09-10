@@ -220,5 +220,29 @@ print "-- the reconnect ladder must climb against a peer that accepts and drops 
         "it doubles from ${min}s and caps at ${max}s" );
 }
 
+print "-- superseded track work is removed before it reaches HQPlayer --\n";
+{
+    my @failed;
+    my $ctl = bless {
+        name  => 'test',
+        queue => [
+            { verb => 'PlaylistClear', scope => 'track' },
+            { verb => 'PlaylistAdd', scope => 'track', cb => sub { push @failed, [@_] } },
+            { verb => 'Volume' },
+            { verb => 'Status', scope => 'link' },
+        ],
+    }, 'Plugins::HQPlayerBridge::Control';
+
+    is( $ctl->cancelQueued('track'), '2',
+        'both waiting commands belonging to the old track are cancelled' );
+    is( join( ',', map { $_->{verb} } @{ $ctl->{queue} } ), 'Volume,Status',
+        'unrelated volume and link work stays in order' );
+    is( scalar(@failed), '1', 'a cancelled request still settles its callback' );
+    is( defined $failed[0][0] ? 'success' : 'failed', 'failed',
+        'using the same failed-callback contract as a dropped link' );
+    is( defined $failed[0][1] ? 'raw' : 'no raw', 'no raw',
+        'and does not invent an HQPlayer reply' );
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

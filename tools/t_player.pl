@@ -227,6 +227,165 @@ print "-- a remote track gets artist and album from the handler --\n";
     ok(scalar($om !~ m{=("|)[A-Za-z:]+=HASH}),        'no reference is ever written into the metadata');
 }
 
+print "-- artwork survives a transient handler miss within the same album --\n";
+{
+    package MissingArtHandler;
+    our $album  = 'WILDCHILD';
+    our $artist = 'Sun Kil Moon';
+    our $id;
+    sub getMetadataFor { return {
+        title => 'Second Track', album => $album, artist => $artist,
+        ( defined $id ? ( albumId => $id ) : () ),
+    } }
+}
+{
+    no warnings qw(redefine once);
+    local *Slim::Music::Info::isRemoteURL = sub { 1 };
+    local *Slim::Player::ProtocolHandlers::handlerForURL = sub { 'MissingArtHandler' };
+
+    my $known = 'http://resources.tidal.com/images/x/1280x1280.jpg';
+    $c->hqArt({ album => 'WILDCHILD', cover => $known });
+
+    my $rt = FakeTrack->new({ id=>-2, secs=>180, url=>'tidal://second.flc' });
+    my $same = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $same =~ /\bcover="\Q$known\E"/ ),
+        'a momentarily missing cover reuses the confirmed cover for the exact same album' );
+
+    # A COMPILATION IS THE CASE THE FEATURE IS FOR.  The track artist changes
+    # from one track to the next while the album does not, so keying the reuse
+    # on the artist as well would decline every hand-over inside a Various
+    # Artists album - the exact blank this is here to prevent.
+    $MissingArtHandler::artist = 'A Completely Different Singer';
+    my $compilation = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $compilation =~ /\bcover="\Q$known\E"/ ),
+        'a different track artist inside the same album still reuses the cover' );
+    $MissingArtHandler::artist = 'Sun Kil Moon';
+
+    $MissingArtHandler::album = 'A DIFFERENT ALBUM';
+    my $different = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $different !~ /\bcover=/ ),
+        'the old cover is never carried into a different album in a mixed playlist' );
+
+    $MissingArtHandler::album = '';
+    my $unknown = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $unknown !~ /\bcover=/ ),
+        'nor reused when the album identity is missing' );
+
+    # -- two different albums of the SAME NAME are told apart by the album id -
+    #
+    # Qobuz publishes `albumId` and Tidal `album_id` on getMetadataFor, so a
+    # shared title ('Live', 'Greatest Hits', anything self-titled) does not
+    # make one artist's cover land on another's.
+    $MissingArtHandler::album = 'Live';
+    $c->hqArt({ id => 'qobuz:111', album => 'Live', cover => $known });
+
+    $MissingArtHandler::id = 'qobuz:222';
+    my $collide = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $collide !~ /\bcover=/ ),
+        'a different album with the same title does not inherit the cover' );
+
+    $MissingArtHandler::id = 'qobuz:111';
+    my $sameId = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $sameId =~ /\bcover="\Q$known\E"/ ),
+        'and the same album id reuses it even though nothing else identifies it' );
+
+    # An id is never compared with a NAME: an anchor identified only by the id
+    # 'Live' is not the album called 'Live'.
+    $MissingArtHandler::id = undef;
+    $c->hqArt({ id => 'Live', cover => $known });
+    my $crossed = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $crossed !~ /\bcover=/ ),
+        'an album id is never matched against an album name' );
+
+    # THE ID WINS ONLY WHEN BOTH SIDES HAVE ONE.  A service that publishes no
+    # id must still fall back to the album name, or the feature would do
+    # nothing at all on Deezer and Spotty.
+    $c->hqArt({ id => 'qobuz:111', album => 'Live', cover => $known });
+    my $oneSided = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $oneSided =~ /\bcover="\Q$known\E"/ ),
+        'an item with no id still matches the anchor on the album name' );
+
+    # -- AN ALBUM ID BELONGS TO ONE SERVICE'S IDENTIFIER SPACE --------------
+    #
+    # Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes,
+    # and the id test above short-circuits AHEAD of the album name - so an id
+    # shared by chance let one service's cover land on another service's album
+    # whatever the two titles said.  The url scheme separates the spaces.
+    $MissingArtHandler::album = 'Live';
+    $MissingArtHandler::id    = '111';
+
+    my %qi;
+    $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-3, secs=>180, url=>'qobuz://111.flac' }) ), \%qi );
+
+    # The fixtures below are only honest if the PRODUCTION path really records
+    # this: without it the veto would be keying on a field nothing ever sets,
+    # and every assertion after this one would pass by accident.
+    is( $qi{art} && $qi{art}{svc}, 'qobuz',
+        'the album identity records which service it came from' );
+
+    $c->_rememberArt({ svc => 'qobuz', id => '111', album => 'Live', cover => $known });
+
+    $MissingArtHandler::album = 'Kid A';
+    my $crossSvc = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-4, secs=>180, url=>'tidal://9.flac' }) ) );
+    ok( scalar( $crossSvc !~ /\bcover=/ ),
+        'a colliding album id from ANOTHER service does not inherit the cover' );
+
+    # The name half collides more easily still: Deezer and Spotty publish no id
+    # at all, so any title shared across two services matched on the name alone.
+    $MissingArtHandler::id = undef;
+    $c->_rememberArt({ svc => 'qobuz', album => 'Live', cover => $known });
+
+    $MissingArtHandler::album = 'Live';
+    my $crossName = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-5, secs=>180, url=>'deezer://7.flac' }) ) );
+    ok( scalar( $crossName !~ /\bcover=/ ),
+        'nor does an album TITLE shared across two services' );
+
+    # THE CONTROL FOR BOTH.  The veto must not simply switch the feature off:
+    # the same service and the same album still reuses, so the two assertions
+    # above are testing the service boundary and not a cold anchor.
+    my $sameSvc = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-6, secs=>180, url=>'qobuz://222.flac' }) ) );
+    ok( scalar( $sameSvc =~ /\bcover="\Q$known\E"/ ),
+        'while the same service and the same album still does' );
+
+    $MissingArtHandler::id = undef;
+
+    # -- THE ANCHOR IS NEVER OVERWRITTEN WITH AN EMPTY PAIR ------------------
+    #
+    # The first cut stored album and cover unguarded, so a pre-queued item whose
+    # handler cache was still cold wrote '' over a good anchor and the NEXT
+    # cold append had nothing left to fall back on.
+    $MissingArtHandler::album = 'WILDCHILD';
+    $c->hqArt({ album => 'WILDCHILD', cover => $known });
+
+    $c->_rememberArt({ album => '', cover => '' });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'an empty pair leaves the confirmed anchor standing' );
+
+    $c->_rememberArt( undef );
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'and so does the undef _metadata leaves behind on its early return' );
+
+    $c->_rememberArt({ album => 'WILDCHILD', cover => undef });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'a known album with no artwork yet does not erase it either' );
+
+    ok( scalar( $c->_metadata( FakeSong->new($rt) ) =~ /\bcover="\Q$known\E"/ ),
+        'so the next cold append still gets the cover' );
+
+    # A cover with nothing to key it on is not an anchor at all.
+    $c->_rememberArt({ album => '', cover => 'http://x/orphan.jpg' });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'a cover with no album identity is not anchored' );
+
+    # A complete pair does replace it.
+    $c->_rememberArt({ album => 'NEXT ALBUM', cover => 'http://x/next.jpg' });
+    is( $c->hqArt && $c->hqArt->{album}, 'NEXT ALBUM',
+        'a usable pair does replace the anchor' );
+
+    $c->hqArt(undef);
+    $MissingArtHandler::album = 'WILDCHILD';
+}
+
 print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
 {
     package FakeHandler;
@@ -1450,6 +1609,33 @@ print "-- the circuit breaker: N consecutive failed loads stop the player --\n";
 }
 
 print "-- a load superseded mid-flight --\n";
+{
+    package CancelCtl;
+    sub cancelQueued {
+        $_[0]->{scope} = $_[1];
+        $_[0]->{seenGen} = $_[0]->{player}->hqGen;
+        return 2;
+    }
+}
+{
+    my $cp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fb', 'paddr', 1.0, undef, 12, undef);
+    my $cc = bless { player => $cp }, 'CancelCtl';
+    $cp->hqControl($cc);
+    my $old = $cp->hqGen;
+    $cp->_newGeneration;
+    is( $cc->{scope}, 'track', 'a new track generation cancels waiting load work from the old one' );
+    is( $cc->{seenGen}, $old + 1,
+        'the generation changes before cancellation settles old callbacks' );
+
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Player.pm'); <> };
+    my ($queue) = $src =~ /sub _queueTrack \{(.*?)\n\}/s;
+    my ($append) = $src =~ /sub _appendTrack \{(.*?)\n\}/s;
+    ok( defined $queue && $queue =~ /scope\s*=>\s*'track'/,
+        'the full load marks its queued commands as generation-bound' );
+    ok( defined $append && $append =~ /scope\s*=>\s*'track'/,
+        'and so does the speculative append' );
+}
+
 # skip: play track two, then stop before HQPlayer has answered
 $p->play({ controller => LoadController->new($two) });
 my $gen = $p->hqGen;
@@ -1710,6 +1896,103 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     is( Slim::Utils::Timers::_pending(), '0',
         'HQPlayer playing again cancels the pending end-of-playlist' );
     is( $gp->hqURL, $u2, 'and the hand-over completes normally' );
+}
+
+{
+    # PlaylistAdd fetches and probes the next item before acknowledging. If the
+    # current track ends during that window, throwing the unacknowledged append
+    # away immediately creates exactly the intermittent full reload and blank
+    # artwork interval pre-queueing exists to avoid.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fa', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );
+
+    @sent = (); @sentCb = ();
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    my ($u2) = $sent[0] =~ m{\buri="([^"]+)"};
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    aged($gp);
+    status( $gp, 0, undef, 0, 0 );       # append has NOT acknowledged yet
+
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'an end arriving while the pre-queue is still probing is not reported immediately' );
+    is( Slim::Utils::Timers::_pending(), '1',
+        'the in-progress hand-over gets the same bounded grace as an acknowledged one' );
+
+    _answer();                            # PlaylistAdd completes inside the grace
+    status( $gp, 2, $u2, 0, 2 );
+    is( Slim::Utils::Timers::_pending(), '0',
+        'a completed hand-over cancels the fallback full reload' );
+    ok( scalar( grep { $_ eq 'playerTrackStarted' } @{ $gc->{calls} } ),
+        'and LMS advances on the pre-queued item instead' );
+}
+
+{
+    # ...AND THE OTHER OUTCOME OF THAT SAME WINDOW: HQPLAYER REFUSES IT.
+    #
+    # PlaylistAdd is the one ordinary command that fetches and probes the media
+    # before replying, so a refusal can arrive AFTER the track it was queued
+    # behind has ended - inside the grace period that its own lateness opened.
+    # _appendTrack answers a refusal by demoting the item to a held load "at
+    # end of track", and this IS the end of that track.
+    #
+    # The timer used to clear the held item and report the end of the playlist
+    # instead, over a song LMS had already handed over and was still streaming.
+    # One refused append stopped an album mid-way, and nothing recovered it:
+    # the held-track branch in _onStatus needs a fresh state 0, and a stopped
+    # instance says nothing until the watchdog speaks STATUS_WATCHDOG seconds
+    # later - long after this END_GRACE timer has fired.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:e1', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );
+
+    @sent = (); @sentCb = ();
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    aged($gp);
+    status( $gp, 0, undef, 0, 0 );        # the track ends, the append is still probing
+
+    is( Slim::Utils::Timers::_pending(), '1',
+        'an end arriving while the pre-queue is still probing is held on the timer' );
+
+    @sent = ();
+    _answer(0);                           # <PlaylistAdd result="Error"/>
+
+    is( ref $gp->hqNext ? $gp->hqNext->{mode} : '(undef)', 'load',
+        'a refusal demotes the hand-over to a held load rather than failing the track' );
+
+    Slim::Utils::Timers::_fireAll();      # the grace period expires
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track IS loaded when the grace period expires' );
+    is( $gp->hqNext, '(undef)', 'and the load consumes it' );
+
+    # THE CONTROL.  This is what the expiry did with it before - reported the
+    # end of the playlist over a song LMS was still streaming.  Without this
+    # assertion the test passes against a build that loads the track AND tells
+    # LMS the playlist ended.
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'and LMS is NOT told the playlist ended - it is still streaming that song' );
 }
 
 {
@@ -2043,7 +2326,7 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
         'the url carries download.<ext> - downloadMusicFile reads the output format out of it' );
     is( $c->hqTier, '3', 'and is tier 3' );
     ok( scalar( $u !~ /\?/ ),
-        'the url carries NO query string - HQPlayer silently refuses those' );
+        'the generated transcode route is canonical and path-only' );
 
     # a format it CAN decode is still an untouched passthrough
     my $flac = FakeSong->new( FakeTrack->new(
@@ -2061,7 +2344,7 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
     ok( scalar( $ru =~ m{^http://127\.0\.0\.1:9000/hqp/02-ab-88-42-4c-69/\d+\.} ),
         'only a remote track reaches tier 4, the plugin stream endpoint' );
     ok( scalar( $ru !~ /\?/ ),
-        'and it too is path-only - /stream.mp3?player= is exactly what HQPlayer will not fetch' );
+        'and its player and sequence identity both live in the path' );
     is( $c->hqTier, '4', 'and is tier 4' );
 }
 
@@ -2084,6 +2367,26 @@ print "-- gapless: the guards --\n";
     _answer(); _answer();
     status( $gp, 2, $u1, 1, 1 );
 
+    # Resolving a different kind of queued track used to overwrite hqTier at
+    # once. If that append was then flushed, the discarded NEXT track became
+    # the supposed tier of the one still playing and later queue decisions
+    # were made from a fact that never happened.
+    my $alac = FakeSong->new( FakeTrack->new(
+        { title=>'ALAC next', id=>303, ct=>'m4a', secs=>180,
+          url=>'file:///next.m4a' } ) );
+    $gc->{song} = $alac;
+    $gc->{playing} = 1;
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u3) = $sent[0] =~ m{\buri="([^"]+)"};
+    is( $gp->hqTier, '1',
+        "resolving a tier-3 next track does not overwrite the PLAYING track's tier" );
+    is( $gp->hqNext && $gp->hqNext->{tier}, '3',
+        'the queued item carries its own tier until the hand-over' );
+    _answer();
+    status( $gp, 2, $u3, 0, 2 );
+    is( $gp->hqTier, '3', 'the queued tier is promoted when HQPlayer actually advances' );
+
     # A LOCAL file of any format is tier 3 now (LMS transcodes it on a
     # path-only url), so only a genuinely REMOTE track reaches tier 4 - it is
     # the one case with no file to serve.
@@ -2098,12 +2401,12 @@ print "-- gapless: the guards --\n";
 
     is( scalar(@sent), '0', 'a tier 4 next track is NOT pre-queued - nothing is sent' );
     is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'it is held for a normal load instead' );
-    is( $gp->hqTier, '1', "and the PLAYING track's tier is left alone" );
+    is( $gp->hqTier, '3', "and the PLAYING track's tier is left alone" );
 
     # ...and it is loaded when the current track actually ends
     $gc->{calls} = [];
     aged($gp);
-    status( $gp, 0, $u1, 200, 1 );
+    status( $gp, 0, $u3, 200, 2 );
     ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ), 'the held track is loaded at end of track' );
     ok( scalar( grep { $_ eq '<PlaylistClear/>' } @sent ),
         'the ordinary way - a full four-command load' );
