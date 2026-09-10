@@ -34,6 +34,8 @@ declined.
 | UPnP must stay for the volume range, because the control API cannot report one (`UPnP.pm`, `Player.pm` `refreshVolumeRange`) | **REMOVED** 2026-09-05 in 0.2.54 | `<VolumeRange/>` is a control command and answers the same range in **plain dB** on the socket that is already open, in ~9 ms against UPnP's 300-550 ms. `UPnP.pm` (414 lines), `t_upnp.pl`, the `describe` handshake and its 5s->60s backoff, the SOAP client, the dormant Play-retry loop and `cancelPlay` are all deleted, and the range now rides the control link's own reconnect via `refreshInfo` on link-up — one retry carrier instead of two. The plugin no longer speaks HTTP at all (`SimpleAsyncHTTP` had no live caller left). **The 1/256 fixed-point discriminator did NOT come across**: that was RenderingControl's unit, and `<VolumeRange/>` is plain dB. Makes the port-8019 log-flood hazard structurally unreachable. |
 | A refused pre-queue is safely demoted to a held load, because "the ordinary load runs at end of track" (`Player.pm`, `_appendTrack` / `_endOfStream`) | **WRONG inside the grace window** 2026-09-10, fixed same day | The demotion is right; the promise it rests on had one hole. `PlaylistAdd` is the ONE ordinary command that makes HQPlayer fetch and probe the media before replying, so a refusal can arrive AFTER the track it was queued behind has ended — i.e. inside the `END_GRACE` window that its own lateness opened. `_endOfStream` then cleared `hqNext` and reported the end of the playlist over a song LMS had already handed over and was still streaming, so **a single refused append stopped an album mid-way**. Nothing recovered it: the held-track branch in `_onStatus` needs a fresh `state=0`, and a stopped instance says nothing until the watchdog speaks `STATUS_WATCHDOG` (10s) later — long after the 3s timer has fired. Fixed by loading a demoted hand-over at expiry, reporting nothing to LMS, exactly as the tier 4 branch in `_onStatus` already does. **Note the trigger is a `result="Error"` REPLY, not a timeout** — `REPLY_TIMEOUT` is 30s and cannot land inside a 3s grace. **The remedy as reported said "the expiry OR failure callback"; only the expiry is correct** — at demotion time the current track is normally still playing, and loading from the callback would cut it off, which is the exact thing that callback's comment refuses to do. Reproduced and controlled in `t_player.pl`; **offline suite only, not yet run against a live daemon**. |
 | Two albums are told apart by the album id, so `_artMatch` can compare the raw value (`Player.pm`, `_artMatch` / `_metadata`) | **WRONG across services** 2026-09-10, fixed same day | Within ONE service it is sound, and that is the case the rule was written for. Across two it is not: Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes, and the id test short-circuits **ahead of** the album name — so an id shared by chance overrode even a different title and one service's cover landed on another service's album. The name half collides far more easily still, and was the already-documented "residual risk": Deezer and Spotty publish no id at all, so any album title shared across two services matched on the name alone. Fixed by recording the **url scheme** on the art identity and treating a difference as a veto ahead of both tests — it costs nothing, it is already on the track, and it is stable across an album because an album is served by one service, so the Various Artists case the album key exists for is untouched. Vetoed only when BOTH sides name a service, the same shape as the id rule. The old fixtures had been writing `qobuz:111` into the id field, which is the namespace the production path never applied. Controlled in `t_player.pl` (the same service and album must still reuse, so the veto cannot pass by simply switching the feature off); **offline suite only, not yet run against a live daemon**. |
+| A stop with a hand-over pending is resolved by waiting `END_GRACE`, and on expiry it is the end of the playlist (`Player.pm`, `_onStatus` / `_endOfStream`) | **WRONG** 2026-09-10, observed live, fixed in 0.2.81 | Simon's challenge, and he was right: *"we should not be sending end of playlist unless last track is reached"*. The timer is armed ONLY when `hqNext` is set, and `hqNext` exists only because LMS resolved a NEXT TRACK — so on that path the playlist provably has more to come and end-of-playlist is the one answer that CANNOT be true. **Seen in the wild the same evening**: 20:47:59, track 5 of an 11-track playlist with track 6 already queued, LMS told the playlist had finished. Four grace arms were observed that evening; three were cancelled by a normal advance and the ONE that expired was wrong. **The genuine end never uses the timer** — at the last track LMS arms no hand-over, `hqNext` stays undef and the stop is reported immediately (confirmed twice). The debounce itself is NOT the mistake and stays: measured raw, a boundary push and an end-of-playlist push are byte-identical (`state=0 track=0 tracks_total=0`, everything zeroed), so "did playback resume" is a fair question to ask with a short wait. Only the CONCLUSION changed. |
+| `tracks_total`, or `track_serial`, can tell a track boundary from the end of the playlist | **WRONG** 2026-09-10 — proposed here, disproven here, do not re-propose | Both were measured off port 4321 and both fail. **`tracks_total` is NOT the playlist length**: it is HQPlayer's OWN accumulated list (played + playing + the one pre-queued), because `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load. Measured simultaneously: LMS `playlist_tracks`=**11**, HQPlayer `tracks_total`=**3**. Since LMS hands over exactly one track ahead, `track < tracks_total` means only "a hand-over is pending", which `hqNext` already says. **`track_serial` is not an advance signal either**: it stepped 5→6 at the END of a one-track list where no next track existed. It counts PLAYLIST-CURSOR ADVANCES, including the step past the final item. Three boundary observations agreed with the advance hypothesis and the first end-of-list observation killed it — every sample had been the same event type. What the serial DOES say is whether the track ran out or was abandoned, which is what 0.2.81 uses it for. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -3932,6 +3934,103 @@ passes trivially: an end-of-stream test passes against a build that loads the
 track *and* wrongly tells LMS the playlist ended, and an artwork veto passes
 against a build that has simply switched artwork reuse off. The tests assert
 what must **not** happen alongside what must.
+
+## 0.2.81 (2026-09-10): a stop is not the end of the playlist, and HQPlayer says which is which
+
+0.2.80 fixed a REFUSED pre-queue being dropped at the end of a track. Simon read
+that fix and asked the harder question underneath it: *"we should not be sending
+end of playlist unless last track is reached, basing it on a duration seems
+wrong."* He was right, and the answer came off the wire rather than out of the
+code.
+
+### What HQPlayer actually sends, measured rather than assumed
+
+Captured raw off port 4321 across every transition type, ~1000 pushes. The full
+`<Status/>` attribute set is confirmed against Signalyst's own parser
+(`hqp-control-601-src/ControlInterface.cpp`, in this repo): `state`, `track`,
+`track_id`, `min`, `sec`, `volume`, `clips`, `tracks_total`, `track_serial`,
+`transport_serial`, `queued`, `position`, `length`, `begin/remain/total_min+sec`,
+`output_delay`, `apod`. The bridge had been parsing five of those.
+
+**The original comment was right about the hard part.** A boundary push and an
+end-of-playlist push really are indistinguishable - both send `state="0"
+track="0" tracks_total="0"` with position, length and the metadata child all
+gone. Nothing in that message separates them. The debounce is therefore a fair
+way to ask "did playback resume", and it stays.
+
+**But two fields that looked like the answer are not.** `tracks_total` is
+HQPlayer's own accumulated list, not the playlist: it read **3** while LMS's
+`playlist_tracks` read **11**. And `track_serial` is not an advance signal - it
+stepped at the end of a ONE-track list where nothing followed. Both are recorded
+as declined in the Review Ledger so they are not proposed again.
+
+**What `track_serial` really counts is playlist-cursor advances**, and that IS
+the useful question:
+
+| event | track_serial |
+|---|---|
+| track started | 4 → 5 |
+| gapless boundary | 2 → 3 |
+| end of the playlist | 3 → 4 (past the last item) |
+| pause, then resume | 5 → 5 |
+| stopped 12s into a track | 5 → 5 |
+| stopped 35s into a track | 1 → 1 |
+
+So at a stopped push: **cursor unchanged means the track was ABANDONED, cursor
+moved means it RAN OUT.** That is what HQPlayer knows. Whether a track that ran
+out was a boundary or the end of the list is **LMS's** to answer, and it already
+has: a pending `hqNext` exists only because LMS resolved a next track.
+
+### The three outcomes, each answered by whoever actually knows
+
+* **Cursor unchanged** - a stop nothing on our side asked for, part way through a
+  track. Now followed into LMS as a STOP, the way the paused branch already
+  follows an outside pause, with the wanted state set first so the controller
+  calling back into `stop()` cannot bounce. The playlist is left intact. This
+  case previously had NO handling at all.
+* **Cursor moved, hand-over pending** - a boundary. Keeps the bounded grace,
+  because "did it resume" is exactly what the grace is good at. On expiry it now
+  LOADS the held track instead of reporting the end of the playlist. 0.2.80 did
+  this only for a refused pre-queue; an accepted one that HQPlayer never entered
+  fell through to the end-of-playlist report.
+* **Cursor moved, nothing pending** - the genuine end. Reported immediately, no
+  timer, exactly as before. This path was always correct and is untouched.
+
+**Nothing already heard is ever restarted.** The held item has never played -
+that distinction is the entire licence for loading it, and it is why a stalled
+track is followed as a stop rather than reloaded.
+
+### The bug, seen in the wild before it was fixed
+
+20:47:59, track 5 of an 11-track playlist, track 6 already queued and
+acknowledged: `end of playlist [playing=PLAYING streaming=STREAMING]`. The cause
+was a wireless drop, so the right report was a stop; end of playlist was never
+available as a correct answer. Four grace arms were observed that evening - three
+cancelled by a normal advance, and the single one that expired was wrong.
+
+### A test that asserted the defect
+
+`t_player.pl` REQUIRED the old behaviour: "a stop that stays stopped IS reported,
+once the grace period expires", with the queued track dropped. That is the
+defect, written down as an expectation. Its real intent - a stop at HQPlayer's
+own front end must still be reported - is now served by the cursor test, and
+served faster and without the timer. It is replaced by two cases, each with a
+control assertion.
+
+### What is NOT established
+
+Every stop measured was one the BRIDGE caused, and those never reach this branch
+because `hqExpectStop` already covers them. The inference to an uncaused stop
+rests on the cursor being a property of HQPlayer rather than of who asked for the
+stop. The abandoned-track rule rests on two observations. And a stop initiated at
+HQPlayer's own front end remains unobserved - on this rig everything is driven
+from LMS, where "stop" means clearing the playlist.
+
+**Two daemon disappearances the same evening are NOT part of this.** They were
+nearly written up as an end-of-playlist crash; Simon's call, and he owns the
+hardware: *"the daemon disappearing has nothing to do with playing or stopping
+anything, its just not as robust on wifi."* `Connection refused` is NOT a
+reliable crash signature on a recovering wireless host.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

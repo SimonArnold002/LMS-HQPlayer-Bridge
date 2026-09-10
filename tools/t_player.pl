@@ -1215,9 +1215,13 @@ sub aged { $_[0]->hqStartedAt( Time::HiRes::time() - 30 ); return }
 # $track is HQPlayer's own playlist index (it reports track="n" tracks_total="n"
 # on every push), which is what a gapless hand-over is observed by.
 sub status {
-    my ( $player, $state, $uri, $pos, $track ) = @_;
+    my ( $player, $state, $uri, $pos, $track, $serial ) = @_;
     my %a = ( state => $state, position => $pos // 0 );
     $a{track} = $track if defined $track;
+    # HQPlayer's playlist-cursor counter. Omitted by every call written before
+    # it existed, which is deliberate: with no serial on either side the stop
+    # classification must abstain rather than guess.
+    $a{track_serial} = $serial if defined $serial;
     my $raw = qq{<Status state="$state" position="} . ( $pos // 0 ) . q{"}
             . ( defined $track ? qq{ track="$track" tracks_total="$track"} : '' )
             . q{>}
@@ -1996,9 +2000,19 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
 }
 
 {
-    # The other half: a stop that is REAL must still be reported, just
-    # END_GRACE later.  Without this the debounce would swallow a stop made at
-    # HQPlayer's own UI whenever a hand-over happened to be queued.
+    # THE OTHER HALF: A REAL STOP MUST STILL BE REPORTED - but "real" is now
+    # decided by HQPlayer's playlist cursor rather than by a timeout.
+    #
+    # This block used to assert the opposite of what it asserts now, and the
+    # behaviour it locked in was the defect: with an ACKNOWLEDGED hand-over
+    # pending, the expiry reported end-of-playlist and dropped the queued
+    # track. Seen live 2026-09-10 20:47:59 on track 5 of an 11-track playlist
+    # with track 6 already queued - LMS was told the playlist had finished.
+    #
+    # A stop made at HQPlayer's own front end is what the old test was really
+    # protecting, and it is now caught FASTER and without the timer: abandoning
+    # a track part way leaves `track_serial` alone (measured on two live stops,
+    # 12s and 35s in), so it is followed as a stop straight away.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f6', 'paddr', 1.0, undef, 12, undef);
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
@@ -2008,7 +2022,7 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     $gp->play({ controller => $gc });
     my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
     _answer(); _answer();
-    status( $gp, 2, $u1, 1, 1 );
+    status( $gp, 2, $u1, 1, 1, 7 );          # cursor at 7
 
     $gc->{song} = $two; $gc->{playing} = 1;
     $gp->play({ controller => $gc });
@@ -2017,15 +2031,59 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     Slim::Utils::Timers::_reset();
     $gc->{calls} = [];
     aged($gp);
-    status( $gp, 0, undef, 0, 0 );
-    Slim::Utils::Timers::_fireAll();          # nothing came back in time
 
-    is( join( ',', @{ $gc->{calls} } ), 'playerEndOfStream,playerReadyToStream,playerStopped',
-        'a stop that stays stopped IS reported, once the grace period expires' );
-    is( $gp->hqStarted, '0', 'and the track is no longer considered playing' );
-    is( $gp->hqNext, '(undef)',
-        'and anything still queued is dropped - it belongs to the run that ended' );
-    is( $gp->hqArmNext, '0', 'as does the arm flag' );
+    # The cursor has NOT moved: the track was abandoned, not finished.
+    status( $gp, 0, undef, 0, 0, 7 );
+
+    is( join( ',', @{ $gc->{calls} } ), 'stop',
+        'a stop that did not move the playlist cursor is followed as a STOP, not an end of playlist' );
+    is( Slim::Utils::Timers::_pending(), '0',
+        'and it needs no grace period at all - the cursor already answered it' );
+    is( $gp->hqStarted, '0', 'the track is no longer considered playing' );
+    is( $gp->hqWanted, 'stop', 'and the wanted state is set BEFORE the controller call, so stop() cannot bounce' );
+}
+
+{
+    # ...AND THE COMPLETED TRACK THAT HQPLAYER NEVER ENTERED.
+    #
+    # Cursor MOVED, so the track ran out rather than being abandoned - but the
+    # pre-queued item never started. That is not an end of playlist either:
+    # `hqNext` is set, which means LMS resolved a next track, so the playlist
+    # provably has more to come. Load the held item; it has never played, so
+    # nothing already heard is restarted.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f7', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();                                # the append IS acknowledged
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );         # cursor MOVED 7 -> 8
+    is( Slim::Utils::Timers::_pending(), '1',
+        'a completed track with a hand-over pending still gets the bounded grace' );
+
+    Slim::Utils::Timers::_fireAll();          # HQPlayer never entered it
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'on expiry the held track is LOADED' );
+
+    # THE CONTROL. This is exactly what the old build did instead, and it is
+    # the assertion that fails against it.
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'and LMS is NEVER told the playlist ended - it supplied that next track' );
 }
 
 {

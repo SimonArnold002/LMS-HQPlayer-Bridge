@@ -47,7 +47,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqWanted hqVolDb hqVolMin hqVolMax
     hqVolSent hqVolSentAt
     hqGen hqPlayAck hqURL hqPrevURL
-    hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt hqFailRun
+    hqNext hqArmNext hqTrackNo hqTrackSerial hqStaleRun hqStartedAt hqFailRun
     hqArt
 ) );
 
@@ -163,6 +163,7 @@ sub new {
         hqNext       => undef,
         hqArmNext    => 0,
         hqTrackNo    => undef,
+        hqTrackSerial=> undef,
         hqStaleRun   => 0,
         hqStartedAt  => 0,
         hqFailRun    => 0,
@@ -1080,6 +1081,11 @@ sub _newGeneration {
     # the index we last saw means nothing across a load - and leaving it set
     # would make the first status of the new track look like an advance.
     $self->hqTrackNo( undef );
+
+    # ...and so does the playlist-cursor counter it is read alongside. HQPlayer
+    # restarts `track_serial` at 0 for a new process, and a load clears the
+    # playlist it counts, so a value carried across is not comparable.
+    $self->hqTrackSerial( undef );
 
     # ...and a pending end-of-stream belongs to the run that is ending.
     $self->_cancelEndOfStream;
@@ -2642,6 +2648,35 @@ sub _onStatus {
     $self->hqTrackNo($track)
         if defined $track && $track =~ /^\d+$/ && $track > 0;
 
+    # THE PLAYLIST CURSOR, AND WHY IT IS READ HERE RATHER THAN WITH `track`.
+    #
+    # `track_serial` counts ADVANCES OF HQPLAYER'S PLAYLIST CURSOR, and it is
+    # the only field that survives the push which blanks everything else.
+    # Measured live 2026-09-10 across every transition type:
+    #
+    #   track started          4 -> 5    cursor moved
+    #   gapless boundary       2 -> 3    cursor moved
+    #   END of the playlist    3 -> 4    cursor moved (past the last item)
+    #   pause, then resume     5 -> 5    unchanged
+    #   stopped 12s into a track  5 -> 5 unchanged
+    #
+    # So it does NOT say "a next track exists" - it stepped at the end of a
+    # one-track list where nothing followed. What it says is whether the track
+    # RAN OUT or was ABANDONED, and that is the question the stop path below
+    # actually needs. Whether a completed track is a boundary or the end of the
+    # playlist is LMS's to answer, not HQPlayer's - see the HQP_STOPPED branch.
+    my $serial = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track_serial' );
+
+    $serial = undef unless defined $serial && $serial =~ /^\d+$/;
+
+    # Compared BEFORE it is stored: the blanked push already carries the NEW
+    # value, so storing first would erase the very difference being tested.
+    my $seenSerial = $self->hqTrackSerial;
+
+    my $cursorMoved = defined $serial && defined $seenSerial && $serial > $seenSerial;
+
+    $self->hqTrackSerial($serial) if defined $serial;
+
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );
         # Store the stream-relative value, so anything reading the plain
@@ -2799,6 +2834,36 @@ sub _onStatus {
             # A genuine stop is still reported, just END_GRACE later - which
             # matters for a stop made at HQPlayer's own UI while a hand-over
             # happens to be queued.
+            # THE TRACK WAS ABANDONED, NOT FINISHED - so nothing ended.
+            #
+            # A stop whose playlist cursor did NOT move means HQPlayer gave up
+            # part way through the track (measured: a stop 12s in, and another
+            # 35s in, both left `track_serial` alone; a pause and a resume do
+            # not move it either). There is no end of stream to report and no
+            # boundary to wait for, and reporting one makes LMS advance or stop
+            # over a track that was simply interrupted.
+            #
+            # The bridge's OWN stops never reach here - `hqExpectStop` covers
+            # those - so this is a stop nothing on our side asked for. Follow it
+            # the way the PAUSED branch follows an outside pause: say what we
+            # now want FIRST, so the controller calling back into stop() does
+            # not bounce, then let LMS stop. The playlist is left intact.
+            if ( defined $serial && defined $seenSerial && !$cursorMoved ) {
+
+                main::INFOLOG && $log->is_info && $log->info( $self->name
+                    . ': stopped outside LMS part way through the track - following'
+                        . _ctlState($controller) );
+
+                $self->hqWanted('stop');
+                $self->hqStarted( 0 );
+                $self->hqNext( undef );
+                $self->hqArmNext( 0 );
+
+                $controller->stop;
+
+                return;
+            }
+
             if ( $next && $next->{mode} eq 'queue' ) {
 
                 main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
@@ -2864,13 +2929,30 @@ sub _endOfStream {
     # _queueTrack answers a missing control link with _loadFailed, and a second
     # refusal is reported properly there, which is the whole point of demoting
     # to a load rather than failing at append time.
+    # A PENDING HAND-OVER IS PROOF THE PLAYLIST HAS NOT ENDED.
+    #
+    # `hqNext` exists only because LMS resolved a NEXT TRACK and handed it over,
+    # so on this path "end of playlist" is not merely unlikely, it is the one
+    # answer that cannot be true. The genuine end never arrives here: at the
+    # last track LMS arms no hand-over, `hqNext` stays undef, and the stop is
+    # reported immediately with no timer at all (confirmed live twice).
+    #
+    # This branch used to fire only for a REFUSED pre-queue (mode 'load'). An
+    # ACCEPTED one that HQPlayer simply never entered (mode 'queue') fell
+    # through and reported the end of the playlist instead. Observed live
+    # 2026-09-10 at 20:47:59, on track 5 of an 11-track playlist with track 6
+    # already queued: LMS was told the playlist had finished.
+    #
+    # Either way the held track has NEVER PLAYED, so loading it restarts
+    # nothing the listener has already heard. That distinction is the whole
+    # licence for this branch.
     my $held = $self->hqNext;
 
-    if ( $held && $held->{mode} eq 'load' ) {
+    if ( $held && ( $held->{mode} eq 'load' || $held->{mode} eq 'queue' ) ) {
         $self->hqNext( undef );
 
         main::INFOLOG && $log->is_info && $log->info( $self->name
-            . ': end of track - loading the hand-over HQPlayer refused'
+            . ': end of track, and HQPlayer did not enter the hand-over - loading it'
                 . _ctlState($controller) );
 
         # No seek: a hand-over is never seeked (see _canHandOver), so the held
