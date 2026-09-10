@@ -4003,10 +4003,12 @@ track is followed as a stop rather than reloaded.
 ### The bug, seen in the wild before it was fixed
 
 20:47:59, track 5 of an 11-track playlist, track 6 already queued and
-acknowledged: `end of playlist [playing=PLAYING streaming=STREAMING]`. The cause
-was a wireless drop, so the right report was a stop; end of playlist was never
-available as a correct answer. Four grace arms were observed that evening - three
-cancelled by a normal advance, and the single one that expired was wrong.
+acknowledged: `end of playlist [playing=PLAYING streaming=STREAMING]`. HQPlayer
+simply stopped sending status mid-track; whatever ended it, the playlist had ten
+more tracks and one of them was already queued, so the right report was a stop
+and end of playlist was never available as a correct answer. Four grace arms were
+observed that evening - three cancelled by a normal advance, and the single one
+that expired was wrong.
 
 ### A test that asserted the defect
 
@@ -4025,12 +4027,6 @@ rests on the cursor being a property of HQPlayer rather than of who asked for th
 stop. The abandoned-track rule rests on two observations. And a stop initiated at
 HQPlayer's own front end remains unobserved - on this rig everything is driven
 from LMS, where "stop" means clearing the playlist.
-
-**Two daemon disappearances the same evening are NOT part of this.** They were
-nearly written up as an end-of-playlist crash; Simon's call, and he owns the
-hardware: *"the daemon disappearing has nothing to do with playing or stopping
-anything, its just not as robust on wifi."* `Connection refused` is NOT a
-reliable crash signature on a recovering wireless host.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
