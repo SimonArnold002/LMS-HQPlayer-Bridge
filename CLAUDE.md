@@ -7,6 +7,71 @@ a finding listed here has been considered and settled, and raising it again
 costs a review round. Record every declined verdict in the same session it is
 declined.
 
+### DECLINED / SETTLED INDEX — GREP THIS FIRST
+
+**One grep before reporting any finding.** Find the symbol or subject in this table, then grep
+the phrase in the last column to jump to the full row below. A hit means it is already decided:
+read the row and either drop the finding, or answer its stated reason with new evidence. Do not
+re-report it as new. Phrases are used instead of line numbers because line numbers rot.
+
+The fleet-wide non-findings (uncommitted tree, unpushed commits, stale zip or `repo.xml <sha>`,
+CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Gate 1 of
+`~/Documents/GitHub/CLAUDE.md`, which auto-loads. Run those gates first.
+
+| symbol / subject | verdict | find it with |
+|---|---|---|
+| `volume`, `_onStatus`, echo guard, `_lmsToDb` round trip | SUPERSEDED — now compares in dB via `_volTol` | `_lmsToDb(_dbToLms($db)) == $db` |
+| `_followVolume`, endpoint re-register jumping the level | REVERSED — we follow it anyway | `An endpoint re-registering can jump the output` |
+| volume curve, taper, knee, sqrt | DECLINED — linear in dB, deliberately | `The volume curve should be tapered` |
+| `<Volume>` returning `result="Error"` | DECLINED | `` `<Volume>` answers `result="Error"` `` |
+| `<VolumeRange/>` `enabled`, fixed-volume detection | WRONG, MEASURED — there is no fixed-volume state | `` `enabled` on `<VolumeRange/>` is the fixed-volume flag `` |
+| `digitalVolumeControl`, `_setFixed`, `_watchForFixed` | REVERSED, Simon's call — the plugin never writes it | `should detect a non-attenuating HQPlayer` |
+| `_replayGain` scaling, convolution gain, peak cap, unity | REVERSED, Simon's call — the figure goes out VERBATIM | `The bridge should scale LMS's ReplayGain figure at all` |
+| `_replayGain` headroom trim against `_volMax` | WRONG — reversed in 0.2.44 | `A boost must be trimmed against the room` |
+| `_replayGain` adding headroom back to every figure | WRONG for the NO-FIGURE case — fixed 0.2.47 | `The headroom should be added back to every figure` |
+| `_convGainFromFile`, `Volume scaler` vs convolution gain | WRONG — fixed 0.2.48 | `` `Volume scaler` is the headroom `` |
+| `album_gain` on local tiers, double-applied tags | WRONG — it OVERRIDES the file's tags; fixed 0.2.44 | `Local tiers must not send `album_gain`` |
+| `album_gain` on `PlaylistAdd`, streaming ReplayGain route | WRONG — the control-API route exists | `hqplayerd ignores a gain figure on `PlaylistAdd`` |
+| tier 3, chunked transcode, "verified working" by API numbers | WRONG — judge playback by hqplayerd's log, never the control API | `Tier 3 (transcoded local files) is verified working` |
+| tier 3 moved onto the tier 4 endpoint | WRONG | `Tier 3 must go on the tier 4 player-stream endpoint` |
+| query strings in a URL, path-only rule | WRONG — DISPROVEN, `?` URLs are fetched | `HQPlayer cannot fetch a URL containing a `?`` |
+| `_downloadHandler`, raw function status code | WRONG — it must set its OWN code; fixed 0.2.45 | `A raw function's response needs no explicit status code` |
+| `<Status/>` subscribe attribute, `_startPolling`, `_statusWatchdog` | DECLINED | `A bare `<Status/>` is not a subscribe` |
+| stranded `mode=play`, frozen clock, Eversolo screen | ACCEPTED — FIXED in 0.2.50 | `stranded in `mode=play` with a frozen clock` |
+| hand-over gated on the uri | WRONG for tier 5 — fixed same day | `The hand-over is safe to gate on the uri` |
+| `track` needing only an INCREASE, `track="0"` | WRONG — fixed 0.2.37 | `` `track` only ever needs an INCREASE `` |
+| `tracks_total` / `track_serial` as a boundary signal | WRONG — proposed here, disproven here, DO NOT RE-PROPOSE | `` `tracks_total`, or `track_serial`, can tell a track boundary `` |
+| `_appendTrack` / `_endOfStream`, refused pre-queue | WRONG inside the grace window — fixed | `A refused pre-queue is safely demoted to a held load` |
+| `_onStatus` / `_endOfStream`, stop with a hand-over pending | WRONG — observed live, fixed 0.2.81 | `A stop with a hand-over pending is resolved by waiting `END_GRACE`` |
+| `_artMatch` / `_metadata`, album id comparison | WRONG across services — fixed same day | `Two albums are told apart by the album id` |
+| `playerStreamingFailed`, `PROBLEM_OPENING` on a failed load | ACCEPTED — BUILT in 0.2.60 | `A failed load should always be handed to LMS as `PROBLEM_OPENING`` |
+| HQPlayer's playlist showing the whole LMS queue | DECLINED, Simon's call: "stick with it as is" | `HQPlayer's playlist should show the whole LMS queue` |
+| `UPnP.pm`, `refreshVolumeRange`, keeping UPnP for the range | REMOVED in 0.2.54 | `UPnP must stay for the volume range` |
+| `_onStatus` `HQP_STOPPED` branch ORDER, held tier 4 track vs abandoned stop | WRONG — fixed 0.2.82 | `The abandoned-stop test can sit anywhere` |
+| `_endOfStream` `mode eq 'queue'`, "the held track has NEVER PLAYED", missed advance | INCOMPLETE — fixed 0.2.82 | `A pending hand-over proves the held track has NEVER PLAYED` |
+
+**Two standing rules that kill most repeat findings:**
+
+1. **Name the WRITER, not just the branch.** A hand-built input proves the branch, never the
+   population. If nothing upstream can reach a guarded branch, say so in the finding instead
+   of reporting it as live.
+2. **A comment is not the contract.** Where a comment claims an invariant the code does not
+   enforce, the comment is the defect. Fix the prose and pin the behaviour in a suite.
+
+### HOW TO LOG A VERDICT so the next round finds it
+
+Every new decision gets a row in the table below AND a row in the index above, in the SAME
+edit. The index row's first column names the **symbols** a future review would grep for; the
+"find it with" column carries a phrase that exists verbatim in the full row. State the reason
+as a fact that can be DISPROVEN ("HQPlayer answers X"), never as "unlikely" — a rarity claim
+invites the next round to find one counter-example and reopen the entry.
+
+Note this repo's ledger is mostly **WRONG** verdicts: beliefs the bridge was built on and
+later disproved live. Those rows are as load-bearing as the declined ones, because the wrong
+belief is the thing a fresh review will re-derive from the code and propose again.
+
+### THE FULL ROWS
+
 | Finding | Verdict | Why |
 |---|---|---|
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
@@ -36,6 +101,8 @@ declined.
 | Two albums are told apart by the album id, so `_artMatch` can compare the raw value (`Player.pm`, `_artMatch` / `_metadata`) | **WRONG across services** 2026-09-10, fixed same day | Within ONE service it is sound, and that is the case the rule was written for. Across two it is not: Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes, and the id test short-circuits **ahead of** the album name — so an id shared by chance overrode even a different title and one service's cover landed on another service's album. The name half collides far more easily still, and was the already-documented "residual risk": Deezer and Spotty publish no id at all, so any album title shared across two services matched on the name alone. Fixed by recording the **url scheme** on the art identity and treating a difference as a veto ahead of both tests — it costs nothing, it is already on the track, and it is stable across an album because an album is served by one service, so the Various Artists case the album key exists for is untouched. Vetoed only when BOTH sides name a service, the same shape as the id rule. The old fixtures had been writing `qobuz:111` into the id field, which is the namespace the production path never applied. Controlled in `t_player.pl` (the same service and album must still reuse, so the veto cannot pass by simply switching the feature off); **offline suite only, not yet run against a live daemon**. |
 | A stop with a hand-over pending is resolved by waiting `END_GRACE`, and on expiry it is the end of the playlist (`Player.pm`, `_onStatus` / `_endOfStream`) | **WRONG** 2026-09-10, observed live, fixed in 0.2.81 | Simon's challenge, and he was right: *"we should not be sending end of playlist unless last track is reached"*. The timer is armed ONLY when `hqNext` is set, and `hqNext` exists only because LMS resolved a NEXT TRACK — so on that path the playlist provably has more to come and end-of-playlist is the one answer that CANNOT be true. **Seen in the wild the same evening**: 20:47:59, track 5 of an 11-track playlist with track 6 already queued, LMS told the playlist had finished. Four grace arms were observed that evening; three were cancelled by a normal advance and the ONE that expired was wrong. **The genuine end never uses the timer** — at the last track LMS arms no hand-over, `hqNext` stays undef and the stop is reported immediately (confirmed twice). The debounce itself is NOT the mistake and stays: measured raw, a boundary push and an end-of-playlist push are byte-identical (`state=0 track=0 tracks_total=0`, everything zeroed), so "did playback resume" is a fair question to ask with a short wait. Only the CONCLUSION changed. |
 | `tracks_total`, or `track_serial`, can tell a track boundary from the end of the playlist | **WRONG** 2026-09-10 — proposed here, disproven here, do not re-propose | Both were measured off port 4321 and both fail. **`tracks_total` is NOT the playlist length**: it is HQPlayer's OWN accumulated list (played + playing + the one pre-queued), because `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load. Measured simultaneously: LMS `playlist_tracks`=**11**, HQPlayer `tracks_total`=**3**. Since LMS hands over exactly one track ahead, `track < tracks_total` means only "a hand-over is pending", which `hqNext` already says. **`track_serial` is not an advance signal either**: it stepped 5→6 at the END of a one-track list where no next track existed. It counts PLAYLIST-CURSOR ADVANCES, including the step past the final item. Three boundary observations agreed with the advance hypothesis and the first end-of-list observation killed it — every sample had been the same event type. What the serial DOES say is whether the track ran out or was abandoned, which is what 0.2.81 uses it for. |
+| The abandoned-stop test can sit anywhere in the `HQP_STOPPED` branch, because the held tier 4 track above it is only ever consumed at a REAL end of track (`Player.pm`, `_onStatus`) | **WRONG** 2026-09-10, fixed in 0.2.82 | Order matters, and it was the wrong way round. The held-track branch does not read the cursor at all, so with a tier 4 track already handed over it answered a stop made at HQPlayer's own UI by LOADING AND PLAYING THE NEXT TRACK. The window is narrow — it needs the CURRENT track on tier 1/3/5, the NEXT one on tier 4, and the stop to land after LMS handed it over — which is why Simon's live stop test (0.2.81, tier 1 throughout) followed the stop correctly and did not reach it. **Not observed live; traced in code and reproduced in `t_player.pl`.** Fixed by testing the cursor FIRST. Safe in that direction because a track that genuinely RAN OUT moves the cursor, so the abandoned test cannot fire at a real end of track and the tier 4 load still runs there untouched — pinned by a control assertion. |
+| A pending hand-over proves the held track has NEVER PLAYED, so loading it at expiry restarts nothing the listener has heard (`Player.pm`, `_endOfStream`) | **INCOMPLETE** 2026-09-10, fixed in 0.2.82 | True whenever `_handedOver` is right, and `_handedOver` can be wrong in the MISSING direction: it returns 0 before the `PlaylistAdd` ack, it treats a non-matching uri as a **veto** rather than a hint, and on tier 5 every reported uri strips to the same string so the index is all it has. A real advance that trips one of those leaves `hqNext` set on a track HQPlayer then plays to the end — and 0.2.81's new `mode eq 'queue'` branch would load it again, replaying a song just heard. **Not observed live; the missing-advance routes are the sub's own stated limits.** Fixed by stamping the cursor onto the held item at append time and reloading only when it has since moved AT MOST ONCE. **This is not row 38 re-proposed** — see §0.2.82. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -4027,6 +4094,120 @@ rests on the cursor being a property of HQPlayer rather than of who asked for th
 stop. The abandoned-track rule rests on two observations. And a stop initiated at
 HQPlayer's own front end remains unobserved - on this rig everything is driven
 from LMS, where "stop" means clearing the playlist.
+
+## 0.2.82 (2026-09-10): the two ways 0.2.81's own answers could still be asked in the wrong order, or of the wrong track
+
+0.2.81 introduced the playlist cursor as the discriminator for a stop, and a
+branch that reloads a hand-over HQPlayer never entered. Both were right. Both
+were reachable in a state their author had not considered.
+
+Neither was observed live. Both were traced in code, reproduced offline, and
+pinned by tests that FAIL against 0.2.81 and pass against this build. Simon's
+own live stop test the same evening — stop and pause at HQPlayer's front end,
+then a restart from LMS — behaved correctly throughout, and the first finding
+below explains why it could not have reached the defect.
+
+### The cursor test has to run BEFORE the held-track branch
+
+`_onStatus`'s `HQP_STOPPED` arm had these in order:
+
+1. start-up noise (`age < START_GRACE`) — unchanged, still first
+2. **a held tier 4 track: load it, this is the end of the track**
+3. **the cursor did not move: the track was abandoned, follow the stop**
+4. a hand-over is pending: wait `END_GRACE` and see
+
+Step 2 does not read the cursor. So a stop made at HQPlayer's own UI, part way
+through a track, with a tier 4 track already held, was answered by starting the
+next track. The listener presses stop and the music carries on with the next
+song.
+
+**Why it never showed up in testing.** The hold is written in exactly one place,
+`_handOver`, and only when the NEXT track resolves to tier 4 while the current
+one is on tier 1, 3 or 5. Tier 4 is now only a genuinely REMOTE track — a local
+file of any format is tier 3 — so it needs a streaming track that could not be
+direct-streamed, queued behind a local one, and the stop must land after LMS
+handed it over, which is the last stretch of the current track. Simon's live
+test was tier 1 throughout and had nothing held.
+
+**The fix is a reorder**, 3 above 2, with no change to either branch. It is safe
+in that direction and the reason is the measurement in §0.2.81: a track that
+RAN OUT steps the cursor. So at a real end of track `cursorMoved` is true, the
+abandoned test abstains, and the held load runs exactly as before. Only a stop
+with a still cursor overtakes it. An engine that reports no `track_serial`
+cannot enter the abandoned branch at all, so old daemons are untouched.
+
+### "The held track has never played" is `_handedOver`'s answer, and it can be wrong
+
+0.2.81 widened the expiry branch from a REFUSED pre-queue (`mode 'load'`) to an
+accepted one HQPlayer never entered (`mode 'queue'`), on the stated licence that
+"either way the held track has NEVER PLAYED". That licence is `_handedOver`
+returning 0, and `_handedOver` is deliberately conservative — it would rather
+miss an advance than invent one, because **a spurious advance is the worst
+failure in the file** and is not self-correcting. Its three ways of missing one
+are written into its own comments:
+
+* it returns 0 before `acked`, so an ack that never arrives blinds it entirely
+* a uri that does not match is a **VETO**, not a hint
+* on tier 5 every reported uri strips to the same `.../file`, so the index is
+  the only evidence, and it must strictly INCREASE from a non-zero baseline
+
+An advance that trips one of those leaves `hqNext` set on a track HQPlayer is
+playing. It plays to the end, reports the end of its list, the grace timer arms
+because a hand-over is still pending, and the expiry loads the track the
+listener has just finished hearing.
+
+### The discriminator, and why it is NOT row 38 coming back
+
+Row 38 disproved the cursor as a way to tell **a track boundary from the end of
+the playlist**. That question is not asked here. The question here is **how many
+times the cursor has moved since the append**, which is precisely what row 38's
+own measurement established that it counts — the step past the final item
+included:
+
+| what happened to the queued item | advances since the append |
+|---|---|
+| never entered; HQPlayer stepped past the end of its list | **1** |
+| entered, played through, then the end of the list | **2** |
+
+So `_appendTrack` now stamps `serial => $self->hqTrackSerial` onto the held
+item, and `_endOfStream` loads it only when the cursor has moved at most once
+since. Two or more means the listener has already heard it: report the end of
+the stream and let LMS move on.
+
+**Undef on either side loads, as before.** The failure actually seen in the wild
+is an album stopping mid-way (§0.2.81, 20:47:59, track 5 of 11), so an engine
+that does not report the field must keep 0.2.81's behaviour rather than gain a
+guess.
+
+### The tests, and the controls that stop them being vacuous
+
+Six assertions in `t_player.pl` FAIL against 0.2.81's `Player.pm` and pass
+against this one. Nine more pass against BOTH, deliberately — they are the
+controls, and without them a guard that refused every reload, or an ordering
+that followed every stop, would still look green:
+
+* one advance still LOADS the held track — the §0.2.81 live case, unchanged
+* no cursor reported anywhere still loads, exactly as before the guard
+* a held tier 4 track still loads at a REAL end of track (cursor moved)
+* and that end is not mistaken for a stop
+
+The missed advance is modelled the way it actually happens rather than by
+poking numbers: the cursor steps 7 → 8 while the pushed uri is the one HQPlayer
+just LEFT, so the veto in `_handedOver` answers "not yet" and the hand-over is
+still pending when the track ends at 9.
+
+`sh tools/run_checks.sh`: 759 assertions across five suites, 0 failed, sweep
+clean.
+
+### What is NOT established
+
+* **Neither defect was seen live.** Both are traced in code and reproduced in
+  the offline harness only. The harness is a stub tree, not a simulator.
+* **Neither fix has run against a live daemon.** In particular the tier 4 stop
+  needs a remote track queued behind a local one to exercise at all.
+* **How often a real advance is actually missed is unmeasured.** The three
+  routes are the sub's own documented limits, not observed failures. If it turns
+  out never to happen, the guard costs one comparison and changes nothing.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

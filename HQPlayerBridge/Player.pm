@@ -1292,9 +1292,13 @@ sub _appendTrack {
     # the running track supersede itself.
     my $gen = $self->hqGen || 0;
 
+    # THE CURSOR AS IT STANDS AT THE APPEND, so the end-of-track path can ask
+    # whether HQPlayer ever ENTERED this item.  See _endOfStream: one advance
+    # since this moment is the item being stepped over at the end of the list,
+    # two is the item having been entered and played through.
     $self->hqNext( {
         mode  => 'queue', url => $url, song => $song, acked => 0,
-        tier  => $tier, art => $item{art},
+        tier  => $tier, art => $item{art}, serial => $self->hqTrackSerial,
     } );
 
     main::INFOLOG && $log->is_info && $log->info(
@@ -2783,6 +2787,45 @@ sub _onStatus {
                 return;
             }
 
+            # THE TRACK WAS ABANDONED, NOT FINISHED - so nothing ended.
+            #
+            # A stop whose playlist cursor did NOT move means HQPlayer gave up
+            # part way through the track (measured: a stop 12s in, and another
+            # 35s in, both left `track_serial` alone; a pause and a resume do
+            # not move it either). There is no end of stream to report and no
+            # boundary to wait for, and reporting one makes LMS advance or stop
+            # over a track that was simply interrupted.
+            #
+            # The bridge's OWN stops never reach here - `hqExpectStop` covers
+            # those - so this is a stop nothing on our side asked for. Follow it
+            # the way the PAUSED branch follows an outside pause: say what we
+            # now want FIRST, so the controller calling back into stop() does
+            # not bounce, then let LMS stop. The playlist is left intact.
+            #
+            # AND IT IS TESTED FIRST, ahead of the held-track branch below.
+            # A stop made at HQPlayer's own UI can land with a tier 4 track
+            # already held, and that branch does not look at the cursor at all
+            # - evaluated first, it answers the listener's stop by playing the
+            # NEXT track. The order is safe the other way round because a track
+            # that genuinely RAN OUT moves the cursor, so this branch cannot
+            # fire at a real end of track and the held load still runs there
+            # exactly as it did before.
+            if ( defined $serial && defined $seenSerial && !$cursorMoved ) {
+
+                main::INFOLOG && $log->is_info && $log->info( $self->name
+                    . ': stopped outside LMS part way through the track - following'
+                        . _ctlState($controller) );
+
+                $self->hqWanted('stop');
+                $self->hqStarted( 0 );
+                $self->hqNext( undef );
+                $self->hqArmNext( 0 );
+
+                $controller->stop;
+
+                return;
+            }
+
             # A track LMS handed over early that could NOT ride HQPlayer's own
             # playlist - tier 4, see _handOver.  Load it now, the ordinary way.
             # There is nothing to report to LMS: it has been streaming this
@@ -2834,36 +2877,6 @@ sub _onStatus {
             # A genuine stop is still reported, just END_GRACE later - which
             # matters for a stop made at HQPlayer's own UI while a hand-over
             # happens to be queued.
-            # THE TRACK WAS ABANDONED, NOT FINISHED - so nothing ended.
-            #
-            # A stop whose playlist cursor did NOT move means HQPlayer gave up
-            # part way through the track (measured: a stop 12s in, and another
-            # 35s in, both left `track_serial` alone; a pause and a resume do
-            # not move it either). There is no end of stream to report and no
-            # boundary to wait for, and reporting one makes LMS advance or stop
-            # over a track that was simply interrupted.
-            #
-            # The bridge's OWN stops never reach here - `hqExpectStop` covers
-            # those - so this is a stop nothing on our side asked for. Follow it
-            # the way the PAUSED branch follows an outside pause: say what we
-            # now want FIRST, so the controller calling back into stop() does
-            # not bounce, then let LMS stop. The playlist is left intact.
-            if ( defined $serial && defined $seenSerial && !$cursorMoved ) {
-
-                main::INFOLOG && $log->is_info && $log->info( $self->name
-                    . ': stopped outside LMS part way through the track - following'
-                        . _ctlState($controller) );
-
-                $self->hqWanted('stop');
-                $self->hqStarted( 0 );
-                $self->hqNext( undef );
-                $self->hqArmNext( 0 );
-
-                $controller->stop;
-
-                return;
-            }
-
             if ( $next && $next->{mode} eq 'queue' ) {
 
                 main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
@@ -2948,7 +2961,42 @@ sub _endOfStream {
     # licence for this branch.
     my $held = $self->hqNext;
 
-    if ( $held && ( $held->{mode} eq 'load' || $held->{mode} eq 'queue' ) ) {
+    # ...UNLESS HQPLAYER ENTERED IT AND WE FAILED TO NOTICE.
+    #
+    # "Never played" is _handedOver's answer, and _handedOver can be wrong in
+    # the missing direction: it needs the PlaylistAdd ack before it looks at
+    # anything, it treats a uri that does not match as a VETO, and on tier 5
+    # every reported uri strips to the same string so the index is all it has.
+    # A real advance that fails one of those leaves hqNext set on a track
+    # HQPlayer has since played to the end, and loading it here plays it TWICE.
+    #
+    # The playlist CURSOR settles it, and this is NOT the claim the ledger
+    # disproved (row 38): the cursor is not being asked whether a stop is a
+    # boundary or the end of the list.  It is being asked how many times it has
+    # moved since the append, which is exactly what the measurement says it
+    # counts - the step past the final item included.
+    #
+    #   queued, never entered      append -> end of list           1 advance
+    #   queued, entered, played    append -> into it -> end        2 advances
+    #
+    # So two or more means the listener has already heard it: say the stream
+    # ended and let LMS move on.  Either side undef - an engine that does not
+    # report the field - loads as before, because the failure observed live is
+    # an album stopping mid-way and that is the direction to fail in.
+    my $played = 0;
+
+    if ( $held && $held->{mode} eq 'queue' ) {
+        my $at  = $held->{serial};
+        my $now = $self->hqTrackSerial;
+
+        $played = 1 if defined $at && defined $now && $now - $at >= 2;
+
+        main::INFOLOG && $log->is_info && $log->info( $self->name
+            . ': the hand-over was entered after all (cursor '
+            . $at . ' -> ' . $now . ') - not reloading it' ) if $played;
+    }
+
+    if ( $held && !$played && ( $held->{mode} eq 'load' || $held->{mode} eq 'queue' ) ) {
         $self->hqNext( undef );
 
         main::INFOLOG && $log->is_info && $log->info( $self->name

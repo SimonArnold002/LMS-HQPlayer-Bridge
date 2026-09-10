@@ -2087,6 +2087,201 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
 }
 
 {
+    # ...AND THE ONE HQPLAYER DID ENTER, WHICH WE FAILED TO NOTICE.
+    #
+    # `_handedOver` can be wrong in the missing direction: it needs the append
+    # ack before it looks at anything, it treats a uri that does not match as a
+    # VETO, and on tier 5 every reported uri strips to the same string. A real
+    # advance that trips one of those leaves `hqNext` set on a track HQPlayer
+    # goes on to play to the END - and the branch above would then load a song
+    # the listener has just heard.
+    #
+    # The cursor separates them: never entered is ONE advance (the step past
+    # the last item), entered and played is TWO.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f8', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );            # cursor at 7 when the append lands
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();                                 # the append IS acknowledged
+
+    # THE MISSED ADVANCE.  HQPlayer really does move into the queued item -
+    # the cursor steps 7 -> 8 - but the uri it reports is the one it just left,
+    # so the veto in _handedOver answers "not yet" and the hand-over stays
+    # pending.  This is the state the guard has to survive.
+    status( $gp, 2, $u1, 3, 2, 8 );
+
+    is( ref $gp->hqNext ? $gp->hqNext->{mode} : '(undef)', 'queue',
+        'an advance _handedOver cannot see leaves the hand-over pending' );
+    is( $gp->hqNext && $gp->hqNext->{serial}, '7',
+        'and the cursor as it stood at the append is still on it' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 9 );          # that track ends: 8 -> 9
+    Slim::Utils::Timers::_fireAll();
+
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'the held track is NOT re-loaded - two advances mean it has already played' );
+    ok( scalar( grep { $_ eq 'playerEndOfStream' } @{ $gc->{calls} } ),
+        'the end of the stream is reported instead' );
+}
+
+{
+    # THE CONTROL FOR THE CURSOR TEST, and the reason it is not vacuous: the
+    # SAME shape with ONE advance still loads the held track. Without this the
+    # guard could refuse every reload and the block above would still pass.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f9', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );          # ONE advance: never entered
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'one advance still loads the held track - it never played' );
+    ok( scalar( !grep { $_ eq 'playerEndOfStream' } @{ $gc->{calls} } ),
+        'and the playlist is not declared finished over it' );
+}
+
+{
+    # AN ENGINE THAT REPORTS NO CURSOR AT ALL must behave exactly as it did
+    # before the guard existed.  The failure observed live is an album stopping
+    # mid-way, so an unanswerable question loads rather than reports the end.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fa', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );               # no track_serial anywhere
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();
+
+    is( $gp->hqNext && $gp->hqNext->{serial}, '(undef)',
+        'nothing to stamp, so the held item carries no cursor' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0 );
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track is loaded, exactly as before the guard' );
+}
+
+{
+    # A STOP AT HQPLAYER'S OWN UI, WITH A TIER 4 TRACK ALREADY HELD.
+    #
+    # The held-track branch does not look at the cursor at all, so while it was
+    # tested FIRST it answered the listener's stop by playing the NEXT track.
+    # The abandoned-stop test has to come before it.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fb', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    my $remote = FakeSong->new( FakeTrack->new(
+        { title=>'Streamed', id=>-94543041325440, ct=>'flc', secs=>200,
+          url=>'qobuz://445307221.flac' } ) );
+
+    $gc->{song} = $remote; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'the tier 4 next track is held' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 7 );          # cursor STILL 7 - abandoned
+
+    is( join( ',', @{ $gc->{calls} } ), 'stop',
+        'a stop part way through a track is followed even with a track held' );
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'and the held track is NOT played over the top of it' );
+    is( $gp->hqNext, '(undef)', 'the hold is dropped with the stop' );
+    is( $gp->hqWanted, 'stop', 'and the wanted state is set before the controller call' );
+}
+
+{
+    # THE CONTROL FOR THE REORDER: the same held track, at a REAL end of track,
+    # still loads.  A completed track moves the cursor, which is why testing
+    # the stop first is safe.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fc', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    my $remote = FakeSong->new( FakeTrack->new(
+        { title=>'Streamed', id=>-94543041325440, ct=>'flc', secs=>200,
+          url=>'qobuz://445307221.flac' } ) );
+
+    $gc->{song} = $remote; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );          # cursor MOVED - the track ran out
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'a held tier 4 track still loads at a real end of track' );
+    ok( scalar( !grep { $_ eq 'stop' } @{ $gc->{calls} } ),
+        'and that is not mistaken for a stop' );
+}
+
+{
     # With nothing queued there is nothing for HQPlayer to move into, so a stop
     # can only be real - report it at once, exactly as before gapless.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f7', 'paddr', 1.0, undef, 12, undef);
