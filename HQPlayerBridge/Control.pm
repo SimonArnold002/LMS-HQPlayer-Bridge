@@ -71,7 +71,7 @@ use constant SLOW_COMMAND    => 1;
 # "Unknown command" - an earlier guess from the binary's strings was wrong.
 #
 # THE COMMAND SET IS NO LONGER GUESSWORK.  Signalyst ship the source of their
-# own `hqp-control` client (hqp-control-601-src.zip in the repo root), and
+# own `hqp-control` client (hqp-control-601-src/ in the repo root), and
 # ControlInterface.cpp writes every command this API has.  The full list, from
 # its writeStartElement/writeEmptyElement calls:
 #
@@ -556,23 +556,6 @@ sub _extractMessage {
     my $end = $close + length("</$tag>");
 
     return substr( $$bufref, 0, $end, '' );
-}
-
-# A response is one top-level element.  Complete when the root tag has either
-# self-closed or been matched by its closing tag.
-sub _completeResponse {
-    my $buf = shift;
-
-    my $body = $buf;
-    $body =~ s/^\s*<\?xml.*?\?>\s*//s;
-
-    return undef unless $body =~ /^<([A-Za-z_][\w:.-]*)/;
-    my $tag = $1;
-
-    return $buf if $body =~ m{^<\Q$tag\E\b[^>]*/>\s*$}s;
-    return $buf if $body =~ m{</\Q$tag\E>\s*$}s;
-
-    return undef;
 }
 
 # ---------------------------------------------------------------------------

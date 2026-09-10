@@ -49,6 +49,8 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `UPnP.pm`, `refreshVolumeRange`, keeping UPnP for the range | REMOVED in 0.2.54 | `UPnP must stay for the volume range` |
 | `_onStatus` `HQP_STOPPED` branch ORDER, held tier 4 track vs abandoned stop | WRONG — fixed 0.2.82, **CONFIRMED LIVE** | `The abandoned-stop test can sit anywhere` |
 | `_endOfStream` `mode eq 'queue'`, "the held track has NEVER PLAYED", missed advance | INCOMPLETE — fixed 0.2.82, CLOSED as unprovable in the wild; the guard SELF-REPORTS | `A pending hand-over proves the held track has NEVER PLAYED` |
+| `_teardown` leaving `_startDeadline` / `_tripStop` / `_endOfStream` / `_fadeDone` armed on a forgotten client | NOT A DEFECT — already guarded via `controller->stop` | `Timer balance` |
+| `_completeResponse` vs `_extractMessage`, two framers in `Control.pm` | REMOVED in 0.2.83 — it was dead, kept alive only by its own test | `was dead, and only its own test kept it alive` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -2289,9 +2291,9 @@ Corroborating, all checked:
   API nor development.
 
 **THE ONE MIT OBLIGATION IS ALREADY MET.** The notice must travel with any copy,
-and this repo does redistribute the vendor source — `COPYING` is present both in
-`hqp-control-601-src/` and inside `hqp-control-601-src.zip`. **The shipped
-plugin zip contains none of it** (verified: zero matches), so the released
+and this repo does redistribute the vendor source — `COPYING` is present in
+`hqp-control-601-src/`. **The shipped plugin zip contains none of it**
+(verified: zero matches), so the released
 artefact carries no vendor code at all. Our own `LICENSE` is MIT too, so there
 is no compatibility question either.
 
@@ -2305,9 +2307,9 @@ their owner, protocol implemented with reference to the MIT-licensed source.
 
 ## THE API IS DOCUMENTED — read the vendor's client, do not probe blind
 
-`hqp-control-601-src/` in the repo root — and the `hqp-control-601-src.zip` it
-came from — is **Signalyst's own source** for their `hqp-control` client. It is
-committed unpacked so it can be grepped directly, and it is MIT licensed
+`hqp-control-601-src/` in the repo root is **Signalyst's own source** for
+their `hqp-control` client. It is committed unpacked so it can be grepped
+directly, and it is MIT licensed
 (`COPYING`), so redistributing it here is fine. `ControlInterface.cpp` writes every command this API
 has and parses every reply, so it is the authority. Months of this file's
 protocol notes were reconstructed by probing a live daemon and guessing at
@@ -3098,7 +3100,7 @@ own client - see below).
 
 ## HQPlayer's control API: what is settable, and the one thing that is not
 
-Read out of `hqp-control-601-src.zip` (Signalyst's own client), 2026-09-06,
+Read out of `hqp-control-601-src/` (Signalyst's own client), 2026-09-06,
 against Simon's proposal to make output mode, filter, shaper and the NAA
 editable. **Not built - he parked it - but the reference is settled.**
 
@@ -4262,6 +4264,81 @@ done from the wire.
 
 (1) is the one worth doing if the self-reporting line ever shows up and the
 arithmetic needs confirming against real audio rather than the harness.
+
+## 0.2.83 (2026-09-11): a housekeeping pass - one dead sub, and a vendor copy kept twice
+
+No behaviour change. A sweep for stale code and dangling references across the
+plugin, the tools and the docs, run against the three gates. Two things were
+worth removing; everything else the sweep touched was already correct and is
+listed below so the next pass does not repeat it.
+
+### `_completeResponse` was dead, and only its own test kept it alive
+
+`Control.pm` carried two framers. `_extractMessage` is the live one, called from
+`_readable`, and it takes ONE message at a time off `rbuf` - which is the whole
+reason it exists, because a subscribed read delivers several concatenated.
+`_completeResponse` answered a different question ("is this buffer one complete
+element?"), came in with the initial commit, and **nothing in the plugin has
+called it since `_extractMessage` landed**. It survived because `t_control.pl`
+exercised it directly through a code ref, so the called-vs-defined sweep in
+`run_checks.sh` could not see it: that sweep greps for
+`Plugins::HQPlayerBridge::<Mod>::<fn>` spelled out in the `.pm` files, and a
+test-only caller is not in one.
+
+Removed, with its comment block. Of its seven assertions, five duplicated cases
+`_extractMessage` already covers (self-closing root, truncated mid-attribute,
+nested with and without a close tag, declaration only) and went with it. **The
+other two were kept and re-pointed at the live framer** - they check that a REAL
+captured `<Status/>` payload and a real `result="Error"` reply frame cleanly,
+which is worth having, and it is worth having against the code that runs. Each
+now frames a COPY of its string: `_extractMessage` consumes the buffer it is
+given, and both originals are read again afterwards by `parseAttrs`.
+
+The suite went 67 -> 62 assertions, which is exactly the five. The other four
+suites are untouched at 422, 64, 73 and 133.
+
+### The vendor source was committed twice
+
+`hqp-control-601-src/` and `hqp-control-601-src.zip` held identical file lists,
+and the two references pointed at different copies - `Control.pm` cited the zip,
+`README.md` the directory. Git already versions the directory, and it is
+committed unpacked precisely so it can be grepped. The zip is deleted and
+`Control.pm` now points at the directory.
+
+**The MIT obligation is unaffected**, and the note above that said so has been
+corrected rather than left to rot: `COPYING` travels in the directory, which is
+the copy that remains. Re-verified on this build that the shipped plugin zip
+contains no vendor code at all (zero matches for `hqp-control`, `.cpp`, `.hpp`
+or `COPYING`).
+
+### Checked and already correct - do not re-report these
+
+The sweep covered more than it changed. All of the following came back clean and
+are recorded so a later pass can skip them:
+
+* **String keys** - no orphans in `strings.txt`, and nothing referenced from code
+  that the file lacks. Both directions.
+* **Unused constants and unused imports** - none, in any of the six modules.
+* **Timer balance** - every `setTimer` has a matching `killTimers`. `_teardown`
+  looked exposed (it kills only the watchdog, leaving `_startDeadline`,
+  `_tripStop`, `_endOfStream` and `_fadeDone` armed on a client about to be
+  forgotten) but is **already guarded**: `controller->stop` reaches the player's
+  own `stop()`, which calls `_newGeneration` and clears `hqStarted`, so the
+  gen-guarded pair drop out at `_superseded` and `_endOfStream` returns at its
+  `hqStarted` test. Writers are real - an instance going quiet, and DHCP moving
+  one - so the guard is what makes this a non-finding, not the reachability.
+* **Volume arithmetic** - both divisions are guarded. `_dbToLms` returns 100 on a
+  zero span; `_volQuantum` returns 1/256 on a non-positive step and can never
+  reach zero.
+* **The live page escapes everything it interpolates** - track metadata through
+  `textContent`, every card value through the page's own `esc`. No injection
+  path from a service-supplied title.
+* **Comment references to `_getNextTrack`, `_readNextChunk` and `_stopClient`**
+  are LMS core symbols, correctly attributed. They are not stale plugin refs.
+* **`PlayNextURI` in `%KNOWN`** - looked like the allowlist permitting the one
+  command documented to kill the daemon. It is deliberate, and the entry above
+  says why: `tools/probe_gapless.py` re-tests it on a future engine behind a
+  default-off arm. Confirmed the probe still carries that arm.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
