@@ -107,6 +107,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `tracks_total`, or `track_serial`, can tell a track boundary from the end of the playlist | **WRONG** 2026-09-10 — proposed here, disproven here, do not re-propose | Both were measured off port 4321 and both fail. **`tracks_total` is NOT the playlist length**: it is HQPlayer's OWN accumulated list (played + playing + the one pre-queued), because `_appendTrack` only adds and `<PlaylistClear/>` runs only on a full load. Measured simultaneously: LMS `playlist_tracks`=**11**, HQPlayer `tracks_total`=**3**. Since LMS hands over exactly one track ahead, `track < tracks_total` means only "a hand-over is pending", which `hqNext` already says. **`track_serial` is not an advance signal either**: it stepped 5→6 at the END of a one-track list where no next track existed. It counts PLAYLIST-CURSOR ADVANCES, including the step past the final item. Three boundary observations agreed with the advance hypothesis and the first end-of-list observation killed it — every sample had been the same event type. What the serial DOES say is whether the track ran out or was abandoned, which is what 0.2.81 uses it for. |
 | The abandoned-stop test can sit anywhere in the `HQP_STOPPED` branch, because the held tier 4 track above it is only ever consumed at a REAL end of track (`Player.pm`, `_onStatus`) | **WRONG** 2026-09-10, fixed in 0.2.82 | Order matters, and it was the wrong way round. The held-track branch does not read the cursor at all, so with a tier 4 track already handed over it answered a stop made at HQPlayer's own UI by LOADING AND PLAYING THE NEXT TRACK. The window is narrow — it needs the CURRENT track on tier 1/3/5, the NEXT one on tier 4, and the stop to land after LMS handed it over — which is why Simon's live stop test (0.2.81, tier 1 throughout) followed the stop correctly and did not reach it. **CONFIRMED LIVE 2026-09-10 23:38**, on the third attempt — the first two never reached it because Qobuz is tier 5 and a local file is tier 3, so the playlist needed **Deezer** (the one service that declines the direct hook) behind a local track. Sequence: `23:36:56` tier 1 playing, `23:37:59` tier 4 resolved and `the next track is tier 4 - holding it`, `23:38:26` stop at HQPlayer's own UI 27s into that window -> `stopped outside LMS part way through the track - following`. **The load line is ABSENT**, which is the whole verdict: on 0.2.81 the next entry would have been `end of track - loading the tier 4 track LMS handed over early` and Deezer would have started playing. Nothing loaded afterwards either. Fixed by testing the cursor FIRST. Safe in that direction because a track that genuinely RAN OUT moves the cursor, so the abandoned test cannot fire at a real end of track and the tier 4 load still runs there untouched — pinned by a control assertion. |
 | A pending hand-over proves the held track has NEVER PLAYED, so loading it at expiry restarts nothing the listener has heard (`Player.pm`, `_endOfStream`) | **INCOMPLETE** 2026-09-10, fixed in 0.2.82 | True whenever `_handedOver` is right, and `_handedOver` can be wrong in the MISSING direction: it returns 0 before the `PlaylistAdd` ack, it treats a non-matching uri as a **veto** rather than a hint, and on tier 5 every reported uri strips to the same string so the index is all it has. A real advance that trips one of those leaves `hqNext` set on a track HQPlayer then plays to the end — and 0.2.81's new `mode eq 'queue'` branch would load it again, replaying a song just heard. **Not observed live, and CLOSED that way deliberately: it cannot be provoked from outside.** Every route needs `_handedOver` to fail spontaneously, which no playlist, service or transport action can force. **So the guard reports itself instead of being tested**: whenever it suppresses a reload it logs `the hand-over was entered after all (cursor N -> M) - not reloading it`. That line appearing in the wild IS the measurement. If it never appears, the case never happens and the guard costs one comparison. Fixed by stamping the cursor onto the held item at append time and reloading only when it has since moved AT MOST ONCE. **This is not row 38 re-proposed** — see §0.2.82. |
+| `_appendTrack` stamps the cursor as it stands at the append, so the held item always carries the value HQPlayer was at when it was queued (`Player.pm`, `_onStatus` / `_appendTrack`) | **WRONG** 2026-09-11, fixed in 0.2.85 | True for the FIRST append of a run and **stale for every one chained off a hand-over** — track 3 onward. `_onStatus` called `_handedOver` ~50 lines ABOVE `$self->hqTrackSerial($serial)`, and `_handedOver` ends in `_armNextTrack` -> `playerReadyToStream`, which real LMS answers by re-entering `play()` SYNCHRONOUSLY for a LOCAL track — chain walked in LMS `public/9.0`: ReadyToStream -> _NextIfMore -> _getNextTrack -> `getNextSong` (a file has no `scanUrl` and no `getNextTrack`, so it falls to "the simple case" and calls its success callback INLINE) -> NextTrackReady -> _StreamIfReady -> _Stream -> `play()`, every step a direct call with no timer. So `_appendTrack` ran INSIDE the push and stamped the PREVIOUS cursor, one low. `_endOfStream` then read the difference as 2 rather than 1, decided the held track had already played, and reported end of playlist — reintroducing the 20:47:59 mid-album stop for every boundary but the first. **Tier 5 is unaffected** (the service handler DOES implement `getNextTrack`, so the append lands after the store) and tier 4 never pre-queues; this is tier 1/3, local files. Bounded in one direction only: a stale stamp can suppress a reload, never cause a spurious one, so nothing is ever replayed. **Nothing released was affected — `main` ships 0.2.77**, and the cursor arrived in 0.2.81. Invisible to the suites because `LoadController` answers `playerReadyToStream` through AUTOLOAD and never re-enters `play()`, so only the first append was ever exercised. Fixed by moving the cursor read and store ABOVE the hand-over check, `$seenSerial`/`$cursorMoved` still captured before the store. See §0.2.85. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -4416,6 +4417,121 @@ time, rather than trusting that a passing test means anything:
 * the padding mode `cover_600x600_m.jpg` - caught by its own assertion
 
 The suite is 425, up 3.
+
+## 0.2.85 (2026-09-11): the cursor stamp was one low on every hand-over but the first
+
+0.2.82 stamps `serial => $self->hqTrackSerial` onto the held item in
+`_appendTrack` and has `_endOfStream` reload it only when the cursor has moved
+**at most once** since. The arithmetic is right. The value it was reading was
+not.
+
+### `_handedOver` runs ABOVE the store, and the append happens inside it
+
+`_onStatus` called `_handedOver` roughly fifty lines above
+`$self->hqTrackSerial($serial)`. `_handedOver` ends by calling `_armNextTrack`,
+which calls `playerReadyToStream` — and for a LOCAL track LMS answers that by
+re-entering `play()` **synchronously**, so `_appendTrack` runs inside the very
+push whose cursor has not been stored yet. The append therefore stamped the
+PREVIOUS cursor, one low.
+
+Only the FIRST append of a run was right, because that one is armed from the
+PLAYING branch, which sits BELOW the store. Every append chained off a
+hand-over — track 3 onward — was stale.
+
+### The carrier, named from LMS's own source rather than from our comment
+
+`_armNextTrack`'s comment already asserted the synchronous re-entry, but a
+comment is not the contract. The chain was walked in the real LMS tree
+(`public/9.0`), and every step is a direct call with no timer:
+
+```
+playerReadyToStream -> _eventAction('ReadyToStream')      StreamingController.pm
+  -> PLAYING row -> _NextIfMore -> _getNextTrack
+  -> $song->getNextSong(successCb)                        Song.pm
+     -> local file has no scanUrl and no getNextTrack,
+        so it falls to "the simple case": &$successCb()   <- called INLINE
+  -> _nextTrackReady -> _eventAction('NextTrackReady')
+  -> PLAYING/TRACKWAIT -> _StreamIfReady -> _Stream
+  -> $player->play(\%params)
+```
+
+**So the writer is LMS itself, on any local album.** It is not reachable by
+hand-built input only.
+
+**Tier 5 is NOT affected.** A streaming service's handler DOES implement
+`getNextTrack`, which returns and calls back later, so the append lands after
+`_onStatus` has returned and the store has already run. Tier 4 never pre-queues
+at all. The defect is tier 1 and tier 3, which is to say local files.
+
+### What it actually cost
+
+Nothing during playback. The stamp is read in exactly one place, the `played`
+test in `_endOfStream`, and that runs only when the END_GRACE timer fires. At an
+ordinary gapless boundary HQPlayer does emit a zeroed state-0 push and the timer
+IS armed, but the next PLAYING push cancels it about 2s later, inside the 3s
+window. Gapless never reads the stamp.
+
+It cost the 0.2.82 fix itself. When the timer does fire — the 20:47:59 case,
+queued-but-never-entered — the difference came out as 2 instead of 1, so the
+guard declared the held track already played and reported the end of the
+playlist. That is precisely the mid-album stop 0.2.82 exists to remove:
+
+| where the stop lands | 0.2.82 behaved as |
+|---|---|
+| end of track 1 | fixed — the held track loads |
+| end of track 2 onward | 0.2.81 — end of playlist reported |
+
+The stamp is low by exactly one, never more, so past the first boundary the
+guard suppressed the reload **every** time rather than occasionally.
+
+The failure direction is bounded: a stale stamp can only make the difference
+LARGER, so it can only ever suppress a reload. It can never cause a spurious
+one, and no track can be replayed by it.
+
+### Nothing released was ever affected — `main` ships 0.2.77
+
+The cursor arrived in 0.2.81 and the guard in 0.2.82, both unreleased. Judged
+against what `main` ships today this is a dev-branch defect caught before it
+reached anyone.
+
+### Why five suites and 759 assertions did not see it
+
+`t_player.pl`'s `LoadController` answers `playerReadyToStream` through AUTOLOAD:
+it records the call and returns. So every existing block calls `play()` by hand
+AFTER `_onStatus` has already returned, which is after the store. The chained
+shape was structurally unreachable, and the one shape the suite exercised was
+the one that happened to be correct.
+
+### The fix, and the control that stops it being the guard switched off
+
+The cursor read, the `$seenSerial` capture, the `$cursorMoved` comparison and
+the store all move together to ABOVE the `_handedOver` call. `$seenSerial` and
+`$cursorMoved` are still taken before the store, so the stop classification is
+untouched.
+
+`ChainController` re-enters `play()` the way LMS does. Three assertions fail
+against the pre-fix file and pass after; six more pass against BOTH and are the
+controls:
+
+* the chained append stamps 8, not 7 — **fails before**
+* one advance loads the held track — **fails before**
+* and does not report end of playlist — **fails before**
+* TWO advances still suppress the reload, so the guard is intact — control
+* the end of the stream is still reported there — control
+* a stop that left the cursor alone is still followed as a STOP — control
+* not as the end of the playlist, and nothing loads over it — control
+
+`sh tools/run_checks.sh`: 766 assertions across five suites, 0 failed, sweep
+clean.
+
+### One consequence for row 109's self-reporting claim
+
+Row 109 closed the guard as unprovable from outside and left it to report
+itself, treating `the hand-over was entered after all (cursor N -> M)` in a live
+log as the measurement. With the stale stamp that line would have fired on
+ORDINARY chained hand-overs, so it would have read as confirmation of a case
+that never happened. The line is only trustworthy as evidence from this fix
+forward.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

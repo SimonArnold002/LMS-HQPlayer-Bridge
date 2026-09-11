@@ -2651,29 +2651,6 @@ sub _onStatus {
     # to the NEW track.
     my $track = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track' );
 
-    $self->_handedOver( $track, $meta ) if $self->hqNext;
-
-    # ZERO IS NOT A PLAYLIST POSITION, AND MUST NEVER BECOME THE BASELINE.
-    # HQPlayer numbers its playlist from 1 and reports track="0" whenever it is
-    # not playing - including in the push that arrives between the <Play/> ack
-    # and its index catching up, where `state` already reads as playing.
-    # Storing that 0 makes the NEXT push (track="1") look like an increase, and
-    # the ambiguous-url path fires on exactly that. Live 2026-08-30:
-    #
-    #   12:47:07.7074  _onStatus     HQPlayer is playing        <- track="0"
-    #   12:47:07.7078  _armNextTrack asking LMS for the next track
-    #   12:47:08.0498  _handedOver   track=1 seen=0 -> ADVANCED <- WRONG
-    #   12:47:08.0502  _armNextTrack asking LMS for the next track
-    #
-    # LMS advanced into a track HQPlayer was not playing, armed again, and
-    # queued a THIRD track. It stayed exactly one track ahead for the rest of
-    # the album. The `>` test was already there to stop a STOP reading as an
-    # advance; it does not help when 0 is the baseline, because 0 -> 1 is an
-    # increase. Whether it happens is a race on how fast HQPlayer's index
-    # catches up, which is why identical code was clean on earlier loads.
-    $self->hqTrackNo($track)
-        if defined $track && $track =~ /^\d+$/ && $track > 0;
-
     # THE PLAYLIST CURSOR, AND WHY IT IS READ HERE RATHER THAN WITH `track`.
     #
     # `track_serial` counts ADVANCES OF HQPLAYER'S PLAYLIST CURSOR, and it is
@@ -2702,6 +2679,51 @@ sub _onStatus {
     my $cursorMoved = defined $serial && defined $seenSerial && $serial > $seenSerial;
 
     $self->hqTrackSerial($serial) if defined $serial;
+
+    # ...AND IT IS READ AND STORED BEFORE THE HAND-OVER CHECK BELOW.
+    #
+    # `_handedOver` ends by calling `_armNextTrack`, and for a LOCAL track LMS
+    # answers `playerReadyToStream` by re-entering `play()` SYNCHRONOUSLY - the
+    # whole chain, ReadyToStream -> _NextIfMore -> _getNextTrack -> getNextSong
+    # ("the simple case", which calls its success callback inline for a file)
+    # -> NextTrackReady -> _StreamIfReady -> _Stream -> play(), is direct calls
+    # with no timer anywhere. So `_appendTrack` runs INSIDE this sub, and the
+    # `serial` it stamps on the held item is whatever is stored at that moment.
+    #
+    # Stored after the check, every append chained off a hand-over was stamped
+    # with the PREVIOUS cursor - one low. The first append of a run was right
+    # (it is armed from the PLAYING branch, below the store) which is why the
+    # suites were green. From the second boundary on, _endOfStream then read
+    # the difference as 2 rather than 1, decided the held track had already
+    # played, and reported the end of the playlist instead of loading it -
+    # which is exactly the mid-album stop 0.2.82 was written to remove.
+    #
+    # $seenSerial and $cursorMoved are still taken BEFORE the store, so the
+    # stop classification below is unchanged. DO NOT MOVE THIS BACK DOWN.
+
+    $self->_handedOver( $track, $meta ) if $self->hqNext;
+
+    # ZERO IS NOT A PLAYLIST POSITION, AND MUST NEVER BECOME THE BASELINE.
+    # HQPlayer numbers its playlist from 1 and reports track="0" whenever it is
+    # not playing - including in the push that arrives between the <Play/> ack
+    # and its index catching up, where `state` already reads as playing.
+    # Storing that 0 makes the NEXT push (track="1") look like an increase, and
+    # the ambiguous-url path fires on exactly that. Live 2026-08-30:
+    #
+    #   12:47:07.7074  _onStatus     HQPlayer is playing        <- track="0"
+    #   12:47:07.7078  _armNextTrack asking LMS for the next track
+    #   12:47:08.0498  _handedOver   track=1 seen=0 -> ADVANCED <- WRONG
+    #   12:47:08.0502  _armNextTrack asking LMS for the next track
+    #
+    # LMS advanced into a track HQPlayer was not playing, armed again, and
+    # queued a THIRD track. It stayed exactly one track ahead for the rest of
+    # the album. The `>` test was already there to stop a STOP reading as an
+    # advance; it does not help when 0 is the baseline, because 0 -> 1 is an
+    # increase. Whether it happens is a race on how fast HQPlayer's index
+    # catches up, which is why identical code was clean on earlier loads.
+    $self->hqTrackNo($track)
+        if defined $track && $track =~ /^\d+$/ && $track > 0;
+
 
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );

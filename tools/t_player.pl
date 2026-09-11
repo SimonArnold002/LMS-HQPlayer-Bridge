@@ -2905,5 +2905,126 @@ print "-- the status watchdog outlives the track --\n";
        'and it still sends only when the stream has actually gone quiet');
 }
 
+
+print "-- a hand-over CHAINED off another one stamps the cursor AFTER the advance --\n";
+{
+    # THE COVERAGE GAP THIS CLOSES.  LoadController answers playerReadyToStream
+    # through AUTOLOAD - it records the call and returns - so every block above
+    # calls play() by hand AFTER _onStatus has already returned.  Real LMS does
+    # not: for a LOCAL track the chain ReadyToStream -> _NextIfMore ->
+    # _getNextTrack -> getNextSong ("the simple case", success callback called
+    # inline for a file) -> NextTrackReady -> _StreamIfReady -> _Stream ->
+    # play() is direct calls with no timer, so the append lands INSIDE the push
+    # being handled.  Only the FIRST append of a run is armed from the PLAYING
+    # branch; every later one is chained off _handedOver, and that is the one
+    # shape the suite could not reach.
+    package ChainController;
+    our @ISA = ('LoadController');
+    sub playerReadyToStream {
+        my $self = shift;
+        push @{ $self->{calls} }, 'playerReadyToStream';
+        my $next = shift @{ $self->{queue} || [] } or return;
+        $self->{song}    = $next;
+        $self->{playing} = 1;
+        $self->{player}->play({ controller => $self });
+        return;
+    }
+}
+
+my $three = FakeSong->new( FakeTrack->new(
+    { title=>'Three', id=>303, ct=>'flc', secs=>200, url=>'file:///three.flac' } ) );
+
+# Drive a run up to "track two playing, track three queued behind it", which is
+# the state every block below starts from.  Returns the player, its controller
+# and the uri HQPlayer is playing.
+sub _chained {
+    my $mac = shift;
+    my $p = Plugins::HQPlayerBridge::Player->new($mac,'paddr',1.0,undef,12,undef);
+    $p->hqControl( bless {}, 'FakeCtl' );
+    my $c = ChainController->new($one);
+    $c->{player} = $p;
+    $c->{queue}  = [ $two, $three ];
+    $p->controller($c);
+
+    @sent = (); @sentCb = ();
+    $p->play({ controller => $c });                       # track one, ordinary load
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+
+    status( $p, 2, $u1, 1, 1, 7 );                        # playing, cursor 7
+    _answer();                                            # the append for two is acked
+
+    my ($u2) = ( grep { /^<PlaylistAdd\b/ } @sent )[-1] =~ m{\buri="([^"]+)"};
+    status( $p, 2, $u2, 1, 2, 8 );                        # advance into two: 7 -> 8
+    _answer();                                            # the CHAINED append is acked
+
+    return ( $p, $c, $u2 );
+}
+
+{
+    my ( $cp, $cc, $cu2 ) = _chained('02:aa:bb:cc:dd:c1');
+
+    is( $cp->hqNext && $cp->hqNext->{mode}, 'queue',
+        'the chained hand-over queued the track after it' );
+    is( $cp->hqNext && $cp->hqNext->{serial}, '8',
+        'and stamped the cursor as it stands AFTER the advance, not before' );
+
+    # Two ends and HQPlayer steps off the end of its list without ever entering
+    # three: ONE advance, 8 -> 9.  Three has not been heard, so it must load.
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    status( $cp, 0, undef, 0, 0, 9 );
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track IS loaded - one advance means it was never entered' );
+    ok( !scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and the playlist is not declared finished mid-album' );
+}
+
+{
+    # CONTROL, and the reason the block above is not just the guard switched
+    # off: the SAME chained shape with TWO advances must still suppress the
+    # reload.  Passes before and after the reorder.
+    my ( $cp, $cc ) = _chained('02:aa:bb:cc:dd:c2');
+
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    # HQPlayer really did enter three (8 -> 9) and we missed it, then played it
+    # out and stepped off the end (9 -> 10).  Two advances since the stamp.
+    status( $cp, 0, undef, 0, 0, 10 );
+    Slim::Utils::Timers::_fireAll();
+
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'two advances still suppress the reload - the guard is intact' );
+    ok( scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and the end of the stream is reported instead' );
+}
+
+{
+    # CONTROL for the thing the reorder actually moved.  $seenSerial and
+    # $cursorMoved are still read BEFORE the store, so a stop that did not move
+    # the cursor is still an abandoned track and not an end of playlist - even
+    # with a chained hand-over pending.
+    my ( $cp, $cc ) = _chained('02:aa:bb:cc:dd:c3');
+
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    status( $cp, 0, undef, 0, 0, 8 );          # cursor STILL 8 - abandoned
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { $_ eq 'stop' } @{ $cc->{calls} } ),
+        'a stop that left the cursor alone is still followed as a STOP' );
+    ok( !scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and not as the end of the playlist' );
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'and nothing is loaded over the top of it' );
+}
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);
