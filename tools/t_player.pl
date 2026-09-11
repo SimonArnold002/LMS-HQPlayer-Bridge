@@ -115,8 +115,27 @@ ok(scalar($meta =~ /^<metadata\b/) && scalar($meta =~ m{/>$}), 'metadata is a co
 ok(scalar($meta =~ m{\bsong="Colony &amp; &quot;Collapse&quot;"}), 'song is XML-escaped');
 ok(scalar($meta =~ m{\bartist="Johanna &lt;Warren&gt;"}), 'artist is XML-escaped');
 ok(scalar($meta =~ m{\balbum="Gemini I"}), 'album present');
-ok(scalar($meta =~ m{\bcover="[^"]*/music/abc123/cover\.jpg"}),
+ok(scalar($meta =~ m{\bcover="[^"]*/music/abc123/cover_600x600_o\.jpg"}),
    'cover points at the LMS cover - this is what lights up the endpoint');
+
+# THE SIZE IS THE POINT, AND EACH OF THESE IS A WAY TO LOSE IT.
+#
+# A bare `cover.jpg` serves the STORED ORIGINAL - 3000x3000 / 8.33 MB at the
+# top of Simon's library, measured 2026-09-11 - and the endpoint's display has
+# to hold it.  The three ways to write this wrong all LOOK right:
+#
+#   cover.jpg          no cap at all
+#   cover_600.jpg      no `x<height>`, so LMS ignores it and serves the original
+#   cover_600x600_m    pads to a forced square with black bars, and measured
+#                      SIX TIMES larger than _o on a non-square cover
+#
+# So assert the whole spec, not just that a size is present somewhere.
+ok(scalar($meta !~ m{\bcover="[^"]*/cover\.jpg"}),
+   'the local cover is NOT the unbounded original');
+ok(scalar($meta =~ m{/cover_\d+x\d+_o\.jpg"}),
+   'it carries BOTH dimensions and the aspect-preserving mode, not a bare width');
+ok(scalar($meta !~ m{/cover_\d+x\d+_[mp]\.jpg"}),
+   'and not a padding mode, which squares the art with black bars');
 
 # THE regression guard for 2026-08-28.  HQPlayer base64-encodes the cover URL
 # into the playlist item's `picture` field ITSELF; handing it base64 gets that
@@ -225,6 +244,165 @@ print "-- a remote track gets artist and album from the handler --\n";
     ok(scalar($om =~ m{\bartist="Deafheaven"}),      'a hash-shaped artist is unwrapped');
     ok(scalar($om =~ m{\balbum="Infinite Granite"}), 'an object-shaped album is unwrapped');
     ok(scalar($om !~ m{=("|)[A-Za-z:]+=HASH}),        'no reference is ever written into the metadata');
+}
+
+print "-- artwork survives a transient handler miss within the same album --\n";
+{
+    package MissingArtHandler;
+    our $album  = 'WILDCHILD';
+    our $artist = 'Sun Kil Moon';
+    our $id;
+    sub getMetadataFor { return {
+        title => 'Second Track', album => $album, artist => $artist,
+        ( defined $id ? ( albumId => $id ) : () ),
+    } }
+}
+{
+    no warnings qw(redefine once);
+    local *Slim::Music::Info::isRemoteURL = sub { 1 };
+    local *Slim::Player::ProtocolHandlers::handlerForURL = sub { 'MissingArtHandler' };
+
+    my $known = 'http://resources.tidal.com/images/x/1280x1280.jpg';
+    $c->hqArt({ album => 'WILDCHILD', cover => $known });
+
+    my $rt = FakeTrack->new({ id=>-2, secs=>180, url=>'tidal://second.flc' });
+    my $same = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $same =~ /\bcover="\Q$known\E"/ ),
+        'a momentarily missing cover reuses the confirmed cover for the exact same album' );
+
+    # A COMPILATION IS THE CASE THE FEATURE IS FOR.  The track artist changes
+    # from one track to the next while the album does not, so keying the reuse
+    # on the artist as well would decline every hand-over inside a Various
+    # Artists album - the exact blank this is here to prevent.
+    $MissingArtHandler::artist = 'A Completely Different Singer';
+    my $compilation = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $compilation =~ /\bcover="\Q$known\E"/ ),
+        'a different track artist inside the same album still reuses the cover' );
+    $MissingArtHandler::artist = 'Sun Kil Moon';
+
+    $MissingArtHandler::album = 'A DIFFERENT ALBUM';
+    my $different = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $different !~ /\bcover=/ ),
+        'the old cover is never carried into a different album in a mixed playlist' );
+
+    $MissingArtHandler::album = '';
+    my $unknown = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $unknown !~ /\bcover=/ ),
+        'nor reused when the album identity is missing' );
+
+    # -- two different albums of the SAME NAME are told apart by the album id -
+    #
+    # Qobuz publishes `albumId` and Tidal `album_id` on getMetadataFor, so a
+    # shared title ('Live', 'Greatest Hits', anything self-titled) does not
+    # make one artist's cover land on another's.
+    $MissingArtHandler::album = 'Live';
+    $c->hqArt({ id => 'qobuz:111', album => 'Live', cover => $known });
+
+    $MissingArtHandler::id = 'qobuz:222';
+    my $collide = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $collide !~ /\bcover=/ ),
+        'a different album with the same title does not inherit the cover' );
+
+    $MissingArtHandler::id = 'qobuz:111';
+    my $sameId = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $sameId =~ /\bcover="\Q$known\E"/ ),
+        'and the same album id reuses it even though nothing else identifies it' );
+
+    # An id is never compared with a NAME: an anchor identified only by the id
+    # 'Live' is not the album called 'Live'.
+    $MissingArtHandler::id = undef;
+    $c->hqArt({ id => 'Live', cover => $known });
+    my $crossed = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $crossed !~ /\bcover=/ ),
+        'an album id is never matched against an album name' );
+
+    # THE ID WINS ONLY WHEN BOTH SIDES HAVE ONE.  A service that publishes no
+    # id must still fall back to the album name, or the feature would do
+    # nothing at all on Deezer and Spotty.
+    $c->hqArt({ id => 'qobuz:111', album => 'Live', cover => $known });
+    my $oneSided = $c->_metadata( FakeSong->new($rt) );
+    ok( scalar( $oneSided =~ /\bcover="\Q$known\E"/ ),
+        'an item with no id still matches the anchor on the album name' );
+
+    # -- AN ALBUM ID BELONGS TO ONE SERVICE'S IDENTIFIER SPACE --------------
+    #
+    # Qobuz's `albumId` and Tidal's `album_id` are unrelated numbering schemes,
+    # and the id test above short-circuits AHEAD of the album name - so an id
+    # shared by chance let one service's cover land on another service's album
+    # whatever the two titles said.  The url scheme separates the spaces.
+    $MissingArtHandler::album = 'Live';
+    $MissingArtHandler::id    = '111';
+
+    my %qi;
+    $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-3, secs=>180, url=>'qobuz://111.flac' }) ), \%qi );
+
+    # The fixtures below are only honest if the PRODUCTION path really records
+    # this: without it the veto would be keying on a field nothing ever sets,
+    # and every assertion after this one would pass by accident.
+    is( $qi{art} && $qi{art}{svc}, 'qobuz',
+        'the album identity records which service it came from' );
+
+    $c->_rememberArt({ svc => 'qobuz', id => '111', album => 'Live', cover => $known });
+
+    $MissingArtHandler::album = 'Kid A';
+    my $crossSvc = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-4, secs=>180, url=>'tidal://9.flac' }) ) );
+    ok( scalar( $crossSvc !~ /\bcover=/ ),
+        'a colliding album id from ANOTHER service does not inherit the cover' );
+
+    # The name half collides more easily still: Deezer and Spotty publish no id
+    # at all, so any title shared across two services matched on the name alone.
+    $MissingArtHandler::id = undef;
+    $c->_rememberArt({ svc => 'qobuz', album => 'Live', cover => $known });
+
+    $MissingArtHandler::album = 'Live';
+    my $crossName = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-5, secs=>180, url=>'deezer://7.flac' }) ) );
+    ok( scalar( $crossName !~ /\bcover=/ ),
+        'nor does an album TITLE shared across two services' );
+
+    # THE CONTROL FOR BOTH.  The veto must not simply switch the feature off:
+    # the same service and the same album still reuses, so the two assertions
+    # above are testing the service boundary and not a cold anchor.
+    my $sameSvc = $c->_metadata( FakeSong->new( FakeTrack->new({ id=>-6, secs=>180, url=>'qobuz://222.flac' }) ) );
+    ok( scalar( $sameSvc =~ /\bcover="\Q$known\E"/ ),
+        'while the same service and the same album still does' );
+
+    $MissingArtHandler::id = undef;
+
+    # -- THE ANCHOR IS NEVER OVERWRITTEN WITH AN EMPTY PAIR ------------------
+    #
+    # The first cut stored album and cover unguarded, so a pre-queued item whose
+    # handler cache was still cold wrote '' over a good anchor and the NEXT
+    # cold append had nothing left to fall back on.
+    $MissingArtHandler::album = 'WILDCHILD';
+    $c->hqArt({ album => 'WILDCHILD', cover => $known });
+
+    $c->_rememberArt({ album => '', cover => '' });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'an empty pair leaves the confirmed anchor standing' );
+
+    $c->_rememberArt( undef );
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'and so does the undef _metadata leaves behind on its early return' );
+
+    $c->_rememberArt({ album => 'WILDCHILD', cover => undef });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'a known album with no artwork yet does not erase it either' );
+
+    ok( scalar( $c->_metadata( FakeSong->new($rt) ) =~ /\bcover="\Q$known\E"/ ),
+        'so the next cold append still gets the cover' );
+
+    # A cover with nothing to key it on is not an anchor at all.
+    $c->_rememberArt({ album => '', cover => 'http://x/orphan.jpg' });
+    is( $c->hqArt && $c->hqArt->{cover}, $known,
+        'a cover with no album identity is not anchored' );
+
+    # A complete pair does replace it.
+    $c->_rememberArt({ album => 'NEXT ALBUM', cover => 'http://x/next.jpg' });
+    is( $c->hqArt && $c->hqArt->{album}, 'NEXT ALBUM',
+        'a usable pair does replace the anchor' );
+
+    $c->hqArt(undef);
+    $MissingArtHandler::album = 'WILDCHILD';
 }
 
 print "-- remote tracks (Qobuz/Tidal) take their artwork from the handler --\n";
@@ -1056,9 +1234,13 @@ sub aged { $_[0]->hqStartedAt( Time::HiRes::time() - 30 ); return }
 # $track is HQPlayer's own playlist index (it reports track="n" tracks_total="n"
 # on every push), which is what a gapless hand-over is observed by.
 sub status {
-    my ( $player, $state, $uri, $pos, $track ) = @_;
+    my ( $player, $state, $uri, $pos, $track, $serial ) = @_;
     my %a = ( state => $state, position => $pos // 0 );
     $a{track} = $track if defined $track;
+    # HQPlayer's playlist-cursor counter. Omitted by every call written before
+    # it existed, which is deliberate: with no serial on either side the stop
+    # classification must abstain rather than guess.
+    $a{track_serial} = $serial if defined $serial;
     my $raw = qq{<Status state="$state" position="} . ( $pos // 0 ) . q{"}
             . ( defined $track ? qq{ track="$track" tracks_total="$track"} : '' )
             . q{>}
@@ -1110,7 +1292,7 @@ ok(scalar($addCmd =~ m{\bqueued="0"}), 'and queued stays 0 - queued="1" kills th
 # into the item's `picture` itself - verified byte-identical to the DIDL path
 # against engine 6.0.4 on 2026-08-28.  picture=/albumArtURI=/art= and a
 # <picture> child are all silently ignored.
-ok(scalar($addCmd =~ m{<metadata\b[^>]*\bcover="https?://[^"]*/cover\.jpg"}),
+ok(scalar($addCmd =~ m{<metadata\b[^>]*\bcover="https?://[^"]*/cover_600x600_o\.jpg"}),
    'the load carries <metadata cover="..."> - this is what sets the picture field');
 is($p->hqExpectStop, '1',
    'play() leaves the stop guard ARMED - the stop that ended the previous track is still in flight');
@@ -1450,6 +1632,33 @@ print "-- the circuit breaker: N consecutive failed loads stop the player --\n";
 }
 
 print "-- a load superseded mid-flight --\n";
+{
+    package CancelCtl;
+    sub cancelQueued {
+        $_[0]->{scope} = $_[1];
+        $_[0]->{seenGen} = $_[0]->{player}->hqGen;
+        return 2;
+    }
+}
+{
+    my $cp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fb', 'paddr', 1.0, undef, 12, undef);
+    my $cc = bless { player => $cp }, 'CancelCtl';
+    $cp->hqControl($cc);
+    my $old = $cp->hqGen;
+    $cp->_newGeneration;
+    is( $cc->{scope}, 'track', 'a new track generation cancels waiting load work from the old one' );
+    is( $cc->{seenGen}, $old + 1,
+        'the generation changes before cancellation settles old callbacks' );
+
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Player.pm'); <> };
+    my ($queue) = $src =~ /sub _queueTrack \{(.*?)\n\}/s;
+    my ($append) = $src =~ /sub _appendTrack \{(.*?)\n\}/s;
+    ok( defined $queue && $queue =~ /scope\s*=>\s*'track'/,
+        'the full load marks its queued commands as generation-bound' );
+    ok( defined $append && $append =~ /scope\s*=>\s*'track'/,
+        'and so does the speculative append' );
+}
+
 # skip: play track two, then stop before HQPlayer has answered
 $p->play({ controller => LoadController->new($two) });
 my $gen = $p->hqGen;
@@ -1713,10 +1922,11 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
 }
 
 {
-    # The other half: a stop that is REAL must still be reported, just
-    # END_GRACE later.  Without this the debounce would swallow a stop made at
-    # HQPlayer's own UI whenever a hand-over happened to be queued.
-    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f6', 'paddr', 1.0, undef, 12, undef);
+    # PlaylistAdd fetches and probes the next item before acknowledging. If the
+    # current track ends during that window, throwing the unacknowledged append
+    # away immediately creates exactly the intermittent full reload and blank
+    # artwork interval pre-queueing exists to avoid.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fa', 'paddr', 1.0, undef, 12, undef);
     $gp->hqControl( bless {}, 'FakeCtl' );
     my $gc = LoadController->new($one);
     $gp->controller($gc);
@@ -1727,6 +1937,112 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     _answer(); _answer();
     status( $gp, 2, $u1, 1, 1 );
 
+    @sent = (); @sentCb = ();
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    my ($u2) = $sent[0] =~ m{\buri="([^"]+)"};
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    aged($gp);
+    status( $gp, 0, undef, 0, 0 );       # append has NOT acknowledged yet
+
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'an end arriving while the pre-queue is still probing is not reported immediately' );
+    is( Slim::Utils::Timers::_pending(), '1',
+        'the in-progress hand-over gets the same bounded grace as an acknowledged one' );
+
+    _answer();                            # PlaylistAdd completes inside the grace
+    status( $gp, 2, $u2, 0, 2 );
+    is( Slim::Utils::Timers::_pending(), '0',
+        'a completed hand-over cancels the fallback full reload' );
+    ok( scalar( grep { $_ eq 'playerTrackStarted' } @{ $gc->{calls} } ),
+        'and LMS advances on the pre-queued item instead' );
+}
+
+{
+    # ...AND THE OTHER OUTCOME OF THAT SAME WINDOW: HQPLAYER REFUSES IT.
+    #
+    # PlaylistAdd is the one ordinary command that fetches and probes the media
+    # before replying, so a refusal can arrive AFTER the track it was queued
+    # behind has ended - inside the grace period that its own lateness opened.
+    # _appendTrack answers a refusal by demoting the item to a held load "at
+    # end of track", and this IS the end of that track.
+    #
+    # The timer used to clear the held item and report the end of the playlist
+    # instead, over a song LMS had already handed over and was still streaming.
+    # One refused append stopped an album mid-way, and nothing recovered it:
+    # the held-track branch in _onStatus needs a fresh state 0, and a stopped
+    # instance says nothing until the watchdog speaks STATUS_WATCHDOG seconds
+    # later - long after this END_GRACE timer has fired.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:e1', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );
+
+    @sent = (); @sentCb = ();
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    aged($gp);
+    status( $gp, 0, undef, 0, 0 );        # the track ends, the append is still probing
+
+    is( Slim::Utils::Timers::_pending(), '1',
+        'an end arriving while the pre-queue is still probing is held on the timer' );
+
+    @sent = ();
+    _answer(0);                           # <PlaylistAdd result="Error"/>
+
+    is( ref $gp->hqNext ? $gp->hqNext->{mode} : '(undef)', 'load',
+        'a refusal demotes the hand-over to a held load rather than failing the track' );
+
+    Slim::Utils::Timers::_fireAll();      # the grace period expires
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track IS loaded when the grace period expires' );
+    is( $gp->hqNext, '(undef)', 'and the load consumes it' );
+
+    # THE CONTROL.  This is what the expiry did with it before - reported the
+    # end of the playlist over a song LMS was still streaming.  Without this
+    # assertion the test passes against a build that loads the track AND tells
+    # LMS the playlist ended.
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'and LMS is NOT told the playlist ended - it is still streaming that song' );
+}
+
+{
+    # THE OTHER HALF: A REAL STOP MUST STILL BE REPORTED - but "real" is now
+    # decided by HQPlayer's playlist cursor rather than by a timeout.
+    #
+    # This block used to assert the opposite of what it asserts now, and the
+    # behaviour it locked in was the defect: with an ACKNOWLEDGED hand-over
+    # pending, the expiry reported end-of-playlist and dropped the queued
+    # track. Seen live 2026-09-10 20:47:59 on track 5 of an 11-track playlist
+    # with track 6 already queued - LMS was told the playlist had finished.
+    #
+    # A stop made at HQPlayer's own front end is what the old test was really
+    # protecting, and it is now caught FASTER and without the timer: abandoning
+    # a track part way leaves `track_serial` alone (measured on two live stops,
+    # 12s and 35s in), so it is followed as a stop straight away.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f6', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );          # cursor at 7
+
     $gc->{song} = $two; $gc->{playing} = 1;
     $gp->play({ controller => $gc });
     _answer();
@@ -1734,15 +2050,254 @@ print "-- a gapless boundary must not be read as the end of the playlist --\n";
     Slim::Utils::Timers::_reset();
     $gc->{calls} = [];
     aged($gp);
-    status( $gp, 0, undef, 0, 0 );
-    Slim::Utils::Timers::_fireAll();          # nothing came back in time
 
-    is( join( ',', @{ $gc->{calls} } ), 'playerEndOfStream,playerReadyToStream,playerStopped',
-        'a stop that stays stopped IS reported, once the grace period expires' );
-    is( $gp->hqStarted, '0', 'and the track is no longer considered playing' );
-    is( $gp->hqNext, '(undef)',
-        'and anything still queued is dropped - it belongs to the run that ended' );
-    is( $gp->hqArmNext, '0', 'as does the arm flag' );
+    # The cursor has NOT moved: the track was abandoned, not finished.
+    status( $gp, 0, undef, 0, 0, 7 );
+
+    is( join( ',', @{ $gc->{calls} } ), 'stop',
+        'a stop that did not move the playlist cursor is followed as a STOP, not an end of playlist' );
+    is( Slim::Utils::Timers::_pending(), '0',
+        'and it needs no grace period at all - the cursor already answered it' );
+    is( $gp->hqStarted, '0', 'the track is no longer considered playing' );
+    is( $gp->hqWanted, 'stop', 'and the wanted state is set BEFORE the controller call, so stop() cannot bounce' );
+}
+
+{
+    # ...AND THE COMPLETED TRACK THAT HQPLAYER NEVER ENTERED.
+    #
+    # Cursor MOVED, so the track ran out rather than being abandoned - but the
+    # pre-queued item never started. That is not an end of playlist either:
+    # `hqNext` is set, which means LMS resolved a next track, so the playlist
+    # provably has more to come. Load the held item; it has never played, so
+    # nothing already heard is restarted.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f7', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();                                # the append IS acknowledged
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );         # cursor MOVED 7 -> 8
+    is( Slim::Utils::Timers::_pending(), '1',
+        'a completed track with a hand-over pending still gets the bounded grace' );
+
+    Slim::Utils::Timers::_fireAll();          # HQPlayer never entered it
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'on expiry the held track is LOADED' );
+
+    # THE CONTROL. This is exactly what the old build did instead, and it is
+    # the assertion that fails against it.
+    is( join( ',', @{ $gc->{calls} } ), '',
+        'and LMS is NEVER told the playlist ended - it supplied that next track' );
+}
+
+{
+    # ...AND THE ONE HQPLAYER DID ENTER, WHICH WE FAILED TO NOTICE.
+    #
+    # `_handedOver` can be wrong in the missing direction: it needs the append
+    # ack before it looks at anything, it treats a uri that does not match as a
+    # VETO, and on tier 5 every reported uri strips to the same string. A real
+    # advance that trips one of those leaves `hqNext` set on a track HQPlayer
+    # goes on to play to the END - and the branch above would then load a song
+    # the listener has just heard.
+    #
+    # The cursor separates them: never entered is ONE advance (the step past
+    # the last item), entered and played is TWO.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f8', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );            # cursor at 7 when the append lands
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();                                 # the append IS acknowledged
+
+    # THE MISSED ADVANCE.  HQPlayer really does move into the queued item -
+    # the cursor steps 7 -> 8 - but the uri it reports is the one it just left,
+    # so the veto in _handedOver answers "not yet" and the hand-over stays
+    # pending.  This is the state the guard has to survive.
+    status( $gp, 2, $u1, 3, 2, 8 );
+
+    is( ref $gp->hqNext ? $gp->hqNext->{mode} : '(undef)', 'queue',
+        'an advance _handedOver cannot see leaves the hand-over pending' );
+    is( $gp->hqNext && $gp->hqNext->{serial}, '7',
+        'and the cursor as it stood at the append is still on it' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 9 );          # that track ends: 8 -> 9
+    Slim::Utils::Timers::_fireAll();
+
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'the held track is NOT re-loaded - two advances mean it has already played' );
+    ok( scalar( grep { $_ eq 'playerEndOfStream' } @{ $gc->{calls} } ),
+        'the end of the stream is reported instead' );
+}
+
+{
+    # THE CONTROL FOR THE CURSOR TEST, and the reason it is not vacuous: the
+    # SAME shape with ONE advance still loads the held track. Without this the
+    # guard could refuse every reload and the block above would still pass.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f9', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );          # ONE advance: never entered
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'one advance still loads the held track - it never played' );
+    ok( scalar( !grep { $_ eq 'playerEndOfStream' } @{ $gc->{calls} } ),
+        'and the playlist is not declared finished over it' );
+}
+
+{
+    # AN ENGINE THAT REPORTS NO CURSOR AT ALL must behave exactly as it did
+    # before the guard existed.  The failure observed live is an album stopping
+    # mid-way, so an unanswerable question loads rather than reports the end.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fa', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );               # no track_serial anywhere
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+    _answer();
+
+    is( $gp->hqNext && $gp->hqNext->{serial}, '(undef)',
+        'nothing to stamp, so the held item carries no cursor' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0 );
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track is loaded, exactly as before the guard' );
+}
+
+{
+    # A STOP AT HQPLAYER'S OWN UI, WITH A TIER 4 TRACK ALREADY HELD.
+    #
+    # The held-track branch does not look at the cursor at all, so while it was
+    # tested FIRST it answered the listener's stop by playing the NEXT track.
+    # The abandoned-stop test has to come before it.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fb', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    my $remote = FakeSong->new( FakeTrack->new(
+        { title=>'Streamed', id=>-94543041325440, ct=>'flc', secs=>200,
+          url=>'qobuz://445307221.flac' } ) );
+
+    $gc->{song} = $remote; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'the tier 4 next track is held' );
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 7 );          # cursor STILL 7 - abandoned
+
+    is( join( ',', @{ $gc->{calls} } ), 'stop',
+        'a stop part way through a track is followed even with a track held' );
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'and the held track is NOT played over the top of it' );
+    is( $gp->hqNext, '(undef)', 'the hold is dropped with the stop' );
+    is( $gp->hqWanted, 'stop', 'and the wanted state is set before the controller call' );
+}
+
+{
+    # THE CONTROL FOR THE REORDER: the same held track, at a REAL end of track,
+    # still loads.  A completed track moves the cursor, which is why testing
+    # the stop first is safe.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:fc', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1, 7 );
+
+    my $remote = FakeSong->new( FakeTrack->new(
+        { title=>'Streamed', id=>-94543041325440, ct=>'flc', secs=>200,
+          url=>'qobuz://445307221.flac' } ) );
+
+    $gc->{song} = $remote; $gc->{playing} = 1;
+    $gp->play({ controller => $gc });
+
+    Slim::Utils::Timers::_reset();
+    $gc->{calls} = [];
+    @sent = ();
+    aged($gp);
+
+    status( $gp, 0, undef, 0, 0, 8 );          # cursor MOVED - the track ran out
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'a held tier 4 track still loads at a real end of track' );
+    ok( scalar( !grep { $_ eq 'stop' } @{ $gc->{calls} } ),
+        'and that is not mistaken for a stop' );
 }
 
 {
@@ -2043,7 +2598,7 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
         'the url carries download.<ext> - downloadMusicFile reads the output format out of it' );
     is( $c->hqTier, '3', 'and is tier 3' );
     ok( scalar( $u !~ /\?/ ),
-        'the url carries NO query string - HQPlayer silently refuses those' );
+        'the generated transcode route is canonical and path-only' );
 
     # a format it CAN decode is still an untouched passthrough
     my $flac = FakeSong->new( FakeTrack->new(
@@ -2061,7 +2616,7 @@ print "-- tier 3: a local file HQPlayer cannot decode --\n";
     ok( scalar( $ru =~ m{^http://127\.0\.0\.1:9000/hqp/02-ab-88-42-4c-69/\d+\.} ),
         'only a remote track reaches tier 4, the plugin stream endpoint' );
     ok( scalar( $ru !~ /\?/ ),
-        'and it too is path-only - /stream.mp3?player= is exactly what HQPlayer will not fetch' );
+        'and its player and sequence identity both live in the path' );
     is( $c->hqTier, '4', 'and is tier 4' );
 }
 
@@ -2084,6 +2639,26 @@ print "-- gapless: the guards --\n";
     _answer(); _answer();
     status( $gp, 2, $u1, 1, 1 );
 
+    # Resolving a different kind of queued track used to overwrite hqTier at
+    # once. If that append was then flushed, the discarded NEXT track became
+    # the supposed tier of the one still playing and later queue decisions
+    # were made from a fact that never happened.
+    my $alac = FakeSong->new( FakeTrack->new(
+        { title=>'ALAC next', id=>303, ct=>'m4a', secs=>180,
+          url=>'file:///next.m4a' } ) );
+    $gc->{song} = $alac;
+    $gc->{playing} = 1;
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u3) = $sent[0] =~ m{\buri="([^"]+)"};
+    is( $gp->hqTier, '1',
+        "resolving a tier-3 next track does not overwrite the PLAYING track's tier" );
+    is( $gp->hqNext && $gp->hqNext->{tier}, '3',
+        'the queued item carries its own tier until the hand-over' );
+    _answer();
+    status( $gp, 2, $u3, 0, 2 );
+    is( $gp->hqTier, '3', 'the queued tier is promoted when HQPlayer actually advances' );
+
     # A LOCAL file of any format is tier 3 now (LMS transcodes it on a
     # path-only url), so only a genuinely REMOTE track reaches tier 4 - it is
     # the one case with no file to serve.
@@ -2098,12 +2673,12 @@ print "-- gapless: the guards --\n";
 
     is( scalar(@sent), '0', 'a tier 4 next track is NOT pre-queued - nothing is sent' );
     is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'it is held for a normal load instead' );
-    is( $gp->hqTier, '1', "and the PLAYING track's tier is left alone" );
+    is( $gp->hqTier, '3', "and the PLAYING track's tier is left alone" );
 
     # ...and it is loaded when the current track actually ends
     $gc->{calls} = [];
     aged($gp);
-    status( $gp, 0, $u1, 200, 1 );
+    status( $gp, 0, $u3, 200, 2 );
     ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ), 'the held track is loaded at end of track' );
     ok( scalar( grep { $_ eq '<PlaylistClear/>' } @sent ),
         'the ordinary way - a full four-command load' );
@@ -2330,5 +2905,126 @@ print "-- the status watchdog outlives the track --\n";
        'and it still sends only when the stream has actually gone quiet');
 }
 
+
+print "-- a hand-over CHAINED off another one stamps the cursor AFTER the advance --\n";
+{
+    # THE COVERAGE GAP THIS CLOSES.  LoadController answers playerReadyToStream
+    # through AUTOLOAD - it records the call and returns - so every block above
+    # calls play() by hand AFTER _onStatus has already returned.  Real LMS does
+    # not: for a LOCAL track the chain ReadyToStream -> _NextIfMore ->
+    # _getNextTrack -> getNextSong ("the simple case", success callback called
+    # inline for a file) -> NextTrackReady -> _StreamIfReady -> _Stream ->
+    # play() is direct calls with no timer, so the append lands INSIDE the push
+    # being handled.  Only the FIRST append of a run is armed from the PLAYING
+    # branch; every later one is chained off _handedOver, and that is the one
+    # shape the suite could not reach.
+    package ChainController;
+    our @ISA = ('LoadController');
+    sub playerReadyToStream {
+        my $self = shift;
+        push @{ $self->{calls} }, 'playerReadyToStream';
+        my $next = shift @{ $self->{queue} || [] } or return;
+        $self->{song}    = $next;
+        $self->{playing} = 1;
+        $self->{player}->play({ controller => $self });
+        return;
+    }
+}
+
+my $three = FakeSong->new( FakeTrack->new(
+    { title=>'Three', id=>303, ct=>'flc', secs=>200, url=>'file:///three.flac' } ) );
+
+# Drive a run up to "track two playing, track three queued behind it", which is
+# the state every block below starts from.  Returns the player, its controller
+# and the uri HQPlayer is playing.
+sub _chained {
+    my $mac = shift;
+    my $p = Plugins::HQPlayerBridge::Player->new($mac,'paddr',1.0,undef,12,undef);
+    $p->hqControl( bless {}, 'FakeCtl' );
+    my $c = ChainController->new($one);
+    $c->{player} = $p;
+    $c->{queue}  = [ $two, $three ];
+    $p->controller($c);
+
+    @sent = (); @sentCb = ();
+    $p->play({ controller => $c });                       # track one, ordinary load
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+
+    status( $p, 2, $u1, 1, 1, 7 );                        # playing, cursor 7
+    _answer();                                            # the append for two is acked
+
+    my ($u2) = ( grep { /^<PlaylistAdd\b/ } @sent )[-1] =~ m{\buri="([^"]+)"};
+    status( $p, 2, $u2, 1, 2, 8 );                        # advance into two: 7 -> 8
+    _answer();                                            # the CHAINED append is acked
+
+    return ( $p, $c, $u2 );
+}
+
+{
+    my ( $cp, $cc, $cu2 ) = _chained('02:aa:bb:cc:dd:c1');
+
+    is( $cp->hqNext && $cp->hqNext->{mode}, 'queue',
+        'the chained hand-over queued the track after it' );
+    is( $cp->hqNext && $cp->hqNext->{serial}, '8',
+        'and stamped the cursor as it stands AFTER the advance, not before' );
+
+    # Two ends and HQPlayer steps off the end of its list without ever entering
+    # three: ONE advance, 8 -> 9.  Three has not been heard, so it must load.
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    status( $cp, 0, undef, 0, 0, 9 );
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { /^<PlaylistAdd\b/ } @sent ),
+        'the held track IS loaded - one advance means it was never entered' );
+    ok( !scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and the playlist is not declared finished mid-album' );
+}
+
+{
+    # CONTROL, and the reason the block above is not just the guard switched
+    # off: the SAME chained shape with TWO advances must still suppress the
+    # reload.  Passes before and after the reorder.
+    my ( $cp, $cc ) = _chained('02:aa:bb:cc:dd:c2');
+
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    # HQPlayer really did enter three (8 -> 9) and we missed it, then played it
+    # out and stepped off the end (9 -> 10).  Two advances since the stamp.
+    status( $cp, 0, undef, 0, 0, 10 );
+    Slim::Utils::Timers::_fireAll();
+
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'two advances still suppress the reload - the guard is intact' );
+    ok( scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and the end of the stream is reported instead' );
+}
+
+{
+    # CONTROL for the thing the reorder actually moved.  $seenSerial and
+    # $cursorMoved are still read BEFORE the store, so a stop that did not move
+    # the cursor is still an abandoned track and not an end of playlist - even
+    # with a chained hand-over pending.
+    my ( $cp, $cc ) = _chained('02:aa:bb:cc:dd:c3');
+
+    Slim::Utils::Timers::_reset();
+    $cc->{calls} = []; $cc->{queue} = []; @sent = ();
+    aged($cp);
+
+    status( $cp, 0, undef, 0, 0, 8 );          # cursor STILL 8 - abandoned
+    Slim::Utils::Timers::_fireAll();
+
+    ok( scalar( grep { $_ eq 'stop' } @{ $cc->{calls} } ),
+        'a stop that left the cursor alone is still followed as a STOP' );
+    ok( !scalar( grep { $_ eq 'playerEndOfStream' } @{ $cc->{calls} } ),
+        'and not as the end of the playlist' );
+    is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
+        'and nothing is loaded over the top of it' );
+}
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

@@ -47,7 +47,8 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqWanted hqVolDb hqVolMin hqVolMax
     hqVolSent hqVolSentAt
     hqGen hqPlayAck hqURL hqPrevURL
-    hqNext hqArmNext hqTrackNo hqStaleRun hqStartedAt hqFailRun
+    hqNext hqArmNext hqTrackNo hqTrackSerial hqStaleRun hqStartedAt hqFailRun
+    hqArt
 ) );
 
 my $log        = logger('plugin.hqplayerbridge');
@@ -162,9 +163,11 @@ sub new {
         hqNext       => undef,
         hqArmNext    => 0,
         hqTrackNo    => undef,
+        hqTrackSerial=> undef,
         hqStaleRun   => 0,
         hqStartedAt  => 0,
         hqFailRun    => 0,
+        hqArt        => undef,
     );
 
     return $client;
@@ -359,7 +362,7 @@ sub pauseForInterval { 1 }
 # ---------------------------------------------------------------------------
 
 sub _send {
-    my ( $self, $cmd, $cb ) = @_;
+    my ( $self, $cmd, $cb, $opts ) = @_;
 
     my $ctl = $self->hqControl;
 
@@ -369,7 +372,7 @@ sub _send {
         return;
     }
 
-    $ctl->send( $cmd, $cb );
+    $ctl->send( $cmd, $cb, $opts );
 
     return;
 }
@@ -496,28 +499,17 @@ sub _resolveURL {
     # has no local file to serve, so the bytes have to come off LMS's own
     # player stream.
     #
-    # THE OBVIOUS URL FOR THAT, /stream.mp3?player=<mac>, DOES NOT WORK, AND
-    # THE REASON IS NOT WHAT IT LOOKS LIKE.  HQPlayer cannot fetch a URL
-    # containing a QUERY STRING.  Isolated live 2026-08-28 against engine
-    # 6.0.4:
+    # The plugin serves the player stream on a path of its own and hands the
+    # socket to the same machinery /stream.mp3 uses - see Stream.pm. The path
+    # gives every track a unique identity and avoids inheriting the player
+    # endpoint's URL shape. HQPlayer DOES support query strings; that older
+    # explanation was disproved on the wire when tier 5 sent signed service
+    # URLs verbatim. It still does not follow a 302, so any URL handed to it
+    # must be final.
     #
-    #   /music/458773/download.flac                -> plays (state 2, proc 3.27)
-    #   /music/458773/download.flac?x=1            -> silent, state 0
-    #   /stream.mp3?player=02:ab:88:42:4c:69       -> silent, state 0
-    #
-    # `PlaylistAdd` answers result="OK" either way and then simply never
-    # fetches it, which is why this looked like a transcoding or single-
-    # consumer problem for so long.  It is the `?`.  A redirect does not rescue
-    # it: HQPlayer issues a HEAD first and DOES NOT FOLLOW the 302 - verified
-    # by pointing it at a local server that answered one; the HEAD arrived and
-    # no GET ever came.
-    #
-    # So the plugin serves the same stream on a path of its own, and hands the
-    # socket to the very machinery /stream.mp3 uses - see Stream.pm.  Every
-    # track gets a url of its own, but this tier is still NOT pre-queued for
-    # gapless: a client has one streamingsocket, and arming a hand-over would
-    # move LMS on to the next song's source while HQPlayer is still pulling
-    # this one.  _armNextTrack holds it instead.
+    # This tier is NOT pre-queued for gapless: a client has one streaming
+    # socket, and arming a hand-over would move LMS on to the next song's source
+    # while HQPlayer is still pulling this one. _armNextTrack holds it instead.
     $self->hqTier( 4 );
 
     my $url = Plugins::HQPlayerBridge::Stream->urlFor( $self, $base, $song );
@@ -584,6 +576,13 @@ sub _addAttrs {
 # load was routed over UPnP for months on the belief that DIDL was the only
 # channel that could carry a cover.  It is not.
 #
+# ARTWORK IS CAPPED AT ART_SIZE ON THE LOCAL ROUTE - see _coverURL.  The
+# endpoint's display is the consumer, and it has to hold whatever is sent;
+# Simon's read on the Eversolo is that it does not like anything larger.  This
+# bounds the LOCAL route only.  A REMOTE track's cover is the service's own URL
+# and goes out untouched (Qobuz already serves 600, others are not checked).
+use constant ART_SIZE => '600x600';
+
 # THE ARTWORK FIELD IS `cover`, AND IT TAKES A PLAIN URL.  Verified against the
 # live daemon (engine 6.0.4) on 2026-08-28 by writing an item both ways and
 # reading it back with <PlaylistGet picture="1"/>.  The two are byte-identical:
@@ -607,7 +606,7 @@ sub _addAttrs {
 # keeping the three fields set here.  The item also carries album_artist, date,
 # genre, composer and performer if there is ever a reason to set them.
 sub _metadata {
-    my ( $self, $song ) = @_;
+    my ( $self, $song, $item ) = @_;
 
     my $track = eval { $song->currentTrack() } or return '<metadata/>';
     my $e = \&Plugins::HQPlayerBridge::Control::escape;
@@ -649,11 +648,67 @@ sub _metadata {
     my $meta = $self->_handlerMeta($track);
     my $gain = $self->_replayGain( $song, $track );
 
+    my $title  = $meta->{title}  || eval { $track->title }      || '';
+    my $artist = $meta->{artist} || eval { $track->artistName } || '';
+    my $album  = $meta->{album}  || eval { $track->albumname }  || '';
+    my $cover  = $self->_coverURL( $track, $meta ) || '';
+
+    # Service handlers populate their metadata caches asynchronously. A
+    # pre-queued track can therefore have a perfectly good album identity but
+    # briefly no artwork, and PlaylistAdd is the only chance to give HQPlayer
+    # a cover. Keep the last confirmed cover only when this item is the SAME
+    # ALBUM. Never carry it into a different album (or across an unknown one),
+    # which would replace a short blank with the wrong artwork.
+    #
+    # THE KEY IS THE ALBUM, NOT THE ARTIST.  Keying on the artist as well would
+    # look stricter and would in fact break the case the feature is for: on a
+    # compilation the track artist changes from one track to the next while the
+    # album does not, so every hand-over inside a Various Artists album would
+    # decline its own cover.  What tells two same-named albums apart is the
+    # album id, which _handlerMeta carries wherever the service publishes one.
+    # AN ALBUM ID IS NOT A GLOBAL IDENTIFIER, AND NEITHER IS A TITLE.
+    #
+    # Qobuz's `albumId` and Tidal's `album_id` are drawn from SEPARATE
+    # identifier spaces, so two services may legitimately publish the same
+    # value for unrelated albums - and the id test in _artMatch short-circuits
+    # AHEAD of the album name, so a collision overrides even a different title.
+    # The name half collides far more easily: Deezer and Spotty publish no id
+    # at all, so any album title shared across two services matched on the name
+    # alone and one service's cover landed on another's album.
+    #
+    # The url scheme is what tells the spaces apart. It costs nothing, it is
+    # already on the track, and it is stable across an album because an album
+    # is served by ONE service - so this cannot break the compilation case the
+    # album key exists for. See _artMatch, where a difference is a veto.
+    my ($svc) = ( eval { $track->url } || '' ) =~ m{^([A-Za-z][\w.+-]*)://};
+
+    my $art = {
+        svc   => defined $svc ? lc $svc : undef,
+        id    => $meta->{albumId},
+        album => $album,
+        cover => $cover,
+    };
+
+    if ( $cover eq '' ) {
+        my $reuse = $self->_reusableArt($art);
+
+        if ( defined $reuse ) {
+            $cover = $art->{cover} = $reuse;
+
+            main::DEBUGLOG && $log->is_debug && $log->debug(
+                $self->name . ": reusing confirmed artwork for album '$album'" );
+        }
+    }
+
+    # ONE value out, not two loose ones: the caller cannot half-copy a triple
+    # it never takes apart.  See _rememberArt.
+    $item->{art} = $art if ref $item eq 'HASH';
+
     my @f = (
-        song   => $meta->{title}  || eval { $track->title }      || '',
-        artist => $meta->{artist} || eval { $track->artistName } || '',
-        album  => $meta->{album}  || eval { $track->albumname }  || '',
-        cover  => $self->_coverURL( $track, $meta ) || '',
+        song   => $title,
+        artist => $artist,
+        album  => $album,
+        cover  => $cover,
         # Guarded rather than defaulted: a zero length is worse than none - it
         # is what the UI was already showing.
         ( $secs && $secs > 0 ? ( length => $secs ) : () ),
@@ -811,6 +866,25 @@ sub _handlerMeta {
     # the artwork keys, left exactly as _coverURL expects them
     $out{$_} = $meta->{$_} for grep { defined $meta->{$_} } qw( cover coverart icon artwork_url );
 
+    # THE ALBUM ID, WHERE THE SERVICE PUBLISHES ONE.  This is read straight off
+    # the hash getMetadataFor already returned - it is not a reach into any
+    # plugin's internals, and a service that does not publish it simply has
+    # none here.  Verified 2026-07-25 by reading each plugin's source:
+    #
+    #   Qobuz   `albumId`   - API/Common.pm precacheTrack, cached during play
+    #   Tidal   `album_id`  - API.pm cacheTrackMetadata
+    #   Deezer  none        - getMetadataFor flattens album to its title first
+    #   Spotty  none        - album is built as a plain string
+    #
+    # It is the exact half of the artwork key (see _artMatch): where BOTH
+    # sides have one, two albums of the same NAME are still told apart.
+    for my $k (qw( albumId album_id albumid )) {
+        my $v = $meta->{$k};
+        next if !defined $v || ref $v || $v eq '';
+        $out{albumId} = $v;
+        last;
+    }
+
     return \%out;
 }
 
@@ -847,7 +921,156 @@ sub _coverURL {
     # on the endpoint.
     my $id = eval { $track->coverid } || eval { $track->id } or return undef;
 
-    return $self->_serverBase . '/music/' . $id . '/cover.jpg';
+    # ASK FOR A BOUNDED SIZE.  A bare `cover.jpg` serves the STORED ORIGINAL,
+    # whatever that happens to be - measured on Simon's library 2026-09-11, the
+    # largest is 3000x3000 / 8.33 MB, and the endpoint has to hold it.  The
+    # same cover at ART_SIZE is 36 KB.  Nothing downstream asked for the
+    # original: HQPlayer hands the URL to the endpoint's display.
+    #
+    # THE MODE LETTER IS NOT DECORATION, and the two obvious ones are wrong:
+    #   _o  fit inside the box, aspect preserved   <- this
+    #   _m/_p  pad to a forced square with black bars, and the padding made
+    #          the file SIX TIMES larger in the measurement
+    #   a bare `cover_600` (no `x<height>`) silently serves the original -
+    #          it looks like it works and caps nothing
+    #
+    # LMS resizes on demand and caches the result, so this costs one resize per
+    # album, once.
+    return $self->_serverBase . '/music/' . $id . '/cover_' . ART_SIZE . '_o.jpg';
+}
+
+# --- artwork continuity -----------------------------------------------------
+#
+# ONE CONCEPT, ONE CARRIER.  "The artwork of the last item HQPlayer confirmed,
+# and the album identity it belongs to" lives in `hqArt` and nowhere else, and
+# it is written ONLY through _rememberArt and read ONLY through _reusableArt.
+# This was first written as two parallel accessors written at three sites with
+# the storage rule repeated at none of them, and the two ways that went wrong -
+# storing an empty pair, and matching on a bare album name - are exactly what
+# these two subs exist to make unrepeatable.
+#
+# The shape is { id => ..., album => ..., cover => ... }, or undef.
+
+# A usable field, or undef.  Everything here arrives from a service handler,
+# so an undef, a blank and a stray reference all have to read the same way.
+sub _artField {
+    my ( $self, $art, $k ) = @_;
+
+    return undef unless ref $art eq 'HASH';
+
+    my $v = $art->{$k};
+
+    return ( defined $v && !ref $v && $v ne '' ) ? $v : undef;
+}
+
+# What identifies an album, most exact first.  Returns undef when there is
+# nothing trustworthy to key on at all - which is what stops radio, and any
+# item whose handler has not answered yet, from anchoring or inheriting art.
+sub _artKey {
+    my ( $self, $art ) = @_;
+
+    # Namespaced, so the key READS as the identity _artMatch actually enforces.
+    my $svc = $self->_artField( $art, 'svc' );
+    my $ns  = defined $svc ? "$svc:" : '';
+
+    my $id = $self->_artField( $art, 'id' );
+    return "${ns}id:$id" if defined $id;
+
+    my $album = $self->_artField( $art, 'album' );
+    return "${ns}album:$album" if defined $album;
+
+    return undef;
+}
+
+# Are these the same album?
+#
+# THE ID WINS ONLY WHEN BOTH SIDES HAVE ONE.  Qobuz and Tidal publish the album
+# id and the album name out of the SAME cached entry, so within one service the
+# two are warm or cold together and the id path is the one that runs.  Falling
+# back to the name when either side lacks an id is therefore not a hole in the
+# id check - it is the only rule available for Deezer, Spotty and anything else
+# that flattens its album to a title before we ever see it.
+#
+# The residual risk is stated rather than hidden: on an id-less service, two
+# ADJACENT items sharing an album title inherit each other's art.
+sub _artMatch {
+    my ( $self, $have, $want ) = @_;
+
+    # A DIFFERENT SERVICE IS A VETO, AHEAD OF BOTH TESTS BELOW.  See _metadata:
+    # ids from two services say nothing about each other and album titles are
+    # shared freely, so neither test can be trusted across a service boundary.
+    #
+    # Vetoed only when BOTH sides name a service - the same shape as the id
+    # rule, and for the same reason: an anchor that has no service recorded is
+    # not evidence of a DIFFERENT one, so it must keep falling through to the
+    # tests that follow rather than silently matching nothing.
+    my $haveSvc = $self->_artField( $have, 'svc' );
+    my $wantSvc = $self->_artField( $want, 'svc' );
+
+    return 0 if defined $haveSvc && defined $wantSvc && $haveSvc ne $wantSvc;
+
+    my $haveId = $self->_artField( $have, 'id' );
+    my $wantId = $self->_artField( $want, 'id' );
+
+    return $haveId eq $wantId if defined $haveId && defined $wantId;
+
+    my $haveAlbum = $self->_artField( $have, 'album' );
+    my $wantAlbum = $self->_artField( $want, 'album' );
+
+    return 0 unless defined $haveAlbum && defined $wantAlbum;
+
+    return $haveAlbum eq $wantAlbum;
+}
+
+# THE ONLY WRITER.  A pair is stored only when it is usable as an anchor: a
+# non-empty cover AND an identity to key it on.  Anything less LEAVES THE
+# EXISTING ANCHOR ALONE - it does not clear it.
+#
+# That is the whole of the first fix.  A pre-queued item whose handler cache
+# was still cold carries album='' and cover='', and the first cut wrote that
+# straight over the anchor; the NEXT cold append had nothing to fall back on and
+# sent no cover, which is the blank the feature exists to prevent.  A stale
+# anchor cannot cause the opposite fault, because _reusableArt only ever hands
+# it back for the same album.
+sub _rememberArt {
+    my ( $self, $art ) = @_;
+
+    return unless ref $art eq 'HASH';
+
+    my $cover = $art->{cover};
+    return unless defined $cover && !ref $cover && $cover ne '';
+
+    my $key = $self->_artKey($art) or return;
+
+    # FIELD BY FIELD, so carry every part of the identity: a field dropped here
+    # is a field _artMatch can never veto on.
+    $self->hqArt( {
+        svc   => $art->{svc},
+        id    => $art->{id},
+        album => $art->{album},
+        cover => $cover,
+    } );
+
+    main::DEBUGLOG && $log->is_debug && $log->debug(
+        $self->name . ": confirmed artwork anchored to $key" );
+
+    return 1;
+}
+
+# THE ONLY READER.  Hands back the anchor's cover when the candidate is the
+# same album, and undef otherwise.
+sub _reusableArt {
+    my ( $self, $art ) = @_;
+
+    my $have = $self->hqArt                  or return undef;
+
+    # Both sides have to be identifiable before they can be compared at all.
+    defined $self->_artKey($art)             or return undef;
+    defined $self->_artKey($have)            or return undef;
+
+    $self->_artMatch( $have, $art )          or return undef;
+
+    return $have->{cover};
 }
 
 # ---------------------------------------------------------------------------
@@ -859,6 +1082,15 @@ sub _coverURL {
 # makes every outstanding callback recognise itself as superseded.
 sub _newGeneration {
     my $self = shift;
+
+    # Stamp the new generation BEFORE cancelling callbacks. cancelQueued()
+    # preserves the ordinary failed-callback contract; the stamp is what lets
+    # those callbacks identify their old work and retire quietly.
+    my $gen = ( $self->hqGen || 0 ) + 1;
+    $self->hqGen($gen);
+
+    my $ctl = $self->hqControl;
+    $ctl->cancelQueued('track') if $ctl && $ctl->can('cancelQueued');
 
     # Anything handed over early belonged to the run that is ending.  Nothing
     # extra has to be sent to HQPlayer: the four-command load opens with
@@ -872,14 +1104,16 @@ sub _newGeneration {
     # would make the first status of the new track look like an advance.
     $self->hqTrackNo( undef );
 
+    # ...and so does the playlist-cursor counter it is read alongside. HQPlayer
+    # restarts `track_serial` at 0 for a new process, and a load clears the
+    # playlist it counts, so a value carried across is not comparable.
+    $self->hqTrackSerial( undef );
+
     # ...and a pending end-of-stream belongs to the run that is ending.
     $self->_cancelEndOfStream;
 
     # As does a load still waiting to be told it started.
     $self->_cancelStartDeadline;
-
-    my $gen = ( $self->hqGen || 0 ) + 1;
-    $self->hqGen($gen);
 
     return $gen;
 }
@@ -1036,8 +1270,14 @@ sub _handOver {
 
     my $newTier = $self->hqTier || 0;
 
-    return $self->_appendTrack( $url, $song )
-        if $newTier == 1 || $newTier == 3 || $newTier == 5;
+    if ( $newTier == 1 || $newTier == 3 || $newTier == 5 ) {
+        # Resolving the queued item must not change facts about the item still
+        # playing. This matters when a playlist edit flushes the append before
+        # hand-over: the replacement decision must still use the current
+        # track's tier, not the discarded next one's.
+        $self->hqTier($tier);
+        return $self->_appendTrack( $url, $song, $newTier );
+    }
 
     # TIER 4 CANNOT RIDE HQPLAYER'S PLAYLIST, even though its urls ARE unique.
     # A client has ONE streamingsocket and one songStreamController.  Appending
@@ -1064,17 +1304,24 @@ sub _handOver {
 # are what the four-command load uses to REPLACE a track, and either one here
 # would kill the track that is playing.
 sub _appendTrack {
-    my ( $self, $url, $song ) = @_;
+    my ( $self, $url, $song, $tier ) = @_;
 
-    my $e    = \&Plugins::HQPlayerBridge::Control::escape;
-    my $meta = $self->_metadata($song);
+    my %item;
+    my $meta = $self->_metadata( $song, \%item );
 
     # Deliberately NOT a new generation.  hqGen belongs to the track that is
     # playing and its callbacks must keep running; bumping it here would make
     # the running track supersede itself.
     my $gen = $self->hqGen || 0;
 
-    $self->hqNext( { mode => 'queue', url => $url, song => $song, acked => 0 } );
+    # THE CURSOR AS IT STANDS AT THE APPEND, so the end-of-track path can ask
+    # whether HQPlayer ever ENTERED this item.  See _endOfStream: one advance
+    # since this moment is the item being stepped over at the end of the list,
+    # two is the item having been entered and played through.
+    $self->hqNext( {
+        mode  => 'queue', url => $url, song => $song, acked => 0,
+        tier  => $tier, art => $item{art}, serial => $self->hqTrackSerial,
+    } );
 
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ": pre-queuing the next track for a gapless hand-over - $url" );
@@ -1135,7 +1382,8 @@ sub _appendTrack {
 
             main::INFOLOG && $log->is_info && $log->info(
                 $self->name . ': the next track is queued behind the playing one' );
-        } );
+        },
+        { scope => 'track' } );
 
     return 1;
 }
@@ -1221,7 +1469,7 @@ sub flush {
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ': flush - dropping the pre-queued track' );
 
-    $self->_send('<PlaylistClear/>');
+    $self->_send( '<PlaylistClear/>', undef, { scope => 'track' } );
 
     return 1;
 }
@@ -1265,8 +1513,8 @@ sub _queueTrack {
         return;
     }
 
-    my $e    = \&Plugins::HQPlayerBridge::Control::escape;
-    my $meta = $self->_metadata($song);
+    my %item;
+    my $meta = $self->_metadata( $song, \%item );
 
     # The generation this load belongs to - see _newGeneration.
     my $gen = $self->hqGen || 0;
@@ -1275,8 +1523,8 @@ sub _queueTrack {
     # back, and holding the chain up for their replies would only widen the
     # window in which a skip can arrive.  Ordering is guaranteed by the socket,
     # not by the callbacks.
-    $self->_send('<Stop/>');
-    $self->_send('<PlaylistClear/>');
+    $self->_send( '<Stop/>',          undef, { scope => 'track' } );
+    $self->_send( '<PlaylistClear/>', undef, { scope => 'track' } );
 
     $self->_send(
         '<PlaylistAdd ' . $self->_addAttrs( $url, 0 ) . '>'
@@ -1301,7 +1549,14 @@ sub _queueTrack {
                 return;
             }
 
-        $self->_send( '<Play/>', sub {
+            # This is now a confirmed playlist item. It is the only safe
+            # source for same-album artwork fallback: do not update the cache
+            # while merely resolving or before HQPlayer accepts the metadata.
+            # _rememberArt ignores an item that has no cover to anchor, which
+            # is why a cold pre-queue can no longer erase a good one.
+            $self->_rememberArt( $item{art} );
+
+            $self->_send( '<Play/>', sub {
             # ($attrs, $raw) again - see the note on PlaylistAdd above.
             my ( $r2, $raw2 ) = @_;
 
@@ -1340,7 +1595,8 @@ sub _queueTrack {
             my $seekTier = $self->hqTier || 0;
 
             if ( $seek && $seek > 0 && ( $seekTier == 1 || $seekTier == 5 ) ) {
-                $self->_send( '<Seek position="' . int($seek) . '"/>' );
+                $self->_send( '<Seek position="' . int($seek) . '"/>',
+                    undef, { scope => 'track' } );
                 $self->hqSeekOffset( int($seek) );
             }
 
@@ -1377,8 +1633,8 @@ sub _queueTrack {
             # play; from here it has START_DEADLINE seconds to actually say it
             # IS playing, or the load is reported failed. See START_DEADLINE.
             $self->_armStartDeadline($gen);
-        } );
-    } );
+            }, { scope => 'track' } );
+        }, { scope => 'track' } );
 
     return;
 }
@@ -2291,6 +2547,8 @@ sub _handedOver {
     # hqExpectStop here either.  A stop from now on is a real end of playlist.
     $self->hqPrevURL( $self->hqURL );
     $self->hqURL( $next->{url} );
+    $self->hqTier( $next->{tier} ) if defined $next->{tier};
+    $self->_rememberArt( $next->{art} );
 
     # Position is HQPlayer's own, and it restarts with the new track.  The seek
     # offset belonged to the track that has just finished; a hand-over is never
@@ -2393,6 +2651,56 @@ sub _onStatus {
     # to the NEW track.
     my $track = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track' );
 
+    # THE PLAYLIST CURSOR, AND WHY IT IS READ HERE RATHER THAN WITH `track`.
+    #
+    # `track_serial` counts ADVANCES OF HQPLAYER'S PLAYLIST CURSOR, and it is
+    # the only field that survives the push which blanks everything else.
+    # Measured live 2026-09-10 across every transition type:
+    #
+    #   track started          4 -> 5    cursor moved
+    #   gapless boundary       2 -> 3    cursor moved
+    #   END of the playlist    3 -> 4    cursor moved (past the last item)
+    #   pause, then resume     5 -> 5    unchanged
+    #   stopped 12s into a track  5 -> 5 unchanged
+    #
+    # So it does NOT say "a next track exists" - it stepped at the end of a
+    # one-track list where nothing followed. What it says is whether the track
+    # RAN OUT or was ABANDONED, and that is the question the stop path below
+    # actually needs. Whether a completed track is a boundary or the end of the
+    # playlist is LMS's to answer, not HQPlayer's - see the HQP_STOPPED branch.
+    my $serial = Plugins::HQPlayerBridge::Control::pick( $attrs, 'track_serial' );
+
+    $serial = undef unless defined $serial && $serial =~ /^\d+$/;
+
+    # Compared BEFORE it is stored: the blanked push already carries the NEW
+    # value, so storing first would erase the very difference being tested.
+    my $seenSerial = $self->hqTrackSerial;
+
+    my $cursorMoved = defined $serial && defined $seenSerial && $serial > $seenSerial;
+
+    $self->hqTrackSerial($serial) if defined $serial;
+
+    # ...AND IT IS READ AND STORED BEFORE THE HAND-OVER CHECK BELOW.
+    #
+    # `_handedOver` ends by calling `_armNextTrack`, and for a LOCAL track LMS
+    # answers `playerReadyToStream` by re-entering `play()` SYNCHRONOUSLY - the
+    # whole chain, ReadyToStream -> _NextIfMore -> _getNextTrack -> getNextSong
+    # ("the simple case", which calls its success callback inline for a file)
+    # -> NextTrackReady -> _StreamIfReady -> _Stream -> play(), is direct calls
+    # with no timer anywhere. So `_appendTrack` runs INSIDE this sub, and the
+    # `serial` it stamps on the held item is whatever is stored at that moment.
+    #
+    # Stored after the check, every append chained off a hand-over was stamped
+    # with the PREVIOUS cursor - one low. The first append of a run was right
+    # (it is armed from the PLAYING branch, below the store) which is why the
+    # suites were green. From the second boundary on, _endOfStream then read
+    # the difference as 2 rather than 1, decided the held track had already
+    # played, and reported the end of the playlist instead of loading it -
+    # which is exactly the mid-album stop 0.2.82 was written to remove.
+    #
+    # $seenSerial and $cursorMoved are still taken BEFORE the store, so the
+    # stop classification below is unchanged. DO NOT MOVE THIS BACK DOWN.
+
     $self->_handedOver( $track, $meta ) if $self->hqNext;
 
     # ZERO IS NOT A PLAYLIST POSITION, AND MUST NEVER BECOME THE BASELINE.
@@ -2415,6 +2723,7 @@ sub _onStatus {
     # catches up, which is why identical code was clean on earlier loads.
     $self->hqTrackNo($track)
         if defined $track && $track =~ /^\d+$/ && $track > 0;
+
 
     if ( defined $pos && $pos =~ /^[\d.]+$/ ) {
         $self->hqPosition( $pos + 0 );
@@ -2522,6 +2831,45 @@ sub _onStatus {
                 return;
             }
 
+            # THE TRACK WAS ABANDONED, NOT FINISHED - so nothing ended.
+            #
+            # A stop whose playlist cursor did NOT move means HQPlayer gave up
+            # part way through the track (measured: a stop 12s in, and another
+            # 35s in, both left `track_serial` alone; a pause and a resume do
+            # not move it either). There is no end of stream to report and no
+            # boundary to wait for, and reporting one makes LMS advance or stop
+            # over a track that was simply interrupted.
+            #
+            # The bridge's OWN stops never reach here - `hqExpectStop` covers
+            # those - so this is a stop nothing on our side asked for. Follow it
+            # the way the PAUSED branch follows an outside pause: say what we
+            # now want FIRST, so the controller calling back into stop() does
+            # not bounce, then let LMS stop. The playlist is left intact.
+            #
+            # AND IT IS TESTED FIRST, ahead of the held-track branch below.
+            # A stop made at HQPlayer's own UI can land with a tier 4 track
+            # already held, and that branch does not look at the cursor at all
+            # - evaluated first, it answers the listener's stop by playing the
+            # NEXT track. The order is safe the other way round because a track
+            # that genuinely RAN OUT moves the cursor, so this branch cannot
+            # fire at a real end of track and the held load still runs there
+            # exactly as it did before.
+            if ( defined $serial && defined $seenSerial && !$cursorMoved ) {
+
+                main::INFOLOG && $log->is_info && $log->info( $self->name
+                    . ': stopped outside LMS part way through the track - following'
+                        . _ctlState($controller) );
+
+                $self->hqWanted('stop');
+                $self->hqStarted( 0 );
+                $self->hqNext( undef );
+                $self->hqArmNext( 0 );
+
+                $controller->stop;
+
+                return;
+            }
+
             # A track LMS handed over early that could NOT ride HQPlayer's own
             # playlist - tier 4, see _handOver.  Load it now, the ordinary way.
             # There is nothing to report to LMS: it has been streaming this
@@ -2562,9 +2910,10 @@ sub _onStatus {
             # STOPPED/IDLE where TrackStarted is _Invalid.
             #
             # THE ONLY DISCRIMINATOR IS TIME, so the report is debounced - but
-            # only in the one state where the transient is possible: a
-            # hand-over we have queued and HQPlayer has acknowledged, which is
-            # exactly when it has another item to move into.  Anything else
+            # only while a hand-over is pending. This includes the short window
+            # before PlaylistAdd acknowledges: HQPlayer fetches and probes the
+            # item before replying, so treating that stop as final throws away
+            # the very append which may be about to complete. Anything else
             # (nothing queued, or a held tier 4 track) is reported at once, as
             # before, because there is nothing for HQPlayer to move into and
             # the stop can only be real.
@@ -2572,10 +2921,10 @@ sub _onStatus {
             # A genuine stop is still reported, just END_GRACE later - which
             # matters for a stop made at HQPlayer's own UI while a hand-over
             # happens to be queued.
-            if ( $next && $next->{mode} eq 'queue' && $next->{acked} ) {
+            if ( $next && $next->{mode} eq 'queue' ) {
 
                 main::DEBUGLOG && $log->is_debug && $log->debug( $self->name
-                    . ': stopped with a hand-over queued - waiting '
+                    . ': stopped with a hand-over pending - waiting '
                     . END_GRACE . 's to see if this is a track boundary' );
 
                 Slim::Utils::Timers::killTimers( $self, \&_endOfStream );
@@ -2608,6 +2957,102 @@ sub _endOfStream {
     my $controller = $self->controller or return;
 
     return unless $self->hqStarted;
+
+    # THE HAND-OVER MAY HAVE BEEN DEMOTED WHILE THIS TIMER RAN.
+    #
+    # The grace period is armed for a hand-over that has NOT acknowledged yet
+    # (see _onStatus), and PlaylistAdd is the one ordinary command that makes
+    # HQPlayer fetch and probe the media before it replies - so a refusal lands
+    # INSIDE the window that the refusal's own lateness opened.  _appendTrack
+    # answers a refusal by demoting the item to a held load, on the stated
+    # promise that "the ordinary load runs at end of track".  This IS the end
+    # of that track.
+    #
+    # Without this branch the promise was broken in the one case that needed
+    # it: the timer cleared hqNext and reported the end of the playlist, so a
+    # single refused append stopped an album mid-way.  Reproduced in
+    # t_player.pl against a <PlaylistAdd result="Error"/> arriving inside the
+    # grace window.
+    #
+    # THERE IS NO SECOND CHANCE ELSEWHERE.  The held-track branch in _onStatus
+    # only runs on a fresh state 0, and a stopped instance says nothing at all
+    # until the watchdog speaks STATUS_WATCHDOG seconds later - long after this
+    # END_GRACE timer has fired.
+    #
+    # Nothing is reported to LMS here, for the same reason the _onStatus branch
+    # reports nothing: LMS has been streaming this song since the hand-over,
+    # and the playerTrackStarted at the far end of the load is what retires the
+    # one that just finished.  A load that cannot run is not silent either -
+    # _queueTrack answers a missing control link with _loadFailed, and a second
+    # refusal is reported properly there, which is the whole point of demoting
+    # to a load rather than failing at append time.
+    # A PENDING HAND-OVER IS PROOF THE PLAYLIST HAS NOT ENDED.
+    #
+    # `hqNext` exists only because LMS resolved a NEXT TRACK and handed it over,
+    # so on this path "end of playlist" is not merely unlikely, it is the one
+    # answer that cannot be true. The genuine end never arrives here: at the
+    # last track LMS arms no hand-over, `hqNext` stays undef, and the stop is
+    # reported immediately with no timer at all (confirmed live twice).
+    #
+    # This branch used to fire only for a REFUSED pre-queue (mode 'load'). An
+    # ACCEPTED one that HQPlayer simply never entered (mode 'queue') fell
+    # through and reported the end of the playlist instead. Observed live
+    # 2026-09-10 at 20:47:59, on track 5 of an 11-track playlist with track 6
+    # already queued: LMS was told the playlist had finished.
+    #
+    # Either way the held track has NEVER PLAYED, so loading it restarts
+    # nothing the listener has already heard. That distinction is the whole
+    # licence for this branch.
+    my $held = $self->hqNext;
+
+    # ...UNLESS HQPLAYER ENTERED IT AND WE FAILED TO NOTICE.
+    #
+    # "Never played" is _handedOver's answer, and _handedOver can be wrong in
+    # the missing direction: it needs the PlaylistAdd ack before it looks at
+    # anything, it treats a uri that does not match as a VETO, and on tier 5
+    # every reported uri strips to the same string so the index is all it has.
+    # A real advance that fails one of those leaves hqNext set on a track
+    # HQPlayer has since played to the end, and loading it here plays it TWICE.
+    #
+    # The playlist CURSOR settles it, and this is NOT the claim the ledger
+    # disproved (row 38): the cursor is not being asked whether a stop is a
+    # boundary or the end of the list.  It is being asked how many times it has
+    # moved since the append, which is exactly what the measurement says it
+    # counts - the step past the final item included.
+    #
+    #   queued, never entered      append -> end of list           1 advance
+    #   queued, entered, played    append -> into it -> end        2 advances
+    #
+    # So two or more means the listener has already heard it: say the stream
+    # ended and let LMS move on.  Either side undef - an engine that does not
+    # report the field - loads as before, because the failure observed live is
+    # an album stopping mid-way and that is the direction to fail in.
+    my $played = 0;
+
+    if ( $held && $held->{mode} eq 'queue' ) {
+        my $at  = $held->{serial};
+        my $now = $self->hqTrackSerial;
+
+        $played = 1 if defined $at && defined $now && $now - $at >= 2;
+
+        main::INFOLOG && $log->is_info && $log->info( $self->name
+            . ': the hand-over was entered after all (cursor '
+            . $at . ' -> ' . $now . ') - not reloading it' ) if $played;
+    }
+
+    if ( $held && !$played && ( $held->{mode} eq 'load' || $held->{mode} eq 'queue' ) ) {
+        $self->hqNext( undef );
+
+        main::INFOLOG && $log->is_info && $log->info( $self->name
+            . ': end of track, and HQPlayer did not enter the hand-over - loading it'
+                . _ctlState($controller) );
+
+        # No seek: a hand-over is never seeked (see _canHandOver), so the held
+        # item carries none and the track starts where it should.
+        $self->_startTrack( $held->{song}, $held->{seek} );
+
+        return;
+    }
 
     # HQPlayer ran off the end of its playlist under its own steam, so this is
     # end-of-stream: report it and let LMS advance.  Verified live: state goes

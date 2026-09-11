@@ -4,6 +4,49 @@ All notable changes to **HQPlayer Bridge** are recorded here. This file records
 what users receive: one entry per release published to `main`. Per-version
 development notes live in `CLAUDE.md`.
 
+## 0.2.87 — 2026-09-11
+
+A reliability release for track hand-overs, pre-queuing and control-command
+ordering. No new features — every item below fixes a way the bridge could
+already lose a beat, most of them narrow timing cases rather than anything
+heard on ordinary playback.
+
+### Playback
+
+- **A stop is now told apart from the playlist running out.** HQPlayer's own
+  playlist cursor is read on every stopped push, so a track stopped at
+  HQPlayer's own front end is followed as a stop — instead of, in a narrow
+  case, silently loading the next queued track and carrying on.
+- **A held next track is no longer reloaded once it has already played.**
+  The same cursor tells a hand-over that never happened apart from one that
+  played through and was missed, so a track can no longer be replayed after
+  a missed hand-over.
+- **Slow and refused pre-queues no longer force an audible full reload.** An
+  append still in flight when the current track ends is now given the same
+  grace window already used for an acknowledged one, instead of falling
+  straight through to a Stop/Clear/Add/Play reload.
+- **The current track's reported format no longer flips early.** Resolving
+  the next track no longer overwrites the tier shown for the one still
+  playing; it is promoted only once the hand-over is confirmed.
+- **A skip or playlist edit that arrives mid-load no longer waits behind
+  stale work.** Commands superseded by a newer one are now cancelled out of
+  the control queue by scope, so the load the user actually asked for is not
+  held up by one that no longer matters.
+
+### Artwork
+
+- **Cover art now stays with its own track through a hand-over**, instead of
+  flashing off and back on at the boundary.
+- **Local artwork is capped at 600×600 before it reaches the endpoint**,
+  instead of serving the original file at full resolution — some library
+  covers ran to several megabytes at full size.
+
+### Housekeeping
+
+- Removed an unused, superseded framer left over from before the live status
+  reader, and a vendor source copy that had been committed twice. No
+  behaviour change.
+
 ## 0.2.77 — 2026-09-06
 
 **First published release.** Presents each HQPlayer instance on the network as a

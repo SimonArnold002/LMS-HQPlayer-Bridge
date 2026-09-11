@@ -2,7 +2,7 @@
 <extension>
     <name>PLUGIN_HQPLAYER_BRIDGE</name>
     <module>Plugins::HQPlayerBridge::Plugin</module>
-    <version>0.2.77</version>
+    <version>0.2.87</version>
     <description>PLUGIN_HQPLAYER_BRIDGE_DESC</description>
     <creator>CrystalGipsy</creator>
     <email></email>

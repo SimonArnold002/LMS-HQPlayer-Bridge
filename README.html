@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause, seek, set its volume and see its artwork from Material or any control point, while HQPlayer does the upsampling, filtering and modulation exactly as it always has.</p>
   <div class="badges">
-    <span class="badge accent">v0.2.77</span>
+    <span class="badge accent">v0.2.87</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -139,7 +139,7 @@
 <div class="card"><h4>Streaming at full rate</h4><p>Qobuz and Tidal are fetched by HQPlayer straight from the service; Deezer and radio go through LMS</p><span class="needs">Needs: The matching service plugin</span></div>
 <div class="card"><h4>Gapless</h4><p>Library and direct streaming hand the next track over early, so HQPlayer makes the join itself</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>ReplayGain everywhere</h4><p>Library <em>and</em> streaming normalised using exactly the figure LMS worked out</p><span class="needs">Needs: Replay gain not set to Off</span></div>
-<div class="card"><h4>Artwork on the endpoint</h4><p>Cover art reaches HQPlayer and its display, from your library or a service</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Artwork on the endpoint</h4><p>Cover art reaches HQPlayer and its display, from your library or a service, and stays with its own track across a gapless hand-over</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Volume, both ways</h4><p>The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Pause from either end</h4><p>Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Stable player identity</h4><p>Prefs, playlist and sync group survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
@@ -186,7 +186,7 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <tr><td><strong>Deezer, internet radio</strong></td><td>Through LMS on a plain path of its own, FLAC first so usually no transcoding</td><td>Next track loads at the end</td></tr>
 </tbody></table>
 <p>Everything is addressed by URL, so nothing about your files needs to match between the two machines.</p>
-<p>Where a track is pre-queued, HQPlayer has the next one in its own playlist before the current ends and makes the join itself. On the last route the next track loads when the current one finishes — about half a second, against roughly a second and a half of audio already in flight, so nothing is heard.</p>
+<p>Where a track is pre-queued, HQPlayer has the next one in its own playlist before the current ends and makes the join itself. A pre-queue HQPlayer is slow to acknowledge, or turns down outright, still reaches the next track — the bridge falls back to a normal load rather than losing it, and a stop at HQPlayer's own front end is told apart from the playlist simply running out. On the last route the next track loads when the current one finishes — about half a second, against roughly a second and a half of audio already in flight, so nothing is heard.</p>
 <p><strong>ReplayGain</strong> is sent with the track, exactly as LMS calculated it — nothing scaled or trimmed, and a <em>boost</em> goes through in full. This covers streaming, where there are no tags, and beats letting HQPlayer read library tags itself, which it does at the moment playback starts and so misses the first tracks of a fresh album. LMS's choice between album and track gain is the one you get. A track LMS has no figure for is left completely alone. If you have HQPlayer's <strong>convolution gain compensation</strong> set, that applies on top — deliberately not cancelled out.</p>
 </section>
 <section id="volume">
@@ -204,7 +204,7 @@ Output format      96000 Hz / 24 bit PCM
 Filter             poly-sinc-gauss-long
 Shaper             TPDF
 Processing speed   30.3x realtime</code></pre>
-<p>HQPlayer reports the filter <em>really</em> in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.</p>
+<p>HQPlayer reports the filter <em>really</em> in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.</p>
 <p><strong>The Apps entry</strong> behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's <strong>settings</strong> — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport <strong>id</strong>, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.</p>
 </section>
 <section id="known-limitations">

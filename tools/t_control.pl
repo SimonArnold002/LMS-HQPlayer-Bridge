@@ -3,18 +3,11 @@ BEGIN { package main; use constant DEBUGLOG=>0; use constant INFOLOG=>0; use con
 use lib '.';
 require Plugins::HQPlayerBridge::Control;
 my $C = 'Plugins::HQPlayerBridge::Control';
+my $ex = \&Plugins::HQPlayerBridge::Control::_extractMessage;
 my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
   if ($got eq $want){$pass++; printf "  ok   %s\n",$name}
   else {$fail++; printf "  FAIL %s\n        got: %s\n       want: %s\n",$name,$got,$want} }
-
-print "-- _completeResponse --\n";
-my $cr = \&Plugins::HQPlayerBridge::Control::_completeResponse;
-is(defined $cr->('<?xml version="1.0"?><Status state="Playing"/>') ? 'complete':'partial','complete','self-closing root');
-is(defined $cr->('<?xml version="1.0"?><Status state="Play') ? 'complete':'partial','partial','truncated mid-attribute');
-is(defined $cr->('<?xml version="1.0"?><PlaylistGet><Track a="1"/></PlaylistGet>')?'complete':'partial','complete','nested with close tag');
-is(defined $cr->('<?xml version="1.0"?><PlaylistGet><Track a="1"/>')?'complete':'partial','partial','nested, close tag not yet arrived');
-is(defined $cr->('<?xml version="1.0"?>')?'complete':'partial','partial','decl only');
 
 print "-- parseAttrs --\n";
 my $a = $C->can('parseAttrs')->('<?xml version="1.0"?><Status state="Playing" position="42.5" rate="352800"/>');
@@ -55,7 +48,8 @@ my ($m) = $C->can('parseChildren')->($real,'metadata');
 is($m->{samplerate},'96000','metadata child samplerate');
 is($m->{bits},'24','metadata child bits');
 is($m->{song},'HTTP stream','metadata song - HQPlayer ignores tags for http sources');
-is(defined $cr->($real) ? 'complete':'partial','complete','real Status frames as complete');
+my $realbuf = $real;
+is(defined $ex->(\$realbuf) ? 'complete':'partial','complete','real Status frames as complete');
 
 # min/sec fallback for position
 my $ms = $C->can('parseAttrs')->('<Status state="2" min="2" sec="33"/>');
@@ -63,14 +57,14 @@ is(($ms->{min}*60)+$ms->{sec},'153','min/sec pair reassembles to seconds');
 
 # unknown command reply must read as an error, and must frame cleanly
 my $err = '<?xml version="1.0" encoding="utf-8"?><GetVolume result="Error">Unknown command</GetVolume>';
-is(defined $cr->($err)?'complete':'partial','complete','error reply frames (close tag)');
+my $errbuf = $err;
+is(defined $ex->(\$errbuf) ? 'complete':'partial','complete','error reply frames (close tag)');
 is($C->can('parseAttrs')->($err)->{result},'Error','error reply result=Error');
 
 my $gt = $C->can('parseAttrs')->('<?xml version="1.0" encoding="utf-8"?><GetTransport arg="" value="240"/>');
 is($gt->{value},'240','GetTransport is a numeric id, not a device name');
 
 print "-- _extractMessage (framing a pushed Status stream) --\n";
-my $ex = \&Plugins::HQPlayerBridge::Control::_extractMessage;
 my $D  = '<?xml version="1.0" encoding="utf-8"?>';
 
 my $buf = $D.'<PlaylistClear result="OK"/>';
@@ -218,6 +212,30 @@ print "-- the reconnect ladder must climb against a peer that accepts and drops 
 
     is( join( ',', @waits ), '2,4,8,16,32,60,60',
         "it doubles from ${min}s and caps at ${max}s" );
+}
+
+print "-- superseded track work is removed before it reaches HQPlayer --\n";
+{
+    my @failed;
+    my $ctl = bless {
+        name  => 'test',
+        queue => [
+            { verb => 'PlaylistClear', scope => 'track' },
+            { verb => 'PlaylistAdd', scope => 'track', cb => sub { push @failed, [@_] } },
+            { verb => 'Volume' },
+            { verb => 'Status', scope => 'link' },
+        ],
+    }, 'Plugins::HQPlayerBridge::Control';
+
+    is( $ctl->cancelQueued('track'), '2',
+        'both waiting commands belonging to the old track are cancelled' );
+    is( join( ',', map { $_->{verb} } @{ $ctl->{queue} } ), 'Volume,Status',
+        'unrelated volume and link work stays in order' );
+    is( scalar(@failed), '1', 'a cancelled request still settles its callback' );
+    is( defined $failed[0][0] ? 'success' : 'failed', 'failed',
+        'using the same failed-callback contract as a dropped link' );
+    is( defined $failed[0][1] ? 'raw' : 'no raw', 'no raw',
+        'and does not invent an HQPlayer reply' );
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
