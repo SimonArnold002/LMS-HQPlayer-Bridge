@@ -20,7 +20,7 @@ Tested on LMS 9.x against **HQPlayer Embedded 6** feeding an NAA endpoint.
 | **Streaming at full rate** | Qobuz and Tidal are fetched by HQPlayer straight from the service; Deezer and radio go through LMS | The matching service plugin |
 | **Gapless** | Library and direct streaming hand the next track over early, so HQPlayer makes the join itself | Nothing |
 | **ReplayGain everywhere** | Library *and* streaming normalised using exactly the figure LMS worked out | Replay gain not set to Off |
-| **Artwork on the endpoint** | Cover art reaches HQPlayer and its display, from your library or a service | Nothing |
+| **Artwork on the endpoint** | Cover art reaches HQPlayer and its display, from your library or a service, and stays with its own track across a gapless hand-over | Nothing |
 | **Volume, both ways** | The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider | Nothing |
 | **Pause from either end** | Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second | Nothing |
 | **Stable player identity** | Prefs, playlist and sync group survive HQPlayer changing IP address | Nothing |
@@ -73,7 +73,7 @@ The plugin picks the route per track. You don't configure any of this.
 
 Everything is addressed by URL, so nothing about your files needs to match between the two machines.
 
-Where a track is pre-queued, HQPlayer has the next one in its own playlist before the current ends and makes the join itself. On the last route the next track loads when the current one finishes — about half a second, against roughly a second and a half of audio already in flight, so nothing is heard.
+Where a track is pre-queued, HQPlayer has the next one in its own playlist before the current ends and makes the join itself. A pre-queue HQPlayer is slow to acknowledge, or turns down outright, still reaches the next track — the bridge falls back to a normal load rather than losing it, and a stop at HQPlayer's own front end is told apart from the playlist simply running out. On the last route the next track loads when the current one finishes — about half a second, against roughly a second and a half of audio already in flight, so nothing is heard.
 
 **ReplayGain** is sent with the track, exactly as LMS calculated it — nothing scaled or trimmed, and a *boost* goes through in full. This covers streaming, where there are no tags, and beats letting HQPlayer read library tags itself, which it does at the moment playback starts and so misses the first tracks of a fresh album. LMS's choice between album and track gain is the one you get. A track LMS has no figure for is left completely alone. If you have HQPlayer's **convolution gain compensation** set, that applies on top — deliberately not cancelled out.
 
@@ -102,7 +102,7 @@ Shaper             TPDF
 Processing speed   30.3x realtime
 ```
 
-HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.
+HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.
 
 **The Apps entry** behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's **settings** — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport **id**, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.
 
