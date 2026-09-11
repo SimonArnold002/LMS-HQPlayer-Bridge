@@ -4,6 +4,13 @@ All notable changes to **HQPlayer Bridge** are recorded here. This file records
 what users receive: one entry per release published to `main`. Per-version
 development notes live in `CLAUDE.md`.
 
+## 1.0.0 — 2026-09-11
+
+**First stable release.** No functional change from 0.2.87 — this build marks
+the plugin as feature-complete and ready for general use, and is the version
+submitted to Lyrion's own plugin repository. See the 0.2.87 entry below, and
+the full per-version history in `CLAUDE.md`, for everything that led here.
+
 ## 0.2.87 — 2026-09-11
 
 A reliability release for track hand-overs, pre-queuing and control-command
