@@ -199,7 +199,8 @@ print "-- a remote track gets artist and album from the handler --\n";
     ok(scalar($m =~ m{\bartist="Alex Warren"}), 'artist comes from the protocol handler');
     ok(scalar($m =~ m{\balbum="WILDCHILD"}),    'album comes from the protocol handler');
     ok(scalar($m =~ m{\bsong="ONLY THING LEFT"}), 'so does the title when the row has none');
-    ok(scalar($m =~ m{\bcover="http://resources\.tidal\.com/}), 'artwork still works');
+    ok(scalar($m =~ m{\bcover="http://127\.0\.0\.1:\d+/imageproxy/http%3A%2F%2Fresources\.tidal\.com%2F[^"]*/image_600x600_o\.jpg"}),
+       'artwork still works - through the image proxy, capped');
     ok(scalar($m =~ m{\blength="215"}), 'and the duration is still sent');
 
     # a library track never reaches the handler at all (_handlerMeta returns {}
@@ -572,8 +573,55 @@ my $rart = $c->_coverURL($remote);
 ok(defined $rart && $rart =~ m{/imageproxy/}, 'remote cover comes from the protocol handler');
 ok($rart !~ m{/music/-}, 'remote cover does NOT use the negative track id');
 
+is($rart, 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fstatic.qobuz.com%2Fx.jpg/image_600x600_o.jpg',
+   'a handler imageproxy path is sized in place, not proxied a second time');
+
+# THE ENDPOINT FETCHES EVERY COVER FROM LMS, NOT FROM THE SERVICE (2026-09-14).
+# Artwork gaps on the Eversolo were more common on streaming, and the one thing
+# that differed from a local cover was the route: HTTPS to a CDN on the internet
+# against plain HTTP to LMS.  So a service URL goes through the image proxy.
 Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerAbs');
-is($c->_coverURL($remote), 'https://static.qobuz.com/direct.jpg', 'an absolute handler URL is passed through unchanged');
+is($c->_coverURL($remote),
+   'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fstatic.qobuz.com%2Fdirect.jpg/image_600x600_o.jpg',
+   'an absolute service URL goes out through the image proxy, at ART_SIZE');
+
+{
+    package FakeHandlerSized;   # a proxy path that already carries a spec
+    sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
+    sub getMetadataFor { return { cover => '/imageproxy/https%3A%2F%2Fa.b%2Fc.jpg/image_300x300_f.jpg' } }
+    package FakeHandlerIcon;    # a plugin's own relative icon - not a proxy path
+    sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
+    sub getMetadataFor { return { icon => '/plugins/Foo/html/images/icon.png' } }
+    package FakeHandlerOwn;     # an absolute URL on THIS server
+    sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
+    sub getMetadataFor { return { cover => 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Fd.jpg/image.jpg' } }
+}
+
+Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerSized');
+is($c->_coverURL($remote), 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Fc.jpg/image_600x600_o.jpg',
+   'a spec already on the path is REPLACED, not stacked');
+
+# CONTROL: the size spec is for proxy paths only.  A plugin icon is served by
+# LMS's plain web handler, which would 404 on a spec it does not understand.
+Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerIcon');
+is($c->_coverURL($remote), 'http://127.0.0.1:9000/plugins/Foo/html/images/icon.png',
+   'a relative non-proxy path is left exactly as it was');
+
+Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerOwn');
+is($c->_coverURL($remote), 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Fd.jpg/image_600x600_o.jpg',
+   'an absolute URL on this server is sized, never proxied through LMS a second time');
+
+# CONTROL: with no proxy available the service URL still goes out - the
+# behaviour before this change, never a blank.
+{
+    no warnings 'redefine';
+    my $real = \&Slim::Web::ImageProxy::proxiedImage;
+    *Slim::Web::ImageProxy::proxiedImage = sub { die "no web stack\n" };
+    Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerAbs');
+    is($c->_coverURL($remote), 'https://static.qobuz.com/direct.jpg',
+       'no image proxy -> the service URL, unchanged, rather than no cover');
+    *Slim::Web::ImageProxy::proxiedImage = $real;
+}
 
 Slim::Player::ProtocolHandlers->_setTestHandler(undef);
 is($c->_coverURL($remote), '(undef)', 'no handler artwork -> no cover attribute rather than a bad one');
