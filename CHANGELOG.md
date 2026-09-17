@@ -4,6 +4,34 @@ All notable changes to **HQPlayer Bridge** are recorded here. This file records
 what users receive: one entry per release published to `main`. Per-version
 development notes live in `CLAUDE.md`.
 
+## 1.0.2 — 2026-09-17
+
+Streamed cover art now reaches the endpoint from Lyrion on your own network,
+instead of from the streaming service over the internet.
+
+### Improvements
+
+- **Streaming covers are served by Lyrion.** Qobuz, Tidal, Spotify and radio
+  artwork now goes out through Lyrion's image proxy, so the endpoint fetches
+  every cover from the server on the LAN, just as it already did for library
+  albums. It no longer has to open an HTTPS connection to a service's CDN at
+  every track change.
+- **Streaming covers are sized like library covers.** Every cover is capped at
+  600x600, so large service artwork such as Tidal's 1280x1280 no longer goes to
+  the endpoint at full size.
+
+### Fixes
+
+- **Covers with no file type stay JPEGs.** Some services (Spotify, for example)
+  hand out cover URLs with no file extension. The proxy would have re-encoded
+  them as PNGs about three times the size; they are now requested as JPEGs.
+
+### Behaviour change
+
+- **A dead streaming cover now shows a radio icon.** When a service's cover
+  link has expired or can't be fetched, the endpoint shows Lyrion's radio
+  placeholder, as Lyrion's own screens do, where it used to show nothing.
+
 ## 1.0.0 — 2026-09-11
 
 **First stable release.** No functional change from 0.2.87 — this build marks

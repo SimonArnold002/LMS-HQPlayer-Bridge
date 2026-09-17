@@ -4633,7 +4633,11 @@ fix). Player suite 442/0, all five suites clean (774/0 fleet-wide after the
 **A dead cover shows `radio.png` — ACCEPTED, Simon's call.** See the index row
 `The image proxy answers a dead cover with 200 and radio.png`.
 
-## 1.0.2 (2026-09-17): the extensionless-cover fix above, built and unpushed
+## 1.0.2 (2026-09-17): the extensionless-cover fix above — RELEASED to main 2026-09-17
+
+Pushed to dev, then merged to `main` and tagged `v1.0.2` on 2026-09-17. The
+CHANGELOG entry covers 1.0.1 + 1.0.2 as one release; the zip is the 1.0.2 dev
+build, unchanged (docs are not in the zip, so no rebuild or bump).
 
 DEV BUILD. Ships exactly the one FIXED finding from the 2026-09-17 review
 above (`_remoteArt` asks for `.jpg` when `proxiedImage`'s `.png` ext was only a
