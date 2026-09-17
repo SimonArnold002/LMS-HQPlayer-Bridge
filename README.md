@@ -20,7 +20,7 @@ Tested on LMS 9.x against **HQPlayer Embedded 6** feeding an NAA endpoint.
 | **Streaming at full rate** | Qobuz and Tidal are fetched by HQPlayer straight from the service; Deezer and radio go through LMS | The matching service plugin |
 | **Gapless** | Library and direct streaming hand the next track over early, so HQPlayer makes the join itself | Nothing |
 | **ReplayGain everywhere** | Library *and* streaming normalised using exactly the figure LMS worked out | Replay gain not set to Off |
-| **Artwork on the endpoint** | Cover art reaches HQPlayer and its display, from your library or a service, and stays with its own track across a gapless hand-over | Nothing |
+| **Artwork on the endpoint** | Cover art reaches HQPlayer and its display, from your library or a service, served by LMS on your network at up to 600x600, and stays with its own track across a gapless hand-over | Nothing |
 | **Volume, both ways** | The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider | Nothing |
 | **Pause from either end** | Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second | Nothing |
 | **Stable player identity** | Prefs, playlist and sync group survive HQPlayer changing IP address | Nothing |

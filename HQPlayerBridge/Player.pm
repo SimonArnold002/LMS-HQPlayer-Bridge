@@ -576,11 +576,11 @@ sub _addAttrs {
 # load was routed over UPnP for months on the belief that DIDL was the only
 # channel that could carry a cover.  It is not.
 #
-# ARTWORK IS CAPPED AT ART_SIZE ON THE LOCAL ROUTE - see _coverURL.  The
-# endpoint's display is the consumer, and it has to hold whatever is sent;
-# Simon's read on the Eversolo is that it does not like anything larger.  This
-# bounds the LOCAL route only.  A REMOTE track's cover is the service's own URL
-# and goes out untouched (Qobuz already serves 600, others are not checked).
+# ARTWORK IS CAPPED AT ART_SIZE ON BOTH ROUTES - see _coverURL and _remoteArt.
+# The endpoint's display is the consumer, and it has to hold whatever is sent;
+# Simon's read on the Eversolo is that it does not like anything larger.  A
+# LOCAL cover is LMS's own resize; a REMOTE one goes through LMS's image proxy,
+# so the endpoint fetches every cover from LMS on the LAN.
 use constant ART_SIZE => '600x600';
 
 # THE ARTWORK FIELD IS `cover`, AND IT TAKES A PLAIN URL.  Verified against the
@@ -905,12 +905,7 @@ sub _coverURL {
 
         my $art = $meta->{cover} || $meta->{coverart} || $meta->{icon} || $meta->{artwork_url};
 
-        if ($art) {
-            return $art if $art =~ m{^https?://};
-            return $self->_serverBase . ( $art =~ m{^/} ? $art : "/$art" );
-        }
-
-        return undef;
+        return $art ? $self->_remoteArt($art) : undef;
     }
 
     # Local track: the direct route serves the real file.
@@ -937,6 +932,80 @@ sub _coverURL {
     # LMS resizes on demand and caches the result, so this costs one resize per
     # album, once.
     return $self->_serverBase . '/music/' . $id . '/cover_' . ART_SIZE . '_o.jpg';
+}
+
+# A remote track's cover, served by LMS's image proxy at ART_SIZE.
+#
+# THE ENDPOINT FETCHES FROM LMS ON THE LAN, NOT FROM THE SERVICE.  Handed the
+# service's own URL, the endpoint had to resolve and open HTTPS to a CDN on the
+# internet at every track change; a local cover is one plain-HTTP request to
+# LMS.  Reported 2026-09-14: artwork gaps on the Eversolo are more common on
+# streaming, and the cover itself is not the difference - measured, Qobuz's is a
+# 600x600 baseline JPEG of 21 KB, smaller than the local one.  The route is.
+#
+# It also caps every service at ART_SIZE, which the local route already was.
+# Qobuz serves 600, but Tidal hands out 1280x1280 and the others are unchecked.
+#
+# proxiedImage is LMS's own: `/imageproxy/<uri_escape_utf8(url)>/image<ext>`,
+# ext taken from the source URL.  The size goes in before the ext, the same
+# spec Material uses.  Verified live 2026-09-14 on a Qobuz cover: 200,
+# image/jpeg, 600x600 / 26 KB in 16-70 ms.  With an EXTERNAL image proxy
+# configured LMS still fetches server-side and answers 200 itself - it does not
+# redirect, which matters because HQPlayer does not follow a 302.
+#
+# Required at call time and never assumed: a server without the web stack has no
+# proxy, and then the cover goes out as the service URL, exactly as before.
+#
+# A DEAD COVER COMES BACK AS LMS's radio.png, NOT AS AN ERROR - accepted
+# 2026-09-17, Simon's call.  The proxy answers a failed fetch with 200 and its
+# own placeholder (9.1 has the status line commented out), so the endpoint shows
+# a radio icon where it used to show nothing, and nothing here sees the miss.
+sub _remoteArt {
+    my ( $self, $art ) = @_;
+
+    my $base = $self->_serverBase;
+    my $path = $art;
+
+    if ( $art =~ m{^https?://} ) {
+        if ( index( $art, "$base/" ) == 0 ) {
+            # already on this server - work on its path, never proxy LMS itself
+            $path = substr( $art, length $base );
+        }
+        else {
+            my $proxied = eval {
+                require Slim::Web::ImageProxy;
+                Slim::Web::ImageProxy::proxiedImage($art);
+            };
+
+            return $art unless defined $proxied && $proxied =~ m{^/imageproxy/};
+
+            $path = $proxied;
+        }
+    }
+
+    $path = "/$path" unless $path =~ m{^/};
+
+    # Only a proxy path takes a size spec.  Any spec already there is REPLACED,
+    # not stacked: `image_300x300_f.jpg` becomes `image_600x600_o.jpg`.  `_o`
+    # for the same reason as the local route - fit, no padding.
+    #
+    # THE EXT IS THE OUTPUT FORMAT, AND `.png` MAY BE A GUESS.  proxiedImage
+    # falls back to `.png` when the source URL names no image type, and the
+    # proxy then re-encodes to whatever the ext says.  Spotify's covers have no
+    # ext: measured live 2026-09-17, an 8 KB 300x300 JPEG came back as a 26 KB
+    # PNG, and as a 7 KB JPEG when asked for `.jpg`.  So a guessed `.png` asks
+    # for `.jpg`, the same as the local route.  The test is LMS's own, on the
+    # escaped URL (`.` is never escaped); a source that IS a png stays one.
+    if ( $path =~ m{^(/imageproxy/([^/]+)/image)(?:_[^/.]*)?(\.[A-Za-z]+)$} ) {
+        # copied out first: the ext test below is a match, and resets $1..$3
+        my ( $head, $src, $ext ) = ( $1, $2, $3 );
+
+        $ext = '.jpg' if $ext eq '.png' && $src !~ /\.(?:jpg|jpeg|png|gif)/;
+
+        $path = $head . '_' . ART_SIZE . '_o' . $ext;
+    }
+
+    return $base . $path;
 }
 
 # --- artwork continuity -----------------------------------------------------
