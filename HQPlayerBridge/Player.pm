@@ -955,6 +955,11 @@ sub _coverURL {
 #
 # Required at call time and never assumed: a server without the web stack has no
 # proxy, and then the cover goes out as the service URL, exactly as before.
+#
+# A DEAD COVER COMES BACK AS LMS's radio.png, NOT AS AN ERROR - accepted
+# 2026-09-17, Simon's call.  The proxy answers a failed fetch with 200 and its
+# own placeholder (9.1 has the status line commented out), so the endpoint shows
+# a radio icon where it used to show nothing, and nothing here sees the miss.
 sub _remoteArt {
     my ( $self, $art ) = @_;
 
@@ -983,8 +988,22 @@ sub _remoteArt {
     # Only a proxy path takes a size spec.  Any spec already there is REPLACED,
     # not stacked: `image_300x300_f.jpg` becomes `image_600x600_o.jpg`.  `_o`
     # for the same reason as the local route - fit, no padding.
-    $path =~ s{^(/imageproxy/[^/]+/image)(?:_[^/.]*)?(\.[A-Za-z]+)$}
-              {$1 . '_' . ART_SIZE . '_o' . $2}e;
+    #
+    # THE EXT IS THE OUTPUT FORMAT, AND `.png` MAY BE A GUESS.  proxiedImage
+    # falls back to `.png` when the source URL names no image type, and the
+    # proxy then re-encodes to whatever the ext says.  Spotify's covers have no
+    # ext: measured live 2026-09-17, an 8 KB 300x300 JPEG came back as a 26 KB
+    # PNG, and as a 7 KB JPEG when asked for `.jpg`.  So a guessed `.png` asks
+    # for `.jpg`, the same as the local route.  The test is LMS's own, on the
+    # escaped URL (`.` is never escaped); a source that IS a png stays one.
+    if ( $path =~ m{^(/imageproxy/([^/]+)/image)(?:_[^/.]*)?(\.[A-Za-z]+)$} ) {
+        # copied out first: the ext test below is a match, and resets $1..$3
+        my ( $head, $src, $ext ) = ( $1, $2, $3 );
+
+        $ext = '.jpg' if $ext eq '.png' && $src !~ /\.(?:jpg|jpeg|png|gif)/;
+
+        $path = $head . '_' . ART_SIZE . '_o' . $ext;
+    }
 
     return $base . $path;
 }

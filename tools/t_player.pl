@@ -592,6 +592,12 @@ is($c->_coverURL($remote),
     package FakeHandlerIcon;    # a plugin's own relative icon - not a proxy path
     sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
     sub getMetadataFor { return { icon => '/plugins/Foo/html/images/icon.png' } }
+    package FakeHandlerNoExt;   # Spotify: the cover URL names no image type
+    sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
+    sub getMetadataFor { return { cover => 'https://i.scdn.co/image/ab67616d00001e02db216ca805faf5fe35df4ee6' } }
+    package FakeHandlerPng;     # a source that really is a png
+    sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
+    sub getMetadataFor { return { cover => 'https://a.b/logo.png' } }
     package FakeHandlerOwn;     # an absolute URL on THIS server
     sub can { my ($s,$m)=@_; return $m eq 'getMetadataFor' ? sub {} : undef }
     sub getMetadataFor { return { cover => 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Fd.jpg/image.jpg' } }
@@ -600,6 +606,20 @@ is($c->_coverURL($remote),
 Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerSized');
 is($c->_coverURL($remote), 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Fc.jpg/image_600x600_o.jpg',
    'a spec already on the path is REPLACED, not stacked');
+
+# proxiedImage GUESSES `.png` for a URL with no ext, and the ext is the proxy's
+# output format - a JPEG cover re-encoded as a PNG is several times the size.
+Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerNoExt');
+my $noext = $c->_coverURL($remote);
+is($noext, 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fi.scdn.co%2Fimage%2Fab67616d00001e02db216ca805faf5fe35df4ee6/image_600x600_o.jpg',
+   'a cover URL with no ext asks the proxy for a jpg, not the guessed png');
+ok(Slim::Web::ImageProxy::proxiedImage('https://i.scdn.co/image/x') =~ m{/image\.png$},
+   'CONTROL: the stub still guesses .png, so the line above is the fix and not the stub');
+
+# CONTROL: a real png source keeps its format.
+Slim::Player::ProtocolHandlers->_setTestHandler('FakeHandlerPng');
+is($c->_coverURL($remote), 'http://127.0.0.1:9000/imageproxy/https%3A%2F%2Fa.b%2Flogo.png/image_600x600_o.png',
+   'a source that names .png is still asked for as a png');
 
 # CONTROL: the size spec is for proxy paths only.  A plugin icon is served by
 # LMS's plain web handler, which would 404 on a spec it does not understand.

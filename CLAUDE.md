@@ -53,6 +53,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `_completeResponse` vs `_extractMessage`, two framers in `Control.pm` | REMOVED in 0.2.83 — it was dead, kept alive only by its own test | `was dead, and only its own test kept it alive` |
 | `nowPlayingFor` still building an UNBOUNDED `/music/<id>/cover.jpg` for the live page | DELIBERATE 0.2.84 — its consumer is a browser, not the endpoint | `THE SECOND CARRIER, LEFT ALONE ON PURPOSE` |
 | a remote track's cover not being size-capped like the local one | REVERSED 1.0.1, Simon's call — remote covers now go through LMS's image proxy at ART_SIZE (`_remoteArt`) | `THE REMOTE ROUTE NOW GOES THROUGH THE IMAGE PROXY` |
+| `_remoteArt`, a dead / unfetchable cover showing LMS's `radio.png` | ACCEPTED 2026-09-17, Simon's call — no bridge-side detection | `The image proxy answers a dead cover with 200 and radio.png` |
 | `flush()`'s `<PlaylistClear/>` dropped by `cancelQueued('track')` | MOOT 2026-09-11 — both `_newGeneration` callers cover it | `` `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` `` |
 
 **Two standing rules that kill most repeat findings:**
@@ -116,6 +117,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | A pending hand-over proves the held track has NEVER PLAYED, so loading it at expiry restarts nothing the listener has heard (`Player.pm`, `_endOfStream`) | **INCOMPLETE** 2026-09-10, fixed in 0.2.82 | True whenever `_handedOver` is right, and `_handedOver` can be wrong in the MISSING direction: it returns 0 before the `PlaylistAdd` ack, it treats a non-matching uri as a **veto** rather than a hint, and on tier 5 every reported uri strips to the same string so the index is all it has. A real advance that trips one of those leaves `hqNext` set on a track HQPlayer then plays to the end — and 0.2.81's new `mode eq 'queue'` branch would load it again, replaying a song just heard. **Not observed live, and CLOSED that way deliberately: it cannot be provoked from outside.** Every route needs `_handedOver` to fail spontaneously, which no playlist, service or transport action can force. **So the guard reports itself instead of being tested**: whenever it suppresses a reload it logs `the hand-over was entered after all (cursor N -> M) - not reloading it`. That line appearing in the wild IS the measurement. If it never appears, the case never happens and the guard costs one comparison. Fixed by stamping the cursor onto the held item at append time and reloading only when it has since moved AT MOST ONCE. **This is not row 38 re-proposed** — see §0.2.82. |
 | `_appendTrack` stamps the cursor as it stands at the append, so the held item always carries the value HQPlayer was at when it was queued (`Player.pm`, `_onStatus` / `_appendTrack`) | **WRONG** 2026-09-11, fixed in 0.2.85 and rebuilt as 0.2.86 | True for the FIRST append of a run and **stale for every one chained off a hand-over** — track 3 onward. `_onStatus` called `_handedOver` ~50 lines ABOVE `$self->hqTrackSerial($serial)`, and `_handedOver` ends in `_armNextTrack` -> `playerReadyToStream`, which real LMS answers by re-entering `play()` SYNCHRONOUSLY for a LOCAL track — chain walked in LMS `public/9.0`: ReadyToStream -> _NextIfMore -> _getNextTrack -> `getNextSong` (a file has no `scanUrl` and no `getNextTrack`, so it falls to "the simple case" and calls its success callback INLINE) -> NextTrackReady -> _StreamIfReady -> _Stream -> `play()`, every step a direct call with no timer. So `_appendTrack` ran INSIDE the push and stamped the PREVIOUS cursor, one low. `_endOfStream` then read the difference as 2 rather than 1, decided the held track had already played, and reported end of playlist — reintroducing the 20:47:59 mid-album stop for every boundary but the first. **Tier 5 is unaffected** (the service handler DOES implement `getNextTrack`, so the append lands after the store) and tier 4 never pre-queues; this is tier 1/3, local files. Bounded in one direction only: a stale stamp can suppress a reload, never cause a spurious one, so nothing is ever replayed. **Nothing released was affected — `main` ships 0.2.77**, and the cursor arrived in 0.2.81. Invisible to the suites because `LoadController` answers `playerReadyToStream` through AUTOLOAD and never re-enters `play()`, so only the first append was ever exercised. Fixed by moving the cursor read and store ABOVE the hand-over check, `$seenSerial`/`$cursorMoved` still captured before the store. See §0.2.85-0.2.86. |
 | `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` before it reaches the wire, so a deleted pre-queued track is left in HQPlayer's playlist until the next full load (`Player.pm`, `flush` / `_newGeneration`) | **MOOT** 2026-09-11 — raised in review, verified here, NO code change | The cancel is real; the consequence is not. `cancelQueued` has exactly one caller, `_newGeneration`, and that has exactly two: `_startTrack` and `stop()`. **Both cover the clear they cancel.** Down `_startTrack` the very next call is `_queueTrack`, which re-sends `<Stop/>` + `<PlaylistClear/>` in the NEW generation — so the cancel removes a redundant clear that the load's own clear supersedes, which is what the scope is for. Down `stop()` the item genuinely does survive, and it cannot be reached: the engine is stopped, `stop()` zeroes `hqStarted` and `hqPlayAck` so `_canHandOver` refuses every hand-over, and the only route back to playback is `play()` → `_startTrack`, which opens Stop + PlaylistClear. Nothing can play the stale item, and `resume()` is not that route — LMS reaches it from `pause()`, never from a stop. **The stated consequence is the DESIGNED steady state, not a defect**: `_appendTrack` only ever adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer's list is a HISTORY of the run and every track already played sits in it on exactly the same terms. Trimming it was offered and declined — see `HQPlayer's playlist should show the whole LMS queue`. **No writer reaches the harmful branch**, which is the whole verdict: the review named a branch, not a route to it. Suite green at the time of checking (62 + 133 + others, 0 failed). |
+| The image proxy answers a dead cover with 200 and radio.png, so since 1.0.1 an expired CDN link or dead station logo shows a radio icon on the endpoint where it used to show nothing (`Player.pm` `_remoteArt`) | **ACCEPTED** 2026-09-17, Simon's call | Measured live: a 404 origin through `/imageproxy/.../image_600x600_o.jpg` answers `200 image/png`, 41,647 B, LMS's 512x512 `radio.png`. In 9.1 `_artworkError` has `$response->code($code)` commented out, so no status reaches the endpoint; only `Cache-Control: no-cache` and a past `Expires` mark it. `_coverURL` still returns a URL, so `_reusableArt` never runs and the log shows no miss. Detecting it would need the bridge to serve its own cover route and turn that header into a 404; declined as not worth the LMS-internals dependency. It is what LMS's own screens show for a dead cover. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -4615,6 +4617,32 @@ If gaps on streaming fall to the local rate, the internet fetch was the cause
 and this stays. If they do not, the gap is the Eversolo's own rendering -
 see the Eversolo NAA note in memory - and this change can be judged on the
 size cap alone.
+
+### Review 2026-09-17: two findings, both verified live — the fix shipped as 1.0.2
+
+**Extensionless covers were re-encoded as PNG — FIXED, shipped as 1.0.2.**
+`proxiedImage` guesses `.png` when the source URL names no image type, and the
+proxy's output format is the ext. Spotify covers have none: a real 300x300 JPEG
+of 8,304 B came back as a 25,746 B PNG, and as a 7,186 B JPEG when asked for
+`.jpg`. `_remoteArt` now asks for `.jpg` when the `.png` was a guess (LMS's own
+ext test, run on the escaped URL); a source that names `.png` stays a png. Two
+assertions and one control (the stub still guesses `.png`, so the pass is the
+fix). Player suite 442/0, all five suites clean (774/0 fleet-wide after the
+1.0.2 rebuild).
+
+**A dead cover shows `radio.png` — ACCEPTED, Simon's call.** See the index row
+`The image proxy answers a dead cover with 200 and radio.png`.
+
+## 1.0.2 (2026-09-17): the extensionless-cover fix above, built and unpushed
+
+DEV BUILD. Ships exactly the one FIXED finding from the 2026-09-17 review
+above (`_remoteArt` asks for `.jpg` when `proxiedImage`'s `.png` ext was only a
+guess) plus its two new assertions and one control in `tools/t_player.pl`. The
+ACCEPTED `radio.png` finding is documentation only, no code change, so it
+ships alongside but is not itself the reason for the bump. No cache-key
+prefixes exist in this plugin to clear; the image-proxy URL changes with the
+ext, so LMS's own imageproxy cache self-invalidates. 774 assertions across five
+suites, 0 failed, sweep clean. Not yet installed live.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
