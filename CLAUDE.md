@@ -120,6 +120,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` before it reaches the wire, so a deleted pre-queued track is left in HQPlayer's playlist until the next full load (`Player.pm`, `flush` / `_newGeneration`) | **MOOT** 2026-09-11 — raised in review, verified here, NO code change | The cancel is real; the consequence is not. `cancelQueued` has exactly one caller, `_newGeneration`, and that has exactly two: `_startTrack` and `stop()`. **Both cover the clear they cancel.** Down `_startTrack` the very next call is `_queueTrack`, which re-sends `<Stop/>` + `<PlaylistClear/>` in the NEW generation — so the cancel removes a redundant clear that the load's own clear supersedes, which is what the scope is for. Down `stop()` the item genuinely does survive, and it cannot be reached: the engine is stopped, `stop()` zeroes `hqStarted` and `hqPlayAck` so `_canHandOver` refuses every hand-over, and the only route back to playback is `play()` → `_startTrack`, which opens Stop + PlaylistClear. Nothing can play the stale item, and `resume()` is not that route — LMS reaches it from `pause()`, never from a stop. **The stated consequence is the DESIGNED steady state, not a defect**: `_appendTrack` only ever adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer's list is a HISTORY of the run and every track already played sits in it on exactly the same terms. Trimming it was offered and declined — see `HQPlayer's playlist should show the whole LMS queue`. **No writer reaches the harmful branch**, which is the whole verdict: the review named a branch, not a route to it. Suite green at the time of checking (62 + 133 + others, 0 failed). |
 | The image proxy answers a dead cover with 200 and radio.png, so since 1.0.1 an expired CDN link or dead station logo shows a radio icon on the endpoint where it used to show nothing (`Player.pm` `_remoteArt`) | **ACCEPTED** 2026-09-17, Simon's call | Measured live: a 404 origin through `/imageproxy/.../image_600x600_o.jpg` answers `200 image/png`, 41,647 B, LMS's 512x512 `radio.png`. In 9.1 `_artworkError` has `$response->code($code)` commented out, so no status reaches the endpoint; only `Cache-Control: no-cache` and a past `Expires` mark it. `_coverURL` still returns a URL, so `_reusableArt` never runs and the log shows no miss. Detecting it would need the bridge to serve its own cover route and turn that header into a 404; declined as not worth the LMS-internals dependency. It is what LMS's own screens show for a dead cover. |
 | The live page's service badge is drawn only where Material is installed: `loadEmblems()` fetches `/material/html/misc/emblems.json` and the logo comes from `/material/svg/<name>`, so on a server without Material the fetch 404s, `EMBLEMS` stays null and no badge is ever drawn (`Live.pm`, `np-badge`) | **BY DESIGN** 2026-09-20, Simon's call: "only material shows badges so this is expected" - badge itself **VERIFIED LIVE** on 1.0.3 | **Only Material shows badges, and that is the whole point** — the badge exists to match the one Material already draws on LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows, so it uses Material's own emblem table and its own recoloured logos rather than a copy that would drift the moment Material changes a colour or adds a service. A skin that draws no badges anywhere has nothing to match, and a fallback drawn from some other asset would be a second, divergent badge. The fetch failing costs the badge and nothing else on the page. **Not a defect, and not a gap to fill with a fallback.** |
+| One host on TWO interfaces (Ethernet + Wi-Fi) could split into two players, and nothing de-duplicates them by machine (`_idsFor`, `tools/probe_identity.py`) | **PARKED** 2026-09-20, Simon: "dont implement this yet" - measured, not built | `one host on two interfaces` - the licence `fingerprint` is the candidate key (128-bit, stable across a restart, present even at `valid="0"`); the rig has never reached the address-qualifying branch, and the open question is what address the host has on Ethernet |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -2152,6 +2153,46 @@ immunity, and a name more than one instance answers to is qualified by address
 for all of them — id *and* display name, since two identically named players
 are unusable anyway. Re-keying when a second instance appears costs that
 player's prefs once; the thrash cost them every round.
+
+### PARKED: one host on two interfaces (2026-09-20)
+
+**Simon's instruction: "dont implement this yet". This is a PARKED scope
+decision, not a gap - do not report the absence of any of it as a finding.**
+
+The question, from a session running alongside the 1.0.x badge work: when a
+machine has both Ethernet and Wi-Fi up, does LMS end up with two HQPlayer
+players? `_idsFor` above already qualifies a shared name by address, so two
+LIVE addresses for one daemon would split into two players.
+
+**Measured on the rig with `tools/probe_identity.py` (read-only: port 4321,
+`GetLicense` + `GetInfo`, multicast discovery, never a subnet sweep):**
+
+* **`<GetLicense/>` carries a `fingerprint`** - `M30kG1/2sPVkASFB4Uz2CA==`,
+  16 bytes base64, so 128 bits and NOT a 6-byte MAC. It came back **unchanged
+  across two runs ~1h apart spanning an hqplayerd restart**, and it is present
+  **even though `valid="0"`**, so identity by fingerprint would not depend on
+  licence state. This is the candidate key if the work is ever taken up.
+* **`GetInfo name` is NOT a second key.** It answers `HQPlayerEmbedded`, which
+  is exactly the discovery string, so it buys nothing over what `_idsFor`
+  already has. (The probe's first version compared `name` against `product`
+  instead of against the DISCOVERY name and would have called it a cheap key -
+  corrected 2026-09-20, with the reason in the code.)
+* **The rig holds ONE player, `02:ab:88:42:4c:69`** = `_idFor("HQPlayerEmbedded")`
+  exactly, plain name-derived, display name carrying no address suffix. So the
+  address-qualifying branch **has never fired there**, and the one-entry player
+  history says it has left no orphans.
+* Discovery answered from a single address (`192.168.1.109`), so the run does
+  **not** settle the two-live-address case. **The open question is what address
+  the host has on Ethernet**: if the router hands it the same one, the case
+  cannot arise on this rig at all and the whole thing is theoretical here.
+
+**Seen in the same log window and NOT diagnosed** (19:13-19:30 local
+2026-09-20): hqplayerd refused every load - `<PlaylistAdd result="Error">
+std::exception</PlaylistAdd>`, seven breaker trips, then `control link down`
+and `connect refused` twice. It recovered on its own; the badge work was
+verified live after it and played normally. **`valid="0"` is the obvious
+suspect** for an Embedded 6 throwing on `PlaylistAdd` and then exiting, but
+nothing tests that yet. See also "hqplayerd 'crashes': it is NOT crashing".
 
 ## Testing without LMS
 
