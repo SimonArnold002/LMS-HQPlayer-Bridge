@@ -558,6 +558,11 @@ moment anyone translates the strings.
 
 ### The live page's service badge (2026-09-20)
 
+**CLOSED 2026-09-20 at 1.0.7** - four review rounds, all findings fixed, the
+last round clean, installed on the rig and pushed to `dev`. The two things the
+rig could NOT prove are named in the next paragraph; they are known gaps, not
+open findings.
+
 **VERIFIED LIVE 2026-09-20** on 1.0.3, installed on the rig - Simon: "that works" -
 and again on **1.0.7**, the build carrying rounds 3 and 4: Simon, on the
 service-to-local-to-service sequence those rounds are about, *"they switch
@@ -711,7 +716,10 @@ mutation-checked.
   so not a live defect - but it is a coupling to a table fetched at runtime,
   and a future Material that splits them would need the colour moved out.
 
-**2026-09-20 REVIEW ROUND 5 - NO FINDINGS.** The badge is settled; rounds 3 and
+**2026-09-20 REVIEW ROUND 5 - NO FINDINGS. THE WHOLE BADGE ROUND IS CLOSED**
+(rounds 2-5, 1.0.3 through 1.0.7, installed + verified live, pushed to `dev`
+2026-09-20 - the PASS signal). Re-raise any of it only with new evidence
+against the entry that settled it. The badge is settled; rounds 3 and
 4 have been walked through service-to-service, service-to-local-to-service, a
 load landing during idle, a load landing after a track change, and a 404 logo,
 and the `badgeSrc` / `badgeWant` / `badgeOk` split holds on all of them. Two
