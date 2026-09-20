@@ -273,27 +273,38 @@ ok(scalar($SENT =~ /el\.badge\.style\.background = em\.bgnd/),
 # must cost the badge and nothing else.
 ok(scalar($SENT =~ /if \(xhr\.status !== 200\) \{ return; \}/),
    'a missing Material leaves EMBLEMS null rather than throwing');
-# ANCHORED ON THE ELSE, not on the class name alone: 'np-badge' is also written
-# by the img-error handler above, so a bare match passed even with this whole
-# branch deleted - and a deleted branch leaves the LAST service's badge sitting
-# over a local file's cover.
-ok(scalar($SENT =~ /np-badge on';\s*\} else \{\s*el\.badge\.className = 'np-badge';/),
+# ANCHORED ON THE ELSE BODY, not on the class name alone: 'np-badge' is also
+# written by the img-error handler above, so a bare match passed even with this
+# whole branch deleted - and a deleted branch leaves the LAST service's badge
+# sitting over a local file's cover.
+ok(scalar($SENT =~ /\} else \{\s*badgeWant = null;\s*el\.badge\.className = 'np-badge';/),
    'and an unrecognised service simply draws no badge');
 
 # Only assigned when it changes, like the artwork above: reassigning an img src
 # reloads it, and a badge that reloads once a second flickers.
-ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) !== src/),
+ok(scalar($SENT =~ /if \(src !== badgeSrc\) \{\s*badgeSrc = src;/),
    'the badge src is only written when it CHANGES');
 
 # A BROKEN IMAGE OVER THE ARTWORK IS THE ONE THING THIS MUST NEVER BE. The
 # circle is drawn from the emblems TABLE, so a table that fetched plus an svg
 # that did not would leave a coloured disc with a broken-image glyph in it.
-# The failed src is remembered rather than cleared, or the next update would
-# re-request the same missing file once a second for the whole track.
-ok(scalar($SENT =~ /badgeBad = el\.badgeImg\.getAttribute\('src'\)/),
+ok(scalar($SENT =~ /e\.target === el\.badgeImg\) \{\s*badgeOk = false;\s*el\.badge\.className = 'np-badge';/),
    'a logo that fails to load hides the badge instead of showing a broken image');
-ok(scalar($SENT =~ /\(src === badgeBad\) \? 'np-badge' : 'np-badge on'/),
-   'and the failed src is remembered, so it is not re-requested every second');
+
+# AND THE OTHER HALF OF THE SAME RULE: nothing is shown before its own logo has
+# arrived. Without it the circle's colour - which comes from the TABLE, not the
+# image - changes a service ahead of the glyph in it, so a Qobuz-to-Tidal move
+# paints the Qobuz logo on Tidal's disc until the new svg lands. That also
+# retires the old blacklist: a src that 404s never turns the badge on, and the
+# "only when it CHANGES" rule above already stops it being re-requested.
+ok(scalar($SENT =~ /el\.badge\.className = badgeOk \? 'np-badge on' : 'np-badge';/),
+   'the badge is shown only once its logo has LOADED');
+ok(scalar($SENT =~ /addEventListener\('load', function \(e\) \{/),
+   'which needs a load listener beside the error one');
+ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) === badgeWant/),
+   'checked against what the LAST update asked for, so a late logo cannot revive a dead badge');
+ok(scalar($SENT =~ /badgeOk\s+= false;\s*el\.badge\.style\.background = em\.bgnd/),
+   'and the circle is recoloured in the same breath as the src, never before it');
 
 # IT IS JUDGED SIDE BY SIDE WITH A MATERIAL ROW BADGE, so the numbers are
 # Material's own (style.css: --small-icon-size 18px, --sub-opacity 0.7), not

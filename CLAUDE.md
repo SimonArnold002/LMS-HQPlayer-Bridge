@@ -596,8 +596,8 @@ answers `"np_extid":"qobuz:"` on a Qobuz track.
 **Two things the same review fixed, both in 1.0.5:** the badge now hides itself
 when its logo fails to load (the circle comes from the TABLE, so a fetched
 table plus a missing svg drew a coloured disc with a broken-image glyph over
-the artwork - and the failed src is REMEMBERED, or the next update re-requests
-the missing file once a second); and `_extid` gained Material's second tier,
+the artwork - the failed src was REMEMBERED so the next update would not
+re-request it every second, **superseded in round 3 below**); and `_extid` gained Material's second tier,
 the `includes` SUBSTRING table (`.radioparadise.com/`, `.bandcamp.com`), which
 a plain `https://stream.radioparadise.com/flacm` favourite needs and no prefix
 matches. `.planetradio.co.uk` is Material's third entry and is deliberately
@@ -632,6 +632,40 @@ file for the literal before pinning a branch on it.
   `includes` is. **DECLINED as unreportable:** no upstream writer reaches the
   over-match - no real LMS URL scheme carries `.bandcamp.com` or
   `.radioparadise.com/` outside an http URL. Re-raise only with a named URL.
+
+**2026-09-20 REVIEW ROUND 3 - two findings, both real, both fixed in
+`Live.pm`. THE BADGE IS NOW GATED ON ITS LOGO HAVING LOADED**, which is the
+single change behind both.
+
+1. **The disc changed service a beat before the glyph on it.** The circle's
+   colour comes from the emblems TABLE and was applied synchronously, while
+   the logo is an `img` that still had to load - so a Qobuz-to-Tidal move
+   painted the black Qobuz glyph on Tidal's black disc, over the artwork, for
+   as long as the svg took. `badgeWant` / `badgeSrc` / `badgeOk` replace the
+   single old flag: the colour now moves **inside** the `src !== badgeSrc`
+   branch, in the same breath as the src, and the `on` class is only added by
+   a `load` listener (CAPTURING - an img load does not bubble, exactly like
+   the error one beside it).
+
+2. **The blacklist could not name the request that failed.** The 1.0.5 error
+   handler read `el.badgeImg.getAttribute('src')` at DISPATCH time, which is
+   whatever the element holds then, not the src whose load failed - so a track
+   change inside the load window would blacklist the new, working logo for the
+   session. **There is no fix by that route**: an img only ever reports its
+   current src. So the blacklist is RETIRED instead. A 404ing logo now simply
+   never fires `load` and the badge never turns on, and the "write src only
+   when it CHANGES" rule already limits the dead request to once per service
+   change rather than once a second. `badgeBad` is gone.
+
+The `load` listener checks the element's src against **`badgeWant`**, what the
+last updater pass asked for, so a logo that arrives after the track moved to a
+service-less one cannot switch the badge back on.
+
+**All seven suite assertions covering this were mutation-checked**, each
+against its own mutation (delete the else, always write src, drop the error
+body, show the badge unconditionally, drop the load listener, colour ahead of
+the src). Every one dies when its behaviour is removed. **UNVERIFIED LIVE** -
+this is `dev` code past 1.0.5, not yet built or installed.
 
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
@@ -4747,6 +4781,16 @@ row. It now matches those rows' own numbers - an 18px logo at
 assertions in `tools/t_live.pl` pin both numbers. No markup, JS logic or test
 data changed; the mechanism above is unchanged. No cache-key prefixes exist in
 this plugin to clear.
+
+## 1.0.6 (2026-09-20): the badge waits for its own logo
+
+DEV BUILD, pushed to `dev` only. **UNVERIFIED LIVE.** Round 3's two fixes,
+described above under "The live page's service badge (2026-09-20)": the badge
+is shown only once its logo has LOADED, so the circle can no longer change
+service a beat before the glyph on it, and the failed-src blacklist is retired
+because an img cannot name the request that failed. `Live.pm` only - no
+`Plugin.pm` change, so nothing about `_extid` or the `signalpath` payload
+moved. No cache-key prefixes exist in this plugin to clear.
 
 ## 1.0.5 (2026-09-20): the service badge's two review fixes
 

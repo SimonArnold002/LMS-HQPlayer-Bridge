@@ -554,8 +554,15 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     // request per page load.
     var EMBLEMS = null;
 
-    // The badge logo src that failed to load, if any - see build().
-    var badgeBad = null;
+    // THE BADGE IS SHOWN ONLY ONCE ITS OWN LOGO HAS LOADED - see build() and
+    // the updater. Its circle is coloured from the emblems TABLE, not from the
+    // image, so colouring it the instant the service changes paints the
+    // PREVIOUS service's logo on the NEW service's disc until the new svg
+    // arrives - a black Qobuz glyph on Tidal's black circle, over artwork the
+    // user is looking at.
+    var badgeWant = null;    // the src THIS track wants, null for no badge
+    var badgeSrc  = null;    // the src actually handed to the img
+    var badgeOk   = false;   // and whether that src has LOADED
 
     function loadEmblems() {
         var xhr = new XMLHttpRequest();
@@ -643,17 +650,31 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         // it. That is the one thing this badge must never be, because it is
         // drawn over artwork the user is looking at.
         //
-        // The failed src is REMEMBERED rather than cleared. Clearing it would
-        // make the next update see a changed src, re-request the same missing
-        // file and do it again every second for as long as the track plays.
-        // Another service still badges normally, and the same one recovers on
-        // a page reload - which is when a missing file could have appeared.
+        // NOTHING IS REMEMBERED AS BAD. The badge only turns on for a logo
+        // that loaded, so a file that 404s simply never shows one; and the
+        // updater writes src only when it CHANGES, so the missing file is
+        // asked for once per service change rather than once a second. It
+        // recovers on a page reload - which is when a missing file could have
+        // appeared. Blacklisting the src instead would have to guess WHICH
+        // request failed, and an img only ever reports its current one.
         npEl.addEventListener('error', function (e) {
             if (e.target === el.badgeImg) {
-                badgeBad = el.badgeImg.getAttribute('src');
+                badgeOk = false;
                 el.badge.className = 'np-badge';
             }
         }, true);   // CAPTURING: an img error does not bubble
+
+        // The other half. The badge appears the moment its logo lands rather
+        // than up to a poll later, and it is checked against what the LAST
+        // updater pass asked for, so a logo that arrives after the track has
+        // moved to a service-less one cannot switch it back on.
+        npEl.addEventListener('load', function (e) {
+            if (e.target === el.badgeImg &&
+                el.badgeImg.getAttribute('src') === badgeWant) {
+                badgeOk = true;
+                el.badge.className = 'np-badge on';
+            }
+        }, true);   // CAPTURING: an img load does not bubble either
 
         el = { card: g('npcard'), cover: g('np-cover'), art: g('np-art'),
                badge: g('np-badge'), badgeImg: g('np-badge-img'), title: g('np-title'),
@@ -805,22 +826,29 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         // THE SERVICE BADGE. The lookup is Material's own, on Material's own
         // table: the key before the first ':' of `extid`, the logo from
         // /material/svg/<name> recoloured through its `c` parameter, and the
-        // circle filled with the service's brand colour. Written only when it
-        // changes, like the artwork above - an img whose src is reassigned
-        // reloads and flickers even when the bytes are identical.
+        // circle filled with the service's brand colour.
         var em = (EMBLEMS && b.np_extid) ? EMBLEMS[b.np_extid.split(':')[0]] : null;
 
         if (em && em.name) {
             var src = '/material/svg/' + encodeURIComponent(em.name) +
                       '?c=' + encodeURIComponent(String(em.color || '#fff').split('#').join(''));
+            badgeWant = src;
 
-            if (el.badgeImg.getAttribute('src') !== src) {
+            // Written only when it CHANGES, like the artwork above - an img
+            // whose src is reassigned reloads and flickers even when the bytes
+            // are identical. The colour moves in the same breath as the src,
+            // and the badge stays hidden until that src loads, so the disc and
+            // the logo on it can never be from two different services.
+            if (src !== badgeSrc) {
+                badgeSrc = src;
+                badgeOk  = false;
+                el.badge.style.background = em.bgnd || 'transparent';
                 el.badgeImg.setAttribute('src', src);
             }
 
-            el.badge.style.background = em.bgnd || 'transparent';
-            el.badge.className = (src === badgeBad) ? 'np-badge' : 'np-badge on';
+            el.badge.className = badgeOk ? 'np-badge on' : 'np-badge';
         } else {
+            badgeWant = null;
             el.badge.className = 'np-badge';
         }
 
