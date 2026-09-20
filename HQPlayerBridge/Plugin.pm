@@ -591,6 +591,19 @@ my %EMBLEM = (
     'sounds:'        => 'bbc',
 );
 
+# MATERIAL'S SECOND TIER: A SUBSTRING, NOT A PREFIX. Its `getTrackSource` tries
+# the prefixes above and then an `includes` table, because these two services
+# are also reachable as an ORDINARY http(s) stream - a Radio Paradise FLAC
+# favourite is `https://stream.radioparadise.com/flacm`, which no prefix
+# matches. Without this tier Material badges such a track and this page did
+# not, which is exactly the divergence the prefix table exists to avoid.
+# `.planetradio.co.uk` is Material's third entry and is deliberately absent:
+# it carries no `extid`, so Material draws no badge for it either.
+my %EMBLEM_IN = (
+    '.radioparadise.com/' => 'radioparadise',
+    '.bandcamp.com'       => 'bandcamp',
+);
+
 sub _extid {
     my $url = shift;
 
@@ -600,6 +613,11 @@ sub _extid {
 
     for my $pfx ( keys %EMBLEM ) {
         return $EMBLEM{$pfx} . ':' if index( $lc, $pfx ) == 0;
+    }
+
+    # ONLY AFTER the prefixes, which is Material's own order.
+    for my $frag ( keys %EMBLEM_IN ) {
+        return $EMBLEM_IN{$frag} . ':' if index( $lc, $frag ) >= 0;
     }
 
     return undef;

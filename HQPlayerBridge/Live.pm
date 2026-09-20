@@ -554,6 +554,9 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     // request per page load.
     var EMBLEMS = null;
 
+    // The badge logo src that failed to load, if any - see build().
+    var badgeBad = null;
+
     function loadEmblems() {
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/material/html/misc/emblems.json', true);
@@ -632,6 +635,26 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         // one silent assumption about the markup away from a TypeError that
         // aborts the whole update - and it did, when the page was executed
         // against a real payload.
+        // A LOGO THAT DOES NOT LOAD TAKES THE BADGE WITH IT. The emblems table
+        // can be fetched and an individual svg still fail - a name the table
+        // lists but Material does not ship, or a request that simply fails -
+        // and the circle is drawn from the TABLE, not from the image, so left
+        // alone it would stay: a coloured disc with a broken-image glyph in
+        // it. That is the one thing this badge must never be, because it is
+        // drawn over artwork the user is looking at.
+        //
+        // The failed src is REMEMBERED rather than cleared. Clearing it would
+        // make the next update see a changed src, re-request the same missing
+        // file and do it again every second for as long as the track plays.
+        // Another service still badges normally, and the same one recovers on
+        // a page reload - which is when a missing file could have appeared.
+        npEl.addEventListener('error', function (e) {
+            if (e.target === el.badgeImg) {
+                badgeBad = el.badgeImg.getAttribute('src');
+                el.badge.className = 'np-badge';
+            }
+        }, true);   // CAPTURING: an img error does not bubble
+
         el = { card: g('npcard'), cover: g('np-cover'), art: g('np-art'),
                badge: g('np-badge'), badgeImg: g('np-badge-img'), title: g('np-title'),
                sub: g('np-sub'), bar: g('np-bar'), time: g('np-time'),
@@ -796,7 +819,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             }
 
             el.badge.style.background = em.bgnd || 'transparent';
-            el.badge.className = 'np-badge on';
+            el.badge.className = (src === badgeBad) ? 'np-badge' : 'np-badge on';
         } else {
             el.badge.className = 'np-badge';
         }

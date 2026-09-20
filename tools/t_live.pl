@@ -281,6 +281,16 @@ ok(scalar($SENT =~ /el\.badge\.className = 'np-badge';/),
 ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) !== src/),
    'the badge src is only written when it CHANGES');
 
+# A BROKEN IMAGE OVER THE ARTWORK IS THE ONE THING THIS MUST NEVER BE. The
+# circle is drawn from the emblems TABLE, so a table that fetched plus an svg
+# that did not would leave a coloured disc with a broken-image glyph in it.
+# The failed src is remembered rather than cleared, or the next update would
+# re-request the same missing file once a second for the whole track.
+ok(scalar($SENT =~ /badgeBad = el\.badgeImg\.getAttribute\('src'\)/),
+   'a logo that fails to load hides the badge instead of showing a broken image');
+ok(scalar($SENT =~ /\(src === badgeBad\) \? 'np-badge' : 'np-badge on'/),
+   'and the failed src is remembered, so it is not re-requested every second');
+
 # IT IS JUDGED SIDE BY SIDE WITH A MATERIAL ROW BADGE, so the numbers are
 # Material's own (style.css: --small-icon-size 18px, --sub-opacity 0.7), not
 # picked here. The first build drew it solid and Simon called it immediately.
@@ -654,6 +664,32 @@ print "-- nowPlayingFor: the resolution the server does --\n";
     };
     $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
     is($np->{extid}, 'tidal:', 'the url falls back to remoteMeta like the rest of the track');
+
+    # MATERIAL'S SECOND TIER IS A SUBSTRING. These two services are also
+    # reachable as an ordinary https stream - a Radio Paradise FLAC favourite
+    # is stream.radioparadise.com/flacm - which no prefix matches. Material
+    # badges them through its `includes` table; without this tier the page
+    # diverged from Material on exactly those rows.
+    for my $c2 ( [ 'https://stream.radioparadise.com/flacm' => 'radioparadise:' ],
+                 [ 'https://artist.bandcamp.com/track/x'    => 'bandcamp:' ] ) {
+        $Slim::Control::Request::RESULTS = {
+            mode => 'play',
+            playlist_loop => [ { title => 'I', duration => 10, url => $c2->[0] } ],
+        };
+        $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+        is($np->{extid}, $c2->[1], "an http stream is matched on a SUBSTRING too ($c2->[1])");
+    }
+
+    # Material's third `includes` entry, .planetradio.co.uk, carries NO extid -
+    # it draws no badge there either, so neither must this.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'P', duration => 10,
+                             url => 'https://stream.planetradio.co.uk/net1national' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    ok(scalar(!exists $np->{extid}),
+       'a service Material lists but does not badge gets no badge here either');
 
     # A LOCAL FILE HAS NO SERVICE, and neither has a plain radio stream. Both
     # must yield NO key at all: an empty string would be a key Material's table

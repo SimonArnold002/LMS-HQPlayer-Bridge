@@ -585,6 +585,24 @@ copy here would drift the moment Material changes a colour or adds a service.
 That it therefore only appears where Material is installed is **by design** —
 see the ledger row.
 
+**MEASURED IN THE 2026-09-20 REVIEW, so the next round need not re-measure it**
+(live, `plex:9000`): `/material/html/misc/emblems.json` answers **200 with
+content-type `application/x-javascript`** and parses as JSON regardless - the
+type is Material's, not a sign the body is wrong. All 14 keys in that file are
+reachable from the prefix table, and **no prefix is a prefix of another**, so
+the unordered `keys %EMBLEM` iteration cannot pick the wrong one. `signalpath`
+answers `"np_extid":"qobuz:"` on a Qobuz track.
+
+**Two things the same review fixed, both in 1.0.5:** the badge now hides itself
+when its logo fails to load (the circle comes from the TABLE, so a fetched
+table plus a missing svg drew a coloured disc with a broken-image glyph over
+the artwork - and the failed src is REMEMBERED, or the next update re-requests
+the missing file once a second); and `_extid` gained Material's second tier,
+the `includes` SUBSTRING table (`.radioparadise.com/`, `.bandcamp.com`), which
+a plain `https://stream.radioparadise.com/flacm` favourite needs and no prefix
+matches. `.planetradio.co.uk` is Material's third entry and is deliberately
+absent: it carries no `extid`, so Material draws no badge for it either.
+
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
 **The plugin is `Slim::Plugin::OPMLBased`, not `Slim::Plugin::Base`, for exactly
@@ -4699,6 +4717,16 @@ row. It now matches those rows' own numbers - an 18px logo at
 assertions in `tools/t_live.pl` pin both numbers. No markup, JS logic or test
 data changed; the mechanism above is unchanged. No cache-key prefixes exist in
 this plugin to clear.
+
+## 1.0.5 (2026-09-20): the service badge's two review fixes
+
+DEV BUILD, pushed to `dev` only. Ships the two fixes to the 1.0.3/1.0.4 service
+badge described above under "The live page's service badge (2026-09-20)" -
+the badge now hides itself on a failed logo load instead of showing a coloured
+disc with a broken-image glyph, and `Plugin::_extid` gained Material's
+`includes` substring tier for a plain `https://` stream favourite (e.g.
+Radio Paradise, Bandcamp) that no URL prefix matches. No cache-key prefixes
+exist in this plugin to clear.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 
