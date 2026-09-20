@@ -711,6 +711,21 @@ mutation-checked.
   so not a live defect - but it is a coupling to a table fetched at runtime,
   and a future Material that splits them would need the colour moved out.
 
+**2026-09-20 REVIEW ROUND 5 - NO FINDINGS.** The badge is settled; rounds 3 and
+4 have been walked through service-to-service, service-to-local-to-service, a
+load landing during idle, a load landing after a track change, and a 404 logo,
+and the `badgeSrc` / `badgeWant` / `badgeOk` split holds on all of them. Two
+things measured for the first time this round:
+
+* **Reassigning `img.src` ABORTS the pending request WITHOUT firing `error`.**
+  That is why the error handler needs no src check of its own - and it means
+  round 3's second finding (the blacklist could not name the failing request)
+  was even narrower than it looked. Retiring the blacklist was still right;
+  the fix simply removed a mechanism rather than a live bug.
+* **`--art` has no media-query overrides**, so moving `flex: 0 0 var(--art)`
+  from `.np-art` onto the new `.np-cover` wrapper is exactly equivalent at
+  every width.
+
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
 **The plugin is `Slim::Plugin::OPMLBased`, not `Slim::Plugin::Base`, for exactly
