@@ -558,7 +558,14 @@ moment anyone translates the strings.
 
 ### The live page's service badge (2026-09-20)
 
-**VERIFIED LIVE 2026-09-20** on 1.0.3, installed on the rig - Simon: "that works".
+**VERIFIED LIVE 2026-09-20** on 1.0.3, installed on the rig - Simon: "that works" -
+and again on **1.0.7**, the build carrying rounds 3 and 4: Simon, on the
+service-to-local-to-service sequence those rounds are about, *"they switch
+fine"*. So the round-4 wedge is gone and no badge is left sitting over a local
+file's cover. **STILL UNVERIFIED on the rig:** the `includes` SUBSTRING tier (a
+Radio Paradise / Bandcamp `https://` favourite), and the wrong-glyph-on-the-new-
+disc flash round 3 fixed - that one needs TWO services and the rig has only
+Qobuz installed, so it cannot be reproduced there at all.
 
 The now-playing cover carries the same service emblem Material draws on
 LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows. Those two get it for free:
@@ -664,8 +671,10 @@ service-less one cannot switch the badge back on.
 **All seven suite assertions covering this were mutation-checked**, each
 against its own mutation (delete the else, always write src, drop the error
 body, show the badge unconditionally, drop the load listener, colour ahead of
-the src). Every one dies when its behaviour is removed. **UNVERIFIED LIVE** -
-this is `dev` code past 1.0.5, not yet built or installed.
+the src). Every one dies when its behaviour is removed. **Shipped in 1.0.6 and
+carried into 1.0.7, which Simon installed and confirmed** - see the VERIFIED
+LIVE note at the top of this section for which half of it a Qobuz-only rig can
+actually prove.
 
 **2026-09-20 REVIEW ROUND 4 - one finding, in the code round 3 wrote, and the
 reason that class of finding is not suppressed by round 3 being closed.** The
@@ -4819,7 +4828,8 @@ this plugin to clear.
 
 ## 1.0.7 (2026-09-20): the badge's load check, split in two
 
-DEV BUILD, pushed to `dev` only. **UNVERIFIED LIVE.** Round 4's one finding,
+DEV BUILD. **VERIFIED LIVE 2026-09-20** - Simon installed it and confirmed the
+service-to-local-to-service switch: *"they switch fine"*. Round 4's one finding,
 in the code 1.0.6 wrote: the `load` listener recorded the load against
 `badgeWant`, so a logo landing while a service-less track played was thrown
 away and - since src is only written when it CHANGES - never asked for again,
@@ -4830,7 +4840,8 @@ clear.
 
 ## 1.0.6 (2026-09-20): the badge waits for its own logo
 
-DEV BUILD, pushed to `dev` only. **UNVERIFIED LIVE.** Round 3's two fixes,
+DEV BUILD. Superseded by 1.0.7, which is the build actually installed and
+confirmed. Round 3's two fixes,
 described above under "The live page's service badge (2026-09-20)": the badge
 is shown only once its logo has LOADED, so the circle can no longer change
 service a beat before the glyph on it, and the failed-src blacklist is retired
