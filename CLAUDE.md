@@ -667,6 +667,41 @@ body, show the badge unconditionally, drop the load listener, colour ahead of
 the src). Every one dies when its behaviour is removed. **UNVERIFIED LIVE** -
 this is `dev` code past 1.0.5, not yet built or installed.
 
+**2026-09-20 REVIEW ROUND 4 - one finding, in the code round 3 wrote, and the
+reason that class of finding is not suppressed by round 3 being closed.** The
+`load` listener recorded the load against **`badgeWant`**, so a logo landing
+while a service-less track played was discarded - and because the updater
+writes src only when it CHANGES, that src was never asked for again and the
+service stayed unbadged for the rest of the page session. A permanent wedge
+from a narrow trigger, on a page meant to stay open.
+
+**The two checks are now deliberately different, and must stay that way:**
+
+* **whether the logo LOADED** is recorded against **`badgeSrc`**, the src
+  actually handed to the img, because that fact has to outlive the track;
+* **whether to SHOW it now** is gated on **`badgeWant`**, what the last updater
+  pass asked for, so a late logo cannot revive a badge whose track has moved
+  on. The updater shows it by itself the moment that service returns.
+
+Collapsing the two back into one variable reintroduces either the wedge or the
+late-revive. Both halves are pinned by their own assertion and both were
+mutation-checked.
+
+**Also cleared this round, so round 5 need not re-derive it:**
+
+* `%EMBLEM` / `%EMBLEM_IN` were diffed **mechanically** against Material's live
+  `track-sources.json` and `emblems.json` - all 15 `extid`-carrying prefix rows
+  covered, every key produced exists, no prefix is a prefix of another.
+* `badgeOk` surviving a service-less track is **correct, not stale**: it is the
+  fact that a src loaded, and the src it belongs to is `badgeSrc`.
+* The idle path returns before the badge block, but `.np.idle > .np-cover`
+  hides the cover and the badge with it. **No leak.**
+* `el.badge.style.background` is written only inside the src-changed branch,
+  which assumes `name`+`color` determine `bgnd`. **True in Material's current
+  table** (spotify/spoton, wimp/tidal, pandora/pyrrha each agree on all three),
+  so not a live defect - but it is a coupling to a table fetched at runtime,
+  and a future Material that splits them would need the colour moved out.
+
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
 **The plugin is `Slim::Plugin::OPMLBased`, not `Slim::Plugin::Base`, for exactly
@@ -4781,6 +4816,17 @@ row. It now matches those rows' own numbers - an 18px logo at
 assertions in `tools/t_live.pl` pin both numbers. No markup, JS logic or test
 data changed; the mechanism above is unchanged. No cache-key prefixes exist in
 this plugin to clear.
+
+## 1.0.7 (2026-09-20): the badge's load check, split in two
+
+DEV BUILD, pushed to `dev` only. **UNVERIFIED LIVE.** Round 4's one finding,
+in the code 1.0.6 wrote: the `load` listener recorded the load against
+`badgeWant`, so a logo landing while a service-less track played was thrown
+away and - since src is only written when it CHANGES - never asked for again,
+wedging that service's badge off for the rest of the page session. The load is
+now recorded against `badgeSrc` and only the immediate show is gated on
+`badgeWant`. `Live.pm` only. No cache-key prefixes exist in this plugin to
+clear.
 
 ## 1.0.6 (2026-09-20): the badge waits for its own logo
 

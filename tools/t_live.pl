@@ -301,8 +301,15 @@ ok(scalar($SENT =~ /el\.badge\.className = badgeOk \? 'np-badge on' : 'np-badge'
    'the badge is shown only once its logo has LOADED');
 ok(scalar($SENT =~ /addEventListener\('load', function \(e\) \{/),
    'which needs a load listener beside the error one');
-ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) === badgeWant/),
-   'checked against what the LAST update asked for, so a late logo cannot revive a dead badge');
+# THE TWO CHECKS IN THE LOAD LISTENER ARE DIFFERENT ON PURPOSE. Recording the
+# load against badgeWant instead WEDGED the badge: a logo landing while a
+# service-less track played was discarded, and since src is only written when
+# it CHANGES it was never asked for again - that service stayed unbadged for
+# the rest of the page session.
+ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) === badgeSrc/),
+   'the LOAD is recorded against the src that was asked for, so it outlives the track');
+ok(scalar($SENT =~ /badgeOk = true;\s*if \(badgeSrc === badgeWant\) \{/),
+   'and only SHOWING it is gated on the track still wanting it');
 ok(scalar($SENT =~ /badgeOk\s+= false;\s*el\.badge\.style\.background = em\.bgnd/),
    'and the circle is recoloured in the same breath as the src, never before it');
 

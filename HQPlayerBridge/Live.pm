@@ -665,14 +665,24 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         }, true);   // CAPTURING: an img error does not bubble
 
         // The other half. The badge appears the moment its logo lands rather
-        // than up to a poll later, and it is checked against what the LAST
-        // updater pass asked for, so a logo that arrives after the track has
-        // moved to a service-less one cannot switch it back on.
+        // than up to a poll later.
+        //
+        // THE TWO CHECKS ARE DELIBERATELY DIFFERENT. Whether the logo LOADED
+        // is recorded against badgeSrc, the src actually asked for, because
+        // that fact outlives the track: the updater writes src only when it
+        // CHANGES, so a load discarded here is never asked for again and that
+        // service would stay unbadged for the whole page session. Whether to
+        // show it NOW is gated on badgeWant, what the last updater pass asked
+        // for, so a logo arriving after the track moved to a service-less one
+        // cannot switch the badge back on. The updater shows it on its own the
+        // moment that service returns.
         npEl.addEventListener('load', function (e) {
             if (e.target === el.badgeImg &&
-                el.badgeImg.getAttribute('src') === badgeWant) {
+                el.badgeImg.getAttribute('src') === badgeSrc) {
                 badgeOk = true;
-                el.badge.className = 'np-badge on';
+                if (badgeSrc === badgeWant) {
+                    el.badge.className = 'np-badge on';
+                }
             }
         }, true);   // CAPTURING: an img load does not bubble either
 
