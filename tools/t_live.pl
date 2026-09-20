@@ -273,7 +273,11 @@ ok(scalar($SENT =~ /el\.badge\.style\.background = em\.bgnd/),
 # must cost the badge and nothing else.
 ok(scalar($SENT =~ /if \(xhr\.status !== 200\) \{ return; \}/),
    'a missing Material leaves EMBLEMS null rather than throwing');
-ok(scalar($SENT =~ /el\.badge\.className = 'np-badge';/),
+# ANCHORED ON THE ELSE, not on the class name alone: 'np-badge' is also written
+# by the img-error handler above, so a bare match passed even with this whole
+# branch deleted - and a deleted branch leaves the LAST service's badge sitting
+# over a local file's cover.
+ok(scalar($SENT =~ /np-badge on';\s*\} else \{\s*el\.badge\.className = 'np-badge';/),
    'and an unrecognised service simply draws no badge');
 
 # Only assigned when it changes, like the artwork above: reassigning an img src

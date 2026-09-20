@@ -603,6 +603,36 @@ a plain `https://stream.radioparadise.com/flacm` favourite needs and no prefix
 matches. `.planetradio.co.uk` is Material's third entry and is deliberately
 absent: it carries no `extid`, so Material draws no badge for it either.
 
+**2026-09-20 REVIEW ROUND 2 (on the 1.0.4 + 1.0.5 commits) - one finding, fixed
+in the suite, no plugin code changed.** The assertion "an unrecognised service
+simply draws no badge" matched `el.badge.className = 'np-badge';` on its own,
+and that exact line is written **twice** in `Live.pm` - once in the img-error
+handler, once in the updater's `else`. **Proved by mutation:** deleting the
+whole `else` branch still gave 154 passed, while the real behaviour regresses
+(a Qobuz track followed by a local file leaves the Qobuz badge over the local
+cover). The assertion is now anchored on `np-badge on';` + the `} else {` that
+follows it, which the same mutation kills. **The general trap:** a class name or
+a short string that the file writes more than once is not an anchor - grep the
+file for the literal before pinning a branch on it.
+
+**Also measured this round, so it need not be re-measured:**
+
+* `/material/svg/no-such-emblem` answers a real **404**, not an empty SVG - so
+  the 1.0.5 `error`-handler fallback genuinely fires on a bad name.
+* The badge URL matches Material's own `emblem` filter exactly
+  (`browse-page.js`: `/material/svg/<name>?c=<colour minus the #>`); Material
+  appends an `&r=` cache-buster and this page does not, which is harmless.
+* All 15 of Material's `track-sources.json` prefix rows that carry an `extid`
+  are covered by `%EMBLEM` (`sounds://_LIVE` folds into `sounds:`), and all 12
+  svg names the table can produce exist in Material's `images/`.
+* The `error` listener is registered before `el` is assigned, but `build()`
+  sets `innerHTML` with no `src` on either img and assigns `el` synchronously,
+  so no error can interleave. **Not a defect.**
+* `_extid`'s substring tier is **not** gated on `http(s):` the way Material's
+  `includes` is. **DECLINED as unreportable:** no upstream writer reaches the
+  over-match - no real LMS URL scheme carries `.bandcamp.com` or
+  `.radioparadise.com/` outside an http URL. Re-raise only with a named URL.
+
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
 **The plugin is `Slim::Plugin::OPMLBased`, not `Slim::Plugin::Base`, for exactly
