@@ -252,6 +252,48 @@ ok(scalar($SENT =~ /el\.title\.textContent = b\.np_title/),
 ok(scalar($SENT =~ /getAttribute\('src'\) !== b\.np_artwork/),
    'artwork is only assigned when it CHANGES - rewriting the same src flickers');
 
+print "-- the service badge --\n";
+# THE SAME KEY THE OTHER PLUGINS SEND. LMS-Listen-to-Later and
+# LMS-Pitchfork-Reviews badge a row by setting `extid`, and Material reads the
+# part before the first ':'. This page is not a Material row - it renders
+# itself - so it does the lookup Material would have done, on MATERIAL'S OWN
+# table, fetched rather than copied: a copy here would drift the moment
+# Material changes a colour or adds a service.
+ok(scalar($SENT =~ m{/material/html/misc/emblems\.json}),
+   "the page fetches Material's own emblem table instead of embedding a copy");
+ok(scalar($SENT =~ /b\.np_extid\.split\(':'\)\[0\]/),
+   'and reads the key from extid exactly the way Material does');
+ok(scalar($SENT =~ m{'/material/svg/' \+ encodeURIComponent\(em\.name\)}),
+   "the logo is Material's own svg, recoloured through its c parameter");
+ok(scalar($SENT =~ /el\.badge\.style\.background = em\.bgnd/),
+   'and the circle carries the service brand colour from the same table');
+
+# MATERIAL IS NOT A DEPENDENCY OF THIS PAGE. It is reachable standalone and on
+# a server with no Material installed, where the emblems fetch 404s - which
+# must cost the badge and nothing else.
+ok(scalar($SENT =~ /if \(xhr\.status !== 200\) \{ return; \}/),
+   'a missing Material leaves EMBLEMS null rather than throwing');
+ok(scalar($SENT =~ /el\.badge\.className = 'np-badge';/),
+   'and an unrecognised service simply draws no badge');
+
+# Only assigned when it changes, like the artwork above: reassigning an img src
+# reloads it, and a badge that reloads once a second flickers.
+ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) !== src/),
+   'the badge src is only written when it CHANGES');
+
+# IT IS JUDGED SIDE BY SIDE WITH A MATERIAL ROW BADGE, so the numbers are
+# Material's own (style.css: --small-icon-size 18px, --sub-opacity 0.7), not
+# picked here. The first build drew it solid and Simon called it immediately.
+ok(scalar($SENT =~ /opacity: 0\.7;/),
+   "the badge carries Material's own --sub-opacity, not a solid circle");
+ok(scalar($SENT =~ /\.np-badge img \{ width: 18px; height: 18px/),
+   'and its logo is the 18px Material draws on a row');
+
+# The badge sits ON the cover, so the cover is what the idle rule hides - the
+# old rule named .np-art, which would now leave a badge floating over nothing.
+ok(scalar($SENT =~ m{\.np\.idle > \.np-cover \{ display: none}),
+   'idle hides the whole cover, badge included');
+
 print "-- it SCALES, which was the desktop complaint --\n";
 # A hard 96px cover on a full-bleed card is what looked tiny on a PC and fine on
 # a phone. Both halves are fixed here: the sizes are viewport-relative with the
@@ -578,6 +620,59 @@ print "-- nowPlayingFor: the resolution the server does --\n";
     is($np->{volctl}, '1', 'and a MISSING use_volume_control is not read as fixed');
     ok(scalar(!exists $np->{volume}),
        'a missing mixer volume yields no volume key rather than 0');
+
+    # THE SERVICE BADGE'S KEY, DERIVED FROM THE URL - because a status result
+    # does not carry `extid` for the playing track. Measured on the rig:
+    # `tags:x` adds nothing and a Qobuz track answers only
+    # url => 'qobuz://449954371.flac'. Material solves it the same way
+    # (getTrackSource), so these prefixes are ITS keys.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'Q', duration => 10,
+                             url => 'qobuz://449954371.flac' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'qobuz:', 'a service URL yields the emblem key Material looks up');
+
+    # NOT ALWAYS THE SAME WORD AS THE SCHEME. Material's emblems.json keys
+    # sounds:// under `bbc`, so a table that just echoed the prefix would draw
+    # nothing here - and would look like the badge "not working for the BBC".
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'S', duration => 10,
+                             url => 'sounds://_LIVE_bbc_6music' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'bbc:', 'and the key is the emblem name, not the url scheme');
+
+    # The url can arrive on remoteMeta alone, which is where a remote track's
+    # metadata lives when the loop entry is bare.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { duration => 10 } ],
+        remoteMeta => { title => 'R', url => 'tidal://123.flac' },
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'tidal:', 'the url falls back to remoteMeta like the rest of the track');
+
+    # A LOCAL FILE HAS NO SERVICE, and neither has a plain radio stream. Both
+    # must yield NO key at all: an empty string would be a key Material's table
+    # cannot match, and the page would draw an empty coloured circle.
+    for my $u ( 'file:///music/x.flac', 'http://stream.example.com/live' ) {
+        $Slim::Control::Request::RESULTS = {
+            mode => 'play',
+            playlist_loop => [ { title => 'L', duration => 10, url => $u } ],
+        };
+        $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+        ok(scalar(!exists $np->{extid}),
+           "no service in $u means no badge key at all");
+    }
+
+    # And it is a TRACK key: it goes when the track goes, or the page would
+    # badge whatever played last.
+    $Slim::Control::Request::RESULTS = { mode => 'stop', playlist_loop => [] };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    ok(scalar(!exists $np->{extid}), 'and nothing playing drops it with the other track keys');
 
     # A failed request must not yield half a snapshot either.
     $Slim::Control::Request::ERROR = 1;

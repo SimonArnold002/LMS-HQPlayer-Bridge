@@ -273,8 +273,26 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
 /* NOW PLAYING - laid out like Material's: cover left, title/artist/album and
    the controls right. */
 .np { display: flex; gap: var(--gap); align-items: center; }
-.np-art { flex: 0 0 var(--art); width: var(--art); height: var(--art); border-radius: 6px;
-          object-fit: cover; background: var(--line); }
+.np-cover { position: relative; flex: 0 0 var(--art); width: var(--art); height: var(--art); }
+.np-art { width: 100%; height: 100%; border-radius: 6px;
+          object-fit: cover; background: var(--line); display: block; }
+
+/* THE SERVICE BADGE, over the cover's top-right corner - Material's own
+   placement for it (.np-image .np-emblem), its own circle, and its own
+   colours, which are fetched from Material rather than copied here; see
+   loadEmblems(). Hidden unless a service was recognised AND its logo loaded,
+   so a Material-less server draws a plain cover rather than a broken image.
+
+   THE NUMBERS ARE MATERIAL'S, read from its style.css, because the badge is
+   judged side by side with the one on an LMS-Listen-to-Later or
+   LMS-Pitchfork-Reviews row: --small-icon-size 18px inside a circle 8px wider,
+   at --sub-opacity 0.7. A solid badge was the first draft and Simon called it
+   at once - "not as transparent" as the row badge it is meant to match. */
+.np-badge { position: absolute; top: 5px; right: 5px; width: 26px; height: 26px;
+            border-radius: 50%; box-sizing: border-box; opacity: 0.7;
+            display: none; align-items: center; justify-content: center; }
+.np-badge.on { display: flex; }
+.np-badge img { width: 18px; height: 18px; display: block; }
 .np-txt { min-width: 0; flex: 1 1 auto; }
 .np-title { font-size: clamp(17px, 1.5vw, 25px); font-weight: 600; }
 .np-sub { color: var(--dim); margin-top: 2px; font-size: clamp(13px, 1.05vw, 17px); }
@@ -291,7 +309,7 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
    queue is stopped, and a mute button you cannot reach unless music is already
    playing is not a control. So the card keeps its control row and drops
    everything else. */
-.np.idle > .np-art { display: none; }
+.np.idle > .np-cover { display: none; }
 .np.idle .np-title, .np.idle .np-sub,
 .np.idle .np-bar, .np.idle .np-time { display: none; }
 .np.idle .np-ctl { margin-top: 0; }
@@ -517,10 +535,46 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     var el   = null;   // the panel's elements, once built
     var CUR  = null;   // the bridge the controls are addressed to
 
+    // MATERIAL'S EMBLEM TABLE, FETCHED RATHER THAN COPIED.
+    //
+    // The server sends the same `extid` key LMS-Listen-to-Later and
+    // LMS-Pitchfork-Reviews put on their rows (see Plugin::_extid); what
+    // Material does with one is look up the part before the first ':' in
+    // html/misc/emblems.json, which gives the logo's name and the two colours
+    // it is drawn in. Reading that file at source keeps this badge identical
+    // to the one on every other row in Material - including when Material
+    // changes a colour or adds a service - where a copy of the table here
+    // would quietly drift out of date.
+    //
+    // IT IS ALSO THE TEST FOR MATERIAL ITSELF. This page is reachable
+    // standalone and on a server with no Material installed, where the fetch
+    // 404s, EMBLEMS stays null and no badge is ever drawn; everything else on
+    // the page is untouched. Nothing is retried: a skin does not appear
+    // halfway through a session, and a failed badge is not worth a second
+    // request per page load.
+    var EMBLEMS = null;
+
+    function loadEmblems() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/material/html/misc/emblems.json', true);
+        xhr.timeout = 5000;
+        xhr.onload = function () {
+            if (xhr.status !== 200) { return; }
+            try { EMBLEMS = JSON.parse(xhr.responseText); }
+            catch (e) { EMBLEMS = null; }
+        };
+        xhr.send();
+    }
+
     function build() {
         npEl.innerHTML =
             '<div class="card np" id="npcard">' +
-              '<img class="np-art" id="np-art" alt="">' +
+              '<div class="np-cover" id="np-cover">' +
+                '<img class="np-art" id="np-art" alt="">' +
+                '<span class="np-badge" id="np-badge">' +
+                  '<img id="np-badge-img" alt="">' +
+                '</span>' +
+              '</div>' +
               '<div class="np-txt">' +
                 '<div class="np-title" id="np-title"></div>' +
                 '<div class="np-sub" id="np-sub"></div>' +
@@ -578,7 +632,8 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         // one silent assumption about the markup away from a TypeError that
         // aborts the whole update - and it did, when the page was executed
         // against a real payload.
-        el = { card: g('npcard'), art: g('np-art'), title: g('np-title'),
+        el = { card: g('npcard'), cover: g('np-cover'), art: g('np-art'),
+               badge: g('np-badge'), badgeImg: g('np-badge-img'), title: g('np-title'),
                sub: g('np-sub'), bar: g('np-bar'), time: g('np-time'),
                pp: g('c-pp'), ipp: g('i-pp'),
                ivdn: g('i-vdn'), ivup: g('i-vup'), mute: g('c-mute'),
@@ -718,10 +773,32 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             if (el.art.getAttribute('src') !== b.np_artwork) {
                 el.art.setAttribute('src', b.np_artwork);
             }
-            el.art.style.display = '';
+            el.cover.style.display = '';
         } else {
             el.art.removeAttribute('src');
-            el.art.style.display = 'none';
+            el.cover.style.display = 'none';
+        }
+
+        // THE SERVICE BADGE. The lookup is Material's own, on Material's own
+        // table: the key before the first ':' of `extid`, the logo from
+        // /material/svg/<name> recoloured through its `c` parameter, and the
+        // circle filled with the service's brand colour. Written only when it
+        // changes, like the artwork above - an img whose src is reassigned
+        // reloads and flickers even when the bytes are identical.
+        var em = (EMBLEMS && b.np_extid) ? EMBLEMS[b.np_extid.split(':')[0]] : null;
+
+        if (em && em.name) {
+            var src = '/material/svg/' + encodeURIComponent(em.name) +
+                      '?c=' + encodeURIComponent(String(em.color || '#fff').split('#').join(''));
+
+            if (el.badgeImg.getAttribute('src') !== src) {
+                el.badgeImg.setAttribute('src', src);
+            }
+
+            el.badge.style.background = em.bgnd || 'transparent';
+            el.badge.className = 'np-badge on';
+        } else {
+            el.badge.className = 'np-badge';
         }
 
         var sub = [ b.np_artist, b.np_album ].filter(function (x) { return x; })
@@ -921,6 +998,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     }
 
     iconCheck();
+    loadEmblems();
     poll();
 }());
 </script>

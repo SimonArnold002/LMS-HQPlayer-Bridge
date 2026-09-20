@@ -55,6 +55,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | a remote track's cover not being size-capped like the local one | REVERSED 1.0.1, Simon's call — remote covers now go through LMS's image proxy at ART_SIZE (`_remoteArt`) | `THE REMOTE ROUTE NOW GOES THROUGH THE IMAGE PROXY` |
 | `_remoteArt`, a dead / unfetchable cover showing LMS's `radio.png` | ACCEPTED 2026-09-17, Simon's call — no bridge-side detection | `The image proxy answers a dead cover with 200 and radio.png` |
 | `flush()`'s `<PlaylistClear/>` dropped by `cancelQueued('track')` | MOOT 2026-09-11 — both `_newGeneration` callers cover it | `` `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` `` |
+| `np_extid`, `_extid`, `loadEmblems`, the live page's service badge missing | BY DESIGN 2026-09-20, Simon's call — only Material draws badges | `only Material shows badges, and that is the whole point` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -118,6 +119,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `_appendTrack` stamps the cursor as it stands at the append, so the held item always carries the value HQPlayer was at when it was queued (`Player.pm`, `_onStatus` / `_appendTrack`) | **WRONG** 2026-09-11, fixed in 0.2.85 and rebuilt as 0.2.86 | True for the FIRST append of a run and **stale for every one chained off a hand-over** — track 3 onward. `_onStatus` called `_handedOver` ~50 lines ABOVE `$self->hqTrackSerial($serial)`, and `_handedOver` ends in `_armNextTrack` -> `playerReadyToStream`, which real LMS answers by re-entering `play()` SYNCHRONOUSLY for a LOCAL track — chain walked in LMS `public/9.0`: ReadyToStream -> _NextIfMore -> _getNextTrack -> `getNextSong` (a file has no `scanUrl` and no `getNextTrack`, so it falls to "the simple case" and calls its success callback INLINE) -> NextTrackReady -> _StreamIfReady -> _Stream -> `play()`, every step a direct call with no timer. So `_appendTrack` ran INSIDE the push and stamped the PREVIOUS cursor, one low. `_endOfStream` then read the difference as 2 rather than 1, decided the held track had already played, and reported end of playlist — reintroducing the 20:47:59 mid-album stop for every boundary but the first. **Tier 5 is unaffected** (the service handler DOES implement `getNextTrack`, so the append lands after the store) and tier 4 never pre-queues; this is tier 1/3, local files. Bounded in one direction only: a stale stamp can suppress a reload, never cause a spurious one, so nothing is ever replayed. **Nothing released was affected — `main` ships 0.2.77**, and the cursor arrived in 0.2.81. Invisible to the suites because `LoadController` answers `playerReadyToStream` through AUTOLOAD and never re-enters `play()`, so only the first append was ever exercised. Fixed by moving the cursor read and store ABOVE the hand-over check, `$seenSerial`/`$cursorMoved` still captured before the store. See §0.2.85-0.2.86. |
 | `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` before it reaches the wire, so a deleted pre-queued track is left in HQPlayer's playlist until the next full load (`Player.pm`, `flush` / `_newGeneration`) | **MOOT** 2026-09-11 — raised in review, verified here, NO code change | The cancel is real; the consequence is not. `cancelQueued` has exactly one caller, `_newGeneration`, and that has exactly two: `_startTrack` and `stop()`. **Both cover the clear they cancel.** Down `_startTrack` the very next call is `_queueTrack`, which re-sends `<Stop/>` + `<PlaylistClear/>` in the NEW generation — so the cancel removes a redundant clear that the load's own clear supersedes, which is what the scope is for. Down `stop()` the item genuinely does survive, and it cannot be reached: the engine is stopped, `stop()` zeroes `hqStarted` and `hqPlayAck` so `_canHandOver` refuses every hand-over, and the only route back to playback is `play()` → `_startTrack`, which opens Stop + PlaylistClear. Nothing can play the stale item, and `resume()` is not that route — LMS reaches it from `pause()`, never from a stop. **The stated consequence is the DESIGNED steady state, not a defect**: `_appendTrack` only ever adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer's list is a HISTORY of the run and every track already played sits in it on exactly the same terms. Trimming it was offered and declined — see `HQPlayer's playlist should show the whole LMS queue`. **No writer reaches the harmful branch**, which is the whole verdict: the review named a branch, not a route to it. Suite green at the time of checking (62 + 133 + others, 0 failed). |
 | The image proxy answers a dead cover with 200 and radio.png, so since 1.0.1 an expired CDN link or dead station logo shows a radio icon on the endpoint where it used to show nothing (`Player.pm` `_remoteArt`) | **ACCEPTED** 2026-09-17, Simon's call | Measured live: a 404 origin through `/imageproxy/.../image_600x600_o.jpg` answers `200 image/png`, 41,647 B, LMS's 512x512 `radio.png`. In 9.1 `_artworkError` has `$response->code($code)` commented out, so no status reaches the endpoint; only `Cache-Control: no-cache` and a past `Expires` mark it. `_coverURL` still returns a URL, so `_reusableArt` never runs and the log shows no miss. Detecting it would need the bridge to serve its own cover route and turn that header into a 404; declined as not worth the LMS-internals dependency. It is what LMS's own screens show for a dead cover. |
+| The live page's service badge is drawn only where Material is installed: `loadEmblems()` fetches `/material/html/misc/emblems.json` and the logo comes from `/material/svg/<name>`, so on a server without Material the fetch 404s, `EMBLEMS` stays null and no badge is ever drawn (`Live.pm`, `np-badge`) | **BY DESIGN** 2026-09-20, Simon's call: "only material shows badges so this is expected" - badge itself **VERIFIED LIVE** on 1.0.3 | **Only Material shows badges, and that is the whole point** — the badge exists to match the one Material already draws on LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows, so it uses Material's own emblem table and its own recoloured logos rather than a copy that would drift the moment Material changes a colour or adds a service. A skin that draws no badges anywhere has nothing to match, and a fallback drawn from some other asset would be a second, divergent badge. The fetch failing costs the badge and nothing else on the page. **Not a defect, and not a gap to fill with a fallback.** |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -553,6 +555,35 @@ after 5 consecutive errors rather than hammering a restarting server.
 **The query returns the formatted strings, not raw fields**, so the JS only
 assigns `textContent`. Parsing a formatted row apart in JS would break the
 moment anyone translates the strings.
+
+### The live page's service badge (2026-09-20)
+
+**VERIFIED LIVE 2026-09-20** on 1.0.3, installed on the rig - Simon: "that works".
+
+The now-playing cover carries the same service emblem Material draws on
+LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows. Those two get it for free:
+they set `extid` on an XMLBrowser row and **Material** renders it. **That route
+is not open here** — the live page is a raw handler that renders itself, so
+`extid` alone would draw nothing and the page does Material's lookup itself.
+
+**MEASURED, not assumed: a status result carries NO `extid` for the playing
+track.** On the rig, `status - 1 tags:aluKcdx` on a Qobuz track answers
+`url => 'qobuz://449954371.flac'` and nothing naming the service; the `x` tag
+adds nothing at all. So the key comes from the **URL prefix**, which is how
+Material solves the same problem (`getTrackSource`). `Plugin::_extid` maps the
+prefix to Material's emblem key and `nowPlayingFor` sends it as `np_extid` in
+the `signalpath` poll, in the same `'<key>:'` shape the other two plugins send.
+
+**The prefix is not always the emblem name** — `sounds:` is keyed `bbc`, `wimp:`
+is Tidal — so the table maps Material's `track-sources.json` keys onto its
+`emblems.json` keys. An invented key draws nothing.
+
+**The colours and logos are FETCHED from Material, never copied**:
+`loadEmblems()` reads `/material/html/misc/emblems.json` once per page load and
+the logo is `/material/svg/<name>?c=<colour>`, Material's own recolour route. A
+copy here would drift the moment Material changes a colour or adds a service.
+That it therefore only appears where Material is installed is **by design** —
+see the ledger row.
 
 ### The Apps feed: how the settings page is reached from Material (0.2.57)
 
@@ -4647,6 +4678,27 @@ ships alongside but is not itself the reason for the bump. No cache-key
 prefixes exist in this plugin to clear; the image-proxy URL changes with the
 ext, so LMS's own imageproxy cache self-invalidates. 774 assertions across five
 suites, 0 failed, sweep clean. Not yet installed live.
+
+## 1.0.3 (2026-09-20): the live page's service badge
+
+DEV BUILD, pushed to `dev` only. Ships the service badge described above
+under "The live page's service badge (2026-09-20)" — `Plugin::_extid` maps a
+track URL prefix to Material's emblem key, `nowPlayingFor` sends it as
+`np_extid` on the `signalpath` query, and `Live.pm` draws the badge on the
+cover from Material's own `emblems.json` + `/material/svg` logos.
+Material-only by design (ledger row: `only Material shows badges, and that is
+the whole point`). No cache-key prefixes exist in this plugin to clear.
+
+## 1.0.4 (2026-09-20): the badge's own sizing and opacity
+
+DEV BUILD, pushed to `dev` only. CSS-only change in `Live.pm`: the badge drew
+as a solid 26px circle in 1.0.3, and Simon called it at once - "not as
+transparent" as the badge on an LMS-Listen-to-Later / LMS-Pitchfork-Reviews
+row. It now matches those rows' own numbers - an 18px logo at
+`--sub-opacity 0.7` - instead of a size and opacity picked here. Two new
+assertions in `tools/t_live.pl` pin both numbers. No markup, JS logic or test
+data changed; the mechanism above is unchanged. No cache-key prefixes exist in
+this plugin to clear.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

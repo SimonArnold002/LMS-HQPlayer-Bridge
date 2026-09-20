@@ -347,7 +347,7 @@ sub _signalPathQuery {
         my $np = nowPlayingFor( $b->{client} );
 
         for my $k (qw( title artist album artwork state position duration
-                       volume muted volctl )) {
+                       volume muted volctl extid )) {
             $request->addResultLoop( 'bridges_loop', $i, "np_$k", $np->{$k} )
                 if defined $np->{$k};
         }
@@ -534,6 +534,11 @@ sub nowPlayingFor {
             if defined $cover && $cover ne '' && $cover !~ /^-/;
     }
 
+    # THE SERVICE BADGE'S KEY, FROM THE URL - see _extid. Absent for a local
+    # file, a plain radio stream, or any service Material has no emblem for.
+    my $extid = _extid( $t->{url} // $rm->{url} );
+    $np{extid} = $extid if defined $extid;
+
     # NOTHING PLAYING DROPS THE TRACK, NOT THE PLAYER.
     #
     # These keys are absent rather than blank, so the page draws no artwork, no
@@ -544,10 +549,60 @@ sub nowPlayingFor {
     # what the transport and volume controls need in order to still work when
     # the queue is stopped. Returning an empty hash here would have left the
     # page with a mute button and no idea whether it was muted.
-    delete @np{ qw( title artist album artwork duration position ) }
+    delete @np{ qw( title artist album artwork duration position extid ) }
         unless length $np{title};
 
     return \%np;
+}
+
+# ---------------------------------------------------------------------------
+# THE SERVICE BADGE, IN THE SHAPE THE OTHER PLUGINS SEND IT.
+#
+# LMS-Listen-to-Later and LMS-Pitchfork-Reviews put a service logo on a row by
+# setting `extid`: Material reads the part before the first ':' and looks it up
+# in its own misc/emblems.json. That route is NOT open to this plugin - those
+# are XMLBrowser rows that MATERIAL renders, and the live page renders itself
+# (see Live.pm) - so the key travels in the same `extid` shape and the page
+# draws the badge from it. Sending the same shape is the point: the page can
+# then do exactly what Material does with it, and a service Material learns
+# about needs no change here beyond a line in the table.
+#
+# THE KEY COMES FROM THE URL, BECAUSE A STATUS RESULT HAS NO `extid` FOR THE
+# PLAYING TRACK. Measured on the rig, not assumed: `status` with `tags:x` adds
+# nothing, and a Qobuz track answers `url => 'qobuz://449954371.flac'` and
+# nothing else that names the service. Material has the same problem and
+# solves it the same way (getTrackSource), so the prefixes below are ITS
+# track-sources.json keys mapped to ITS emblems.json keys - they are not
+# always the same word (sounds: -> bbc), and an invented one draws nothing.
+my %EMBLEM = (
+    'qobuz:'         => 'qobuz',
+    'tidal:'         => 'tidal',
+    'wimp:'          => 'wimp',
+    'spotify:'       => 'spotify',
+    'spoton:'        => 'spoton',
+    'deezer:'        => 'deezer',
+    'bandcamp:'      => 'bandcamp',
+    'youtube:'       => 'youtube',
+    'ytm:'           => 'ytm',
+    'pandora:'       => 'pandora',
+    'pyrrha:'        => 'pyrrha',
+    'radioparadise:' => 'radioparadise',
+    'ibcst:'         => 'ibcst',
+    'sounds:'        => 'bbc',
+);
+
+sub _extid {
+    my $url = shift;
+
+    return undef unless defined $url && length $url;
+
+    my $lc = lc $url;
+
+    for my $pfx ( keys %EMBLEM ) {
+        return $EMBLEM{$pfx} . ':' if index( $lc, $pfx ) == 0;
+    }
+
+    return undef;
 }
 
 sub _fmtFormat {
