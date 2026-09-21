@@ -206,6 +206,19 @@ ok(conf(mode='servce')['mode'] == 'auto', 'a typo falls back to auto rather than
 # `cfg['token'].encode()` raises on a number, so every tokened request 500s.
 ok(c6['token'] == '12345' and c6['listen'] == '0', 'token and listen are text (%r, %r)' % (c6['token'], c6['listen']))
 
+# A trailing comma used to raise a traceback and leave the service manager
+# restarting the helper for ever, with the file's own name nowhere in sight.
+bad = os.path.join(tempfile.mkdtemp(), 'hqrestart.json')
+real_open(bad, 'w').write('{ "token": "abc", }')
+try:
+    hq.Config(bad); ok(False, 'a broken config stops the helper')
+except SystemExit as e:
+    ok(e.code == 2, 'a broken config stops the helper with a plain message, not a traceback')
+except Exception as e:
+    ok(False, 'a broken config raised %s instead' % type(e).__name__)
+ok(real_open(bad).read() == '{ "token": "abc", }', 'and the file is NOT rewritten over the user\'s edits')
+ok(conf(start_command=[EXE, 7])['start_command'] == [EXE, '7'], 'start_command elements are text - a number raises on the way to Popen')
+
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')

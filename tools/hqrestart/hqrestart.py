@@ -110,8 +110,21 @@ class Config:
         self.state_path = os.path.join(os.path.dirname(path), 'hqrestart-state.json')
         data = {}
         if os.path.exists(path):
-            with open(path) as f:
-                data = json.load(f)
+            # A hand-edited file with a trailing comma used to raise a TRACEBACK
+            # here, which the service manager answers by restarting the helper
+            # for ever: the Restart row just disappears with no plain reason.
+            # Say what is wrong in one line and stop. The file is never rewritten
+            # from this path, so the user's edits and token survive.
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (ValueError, OSError) as e:
+                log('config: cannot read %s (%s). Nothing was changed - fix the '
+                    'file, or move it aside to start with a fresh one.' % (path, e))
+                raise SystemExit(2)
+            if not isinstance(data, dict):
+                log('config: %s must hold a JSON object; ignoring it' % path)
+                data = {}
         self.c = dict(DEFAULTS, **data)
         self._coerce()
         if not self.c['token']:
@@ -147,7 +160,10 @@ class Config:
         if isinstance(cmd, str):
             log('config: "start_command" should be a list; splitting it')
             self.c['start_command'] = shlex.split(cmd, posix=(PLATFORM != 'win32'))
-        elif cmd is not None and not isinstance(cmd, (list, tuple)):
+        elif isinstance(cmd, (list, tuple)):
+            # every element reaches Popen, and a number raises in start_argv
+            self.c['start_command'] = [str(x) for x in cmd] or None
+        elif cmd is not None:
             log('config: "start_command" should be a list; ignoring %r' % (cmd,))
             self.c['start_command'] = None
 
