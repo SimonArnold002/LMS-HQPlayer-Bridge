@@ -48,6 +48,11 @@ could do it. A form POST is refused as well. Browsers won't send a JSON POST to 
 site without checking with the server first, and this server doesn't answer that check.
 The Bridge sends a JSON POST.
 
+The request must also be addressed to the helper by IP address (or `localhost`, or a name in
+`hostnames`). Otherwise a web page could point its own domain at your machine's address
+(DNS rebinding) and make the POST look same-origin. That only matters if a browser runs on a
+machine in `allow`. The Bridge always connects by IP address.
+
 ## Use
 
 ```
@@ -66,7 +71,8 @@ Every key is optional except `token`, which is generated on first run.
 | key | default | meaning |
 |---|---|---|
 | `port` / `listen` | `8090` / `0.0.0.0` | where it listens. Keep 8090 for the HQPlayer Bridge to find it |
-| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST (see below). Put your LMS server here, e.g. `["192.168.1.234"]` |
+| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). Put your LMS server here, e.g. `["192.168.1.234"]` |
+| `hostnames` | `[]` | host names, besides an IP address or `localhost`, that the tokenless route may be addressed by |
 | `mode` | `auto` | force `app` or `service` |
 | `service` | detected | pin the launchd label, systemd unit or Windows service name |
 | `user_service` | detected | Linux: `true` for `systemctl --user` |
@@ -76,6 +82,12 @@ Every key is optional except `token`, which is generated on first run.
 | `respawn_wait` | `6` | macOS app: seconds to let macOS relaunch it first |
 | `start_timeout` | `30` | seconds for the new process to appear |
 | `total_timeout` | `90` | the whole restart, every wait included. The Bridge waits 120s, so keep this below that |
+
+## Windows notes
+
+`install.ps1` runs the helper with `pythonw`, which has no console. The helper then writes
+its log to `hqrestart.log` next to its config. Opening the firewall port needs an admin
+PowerShell. Without it the installer warns you, and LMS may not be able to reach the helper.
 
 ## Linux notes
 

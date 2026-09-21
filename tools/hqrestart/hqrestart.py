@@ -17,10 +17,13 @@ running at all. Every guess can be pinned in the config file.
 
 Endpoints (token required - `Authorization: Bearer <token>`, `X-Token`, or `?token=`).
 An address in the config's `allow` list is let in WITHOUT the token only on a POST
-sent as `Content-Type: application/json`: a GET would let anything that can make
-that host fetch a URL - LMS's own image proxy, a browser there - restart HQPlayer,
-and a JSON POST is one a browser will not send cross-site without a CORS preflight
-this server never answers.
+sent as `Content-Type: application/json`, addressed by IP (or `localhost`, or a
+name in `hostnames`). A GET would let anything that can make that host fetch a
+URL - LMS's own image proxy, a browser there - restart HQPlayer. A browser will
+not send a JSON POST cross-site without a CORS preflight this server never
+answers - BUT a page can rebind its own domain to this address and make the
+POST same-origin (DNS rebinding); it then arrives carrying that domain as its
+Host, which is what the Host rule refuses.
 
     GET  /ping      {"ok", "service": "hqrestart"} - NO token; how the HQPlayer Bridge
                     finds out this host can be restarted
@@ -32,6 +35,7 @@ Standard library only; Python 3.7+.
 """
 
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -64,6 +68,7 @@ DEFAULTS = {
     'port':          8090,
     'token':         '',
     'allow':         [],      # addresses that need no token, e.g. the LMS server
+    'hostnames':     [],      # names besides an IP / localhost the tokenless path may be addressed by
     'process_names': None,  # None -> DEFAULT_NAMES for this OS
     'mode':          'auto',  # auto | app | service
     'service':       '',      # pin the launchd label / systemd unit / Windows service name
@@ -439,6 +444,23 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def direct_host(self):
+        """True when the request was addressed to this host by IP, `localhost` or a
+        configured name - never by some other domain, which is what a DNS-rebound
+        page sends."""
+        host = (self.headers.get('Host') or '').strip().lower()
+        if host.startswith('['):                        # [v6]:port
+            host = host[1:].split(']', 1)[0]
+        elif host.count(':') == 1:                      # v4-or-name:port
+            host = host.split(':', 1)[0]
+        if host == 'localhost' or host in [h.lower() for h in self.cfg['hostnames']]:
+            return True
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            return False
+
     def authorised(self, url):
         got = self.headers.get('X-Token') or ''
         auth = self.headers.get('Authorization') or ''
@@ -460,7 +482,8 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(min(n, 65536))
         trusted = (self.command == 'POST'
                    and self.client_address[0] in self.cfg['allow']
-                   and (self.headers.get('Content-Type') or '').split(';')[0].strip() == 'application/json')
+                   and (self.headers.get('Content-Type') or '').split(';')[0].strip() == 'application/json'
+                   and self.direct_host())
         if not (trusted or self.authorised(url)):
             return self.reply(401, {'ok': False, 'error': 'bad or missing token'})
         if url.path == '/status':
@@ -491,6 +514,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'hqrestart.json')
+    # Under pythonw (how install.ps1 runs it on Windows) there is no stderr at
+    # all: the first log line - and http.server's own error output - would
+    # raise and kill the helper before it listens. Log to a file instead.
+    if sys.stderr is None:
+        sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(path)), 'hqrestart.log'),
+                          'a', buffering=1, encoding='utf-8')
     cfg = Config(path)
     Handler.cfg = cfg
     srv = ThreadingHTTPServer((cfg['listen'], int(cfg['port'])), Handler)

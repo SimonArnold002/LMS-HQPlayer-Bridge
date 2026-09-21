@@ -40,8 +40,19 @@ Start-ScheduledTask -TaskName $task
 $port = 8090
 for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
 $token = (Get-Content $cfg -Raw | ConvertFrom-Json).token
-New-NetFirewallRule -DisplayName 'hqrestart' -Direction Inbound -Protocol TCP -LocalPort $port `
-    -Action Allow -Profile Private -ErrorAction SilentlyContinue | Out-Null
+if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyContinue)) {
+    # only once: a re-install must not stack duplicate rules
+    New-NetFirewallRule -DisplayName 'hqrestart' -Direction Inbound -Protocol TCP -LocalPort $port `
+        -Action Allow -Profile Private -ErrorAction SilentlyContinue | Out-Null
+}
+# Creating the rule needs an admin PowerShell; without it the helper runs but
+# LMS may never reach it, and the Restart row simply never appears. Say so.
+if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyContinue)) {
+    Write-Warning ("No firewall rule for port $port - LMS may not be able to reach the helper. " +
+                   "From an ADMIN PowerShell run:`n  New-NetFirewallRule -DisplayName hqrestart " +
+                   "-Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Private")
+}
 "installed. config: $cfg"
+"log:     $(Join-Path $dir 'hqrestart.log')"
 "token:   $token"
 "test:    curl -H `"Authorization: Bearer $token`" http://$($env:COMPUTERNAME):$port/status"
