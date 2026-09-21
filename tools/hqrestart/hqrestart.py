@@ -40,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -112,6 +113,17 @@ class Config:
             with open(path) as f:
                 data = json.load(f)
         self.c = dict(DEFAULTS, **data)
+        # These are hand-edited, and a key written as a bare string instead of a
+        # list is the easy mistake. `addr in "1.2.3.4"` is a SUBSTRING test, so a
+        # string `allow` would let 1.2.3 and 1.2 past the token as well.
+        for k in ('allow', 'hostnames', 'process_names'):
+            if isinstance(self.c[k], str):
+                log('config: "%s" should be a list; reading it as one entry' % k)
+                self.c[k] = [self.c[k]]
+        if isinstance(self.c['start_command'], str):
+            log('config: "start_command" should be a list; splitting it')
+            self.c['start_command'] = shlex.split(self.c['start_command'],
+                                                  posix=(PLATFORM != 'win32'))
         if not self.c['token']:
             self.c['token'] = secrets.token_urlsafe(24)
             data['token'] = self.c['token']
@@ -324,6 +336,14 @@ def stop_app(pid, cfg, budget):
         time.sleep(1)
 
 
+def launch_cwd(how):
+    """The directory to start HQPlayer in, or None. A recorded cwd that has since
+    gone (an upgrade replaces the directory; /proc reports it as "... (deleted)")
+    would make Popen raise AFTER the stop, so it is dropped rather than used."""
+    cwd = how.get('cwd')
+    return cwd if cwd and os.path.isdir(cwd) else None
+
+
 def start_argv(how, cfg):
     """The command that starts HQPlayer again, or None when there is none that
     would work. Decided BEFORE anything is stopped: a restart that cannot start
@@ -351,9 +371,11 @@ def start_argv(how, cfg):
     if os.sep in exe or (os.altsep and os.altsep in exe):
         if not os.path.isabs(exe):
             # relative to HQPlayer's own directory - unusable if that is unknown
-            if not how.get('cwd'):
+            # or no longer there
+            cwd = launch_cwd(how)
+            if not cwd:
                 return None
-            exe = argv[0] = os.path.normpath(os.path.join(how['cwd'], exe))
+            exe = argv[0] = os.path.normpath(os.path.join(cwd, exe))
         if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
             return None
     elif not shutil.which(exe):
@@ -367,7 +389,7 @@ def start_app(how, cfg):
         raise RuntimeError('do not know how to start HQPlayer; set "start_command" in the config')
     log('starting: %s' % ' '.join(argv))
     kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
-          'close_fds': True, 'cwd': how.get('cwd') or None}
+          'close_fds': True, 'cwd': launch_cwd(how)}
     if how.get('env'):
         kw['env'] = dict(os.environ, **how['env'])
     if PLATFORM == 'win32':

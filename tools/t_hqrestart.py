@@ -38,7 +38,11 @@ hq.open = f_open             # module-level name lookup for open()
 os.readlink = f_readlink
 
 calls = []
+ORIG_DETECT, ORIG_RESTART_SERVICE = hq.detect, hq.restart_service
 def setup(platform, proc=None, state=None, pinned=None):
+    # some cases below replace these; a leaked patch would silently answer the
+    # NEXT case and its assertions would be measuring nothing
+    hq.detect, hq.restart_service = ORIG_DETECT, ORIG_RESTART_SERVICE
     global PROC
     PROC = proc or {}
     calls.clear()
@@ -143,6 +147,39 @@ cfg = setup('darwin')
 hq.detect = lambda pid, c: {'mode': 'app', 'os': 'darwin', 'exe': '/Applications/gone.app/Contents/MacOS/x', 'bundle': '/Applications/gone.app'}
 r, e = run(cfg)
 ok(e and not any(c[0] == 'stop' for c in calls), 'refused, nothing stopped (%s)' % e)
+
+print('== a recorded cwd that has gone is dropped, not handed to the launch')
+GONE_CWD = os.path.join(tmp, 'gone')
+cfg = setup('linux', linux_proc(EXE, GONE_CWD, exe=DENY))
+r, e = run(cfg)
+ok(e is None, 'restart succeeds (%s)' % e)
+started = [c for c in calls if c[0] == 'start']
+ok(started and started[0][2] is None, 'started with no cwd rather than a dead one (%r)' % (started and started[0][2]))
+# CONTROL: a cwd that EXISTS is still used.
+cfg = setup('linux', linux_proc(EXE, BIN, exe=DENY))
+r, e = run(cfg)
+ok(('start', [EXE, '--x'], BIN) in calls, 'a real cwd is still passed')
+
+print('== relative argv whose cwd has gone: LEFT RUNNING')
+cfg = setup('linux', linux_proc('./hqplayerd', GONE_CWD, exe=DENY))
+r, e = run(cfg)
+ok(e and 'left running' in e and not any(c[0] == 'stop' for c in calls), 'refused, nothing stopped (%s)' % e)
+
+print('== a list key written as a bare string is read as ONE entry')
+import json as _json
+d = tempfile.mkdtemp(); cfgp = os.path.join(d, 'hqrestart.json')
+_json.dump({'token': 't', 'allow': '192.168.1.234', 'hostnames': 'hq.local',
+            'start_command': '%s --flag' % EXE}, real_open(cfgp, 'w'))
+c2 = hq.Config(cfgp)
+ok(c2['allow'] == ['192.168.1.234'], 'allow is a list (%r)' % (c2['allow'],))
+# `addr in "192.168.1.234"` is TRUE for 192.168.1.23 - the whole point.
+ok('192.168.1.23' not in c2['allow'], 'a shorter address that is a SUBSTRING is not allowed')
+ok('192.168.1.234' in c2['allow'], 'the address itself still is')
+ok(c2['hostnames'] == ['hq.local'], 'hostnames too')
+ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not read character by character (%r)' % (c2['start_command'],))
+# CONTROL: a proper list is untouched.
+_json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
+ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)
