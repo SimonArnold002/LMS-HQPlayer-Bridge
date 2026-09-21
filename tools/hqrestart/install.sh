@@ -92,6 +92,8 @@ Wants=network-online.target
 [Service]
 ExecStart=$PY $DIR/hqrestart.py $DIR/hqrestart.json
 Restart=always
+# stopping or updating the helper must never take a relaunched HQPlayer with it
+KillMode=process
 RestartSec=3
 
 [Install]

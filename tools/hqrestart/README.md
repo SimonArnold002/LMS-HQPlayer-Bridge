@@ -41,6 +41,13 @@ The Bridge needs no settings. When its control link to an HQPlayer comes up, it 
 **Restart HQPlayer** row in the Bridge's Apps list. The restart itself only works if the LMS
 server's address is in `allow`: the Bridge has no token to send.
 
+**Why only a JSON POST gets in without the token.** Anything that can make the LMS
+server fetch a URL would otherwise restart HQPlayer as a GET. LMS's own image proxy fetches
+any URL a client gives it, and LMS needs no login by default, so any web page on the LAN
+could do it. A form POST is refused as well. Browsers won't send a JSON POST to another
+site without checking with the server first, and this server doesn't answer that check.
+The Bridge sends a JSON POST.
+
 ## Use
 
 ```
@@ -49,7 +56,7 @@ curl -X POST -H 'Authorization: Bearer TOKEN' http://HQHOST:8090/restart
 http://HQHOST:8090/restart?token=TOKEN        # browser bookmark / phone shortcut
 ```
 
-`/restart` returns once HQPlayer is back, with the old and new process ids (about 7s on a Mac).
+The token is never written to the log (`token=***`). `/restart` returns once HQPlayer is back, with the old and new process ids (about 7s on a Mac).
 Only one restart runs at a time; a second request gets `409`.
 
 ## Config (`hqrestart.json`)
@@ -59,7 +66,7 @@ Every key is optional except `token`, which is generated on first run.
 | key | default | meaning |
 |---|---|---|
 | `port` / `listen` | `8090` / `0.0.0.0` | where it listens. Keep 8090 for the HQPlayer Bridge to find it |
-| `allow` | `[]` | addresses that may call it WITHOUT the token. Put your LMS server here, e.g. `["192.168.1.234"]` |
+| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST (see below). Put your LMS server here, e.g. `["192.168.1.234"]` |
 | `mode` | `auto` | force `app` or `service` |
 | `service` | detected | pin the launchd label, systemd unit or Windows service name |
 | `user_service` | detected | Linux: `true` for `systemctl --user` |
@@ -68,9 +75,18 @@ Every key is optional except `token`, which is generated on first run.
 | `stop_timeout` | `20` | seconds allowed for a clean exit before it is killed |
 | `respawn_wait` | `6` | macOS app: seconds to let macOS relaunch it first |
 | `start_timeout` | `30` | seconds for the new process to appear |
+| `total_timeout` | `90` | the whole restart, every wait included. The Bridge waits 120s, so keep this below that |
+
+## Linux notes
+
+Under systemd, a process the helper starts would otherwise stay in the helper's own cgroup.
+Stopping the helper would then kill it, and the next restart would mistake it for the helper's
+own service. So on Linux an app is relaunched through `systemd-run --scope`, the helper
+ignores its own unit when working out how HQPlayer was started, and its unit has
+`KillMode=process`.
 
 ## Tested
 
 macOS app mode, 2026-09-21: `hqplayerd` Embedded 6.0.2 on macOS 26.6, restarted in 7.1s. The
 saved SDM settings came back (`Set dither: 9` / `Set modulator: 18`), and the Bridge and the
-Eversolo NAA reconnected. **Not yet run:** macOS service mode, Linux, Windows.
+Eversolo NAA reconnected. **Not yet run:** macOS service mode, Linux, Windows. The Linux cgroup handling is tested in a harness only.

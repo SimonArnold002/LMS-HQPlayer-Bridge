@@ -700,7 +700,14 @@ print "-- the restart row --\n";
     # THE SECOND DOES IT, and the page that opens is the outcome.
     Plugins::HQPlayerBridge::Plugin::_restartNow( undef, sub { $page = shift }, {}, { id => 'aa' } );
     is($REQ->[0]{url}, 'http://10.0.0.5:8090/restart', 'Restart now calls the helper');
-    ok(scalar( $REQ->[0]{timeout} >= 60 ), 'with a timeout that outlasts the restart itself');
+    # A GET here is reachable by anything that can make LMS fetch a URL - its
+    # own image proxy does, for any client - so the helper waives the token
+    # ONLY for a JSON POST. Measured 2026-09-21.
+    is($REQ->[0]{method}, 'POST', 'as a POST - the helper refuses a tokenless GET');
+    is($REQ->[0]{headers}{'Content-Type'}, 'application/json', 'sent as JSON, which is what the helper trusts');
+    # The helper bounds a restart at total_timeout = 90s; waiting only as long
+    # reads a slow service stop as a failure that then succeeds.
+    ok(scalar( $REQ->[0]{timeout} > 90 ), 'and it waits LONGER than the helper\'s 90s bound');
     $page = undef;
     $REQ->[0]{cb}->( FakeRes->new('{"ok": true, "old_pid": 1, "new_pid": 2, "seconds": 7.1}') );
     is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_OK', 'success says so');

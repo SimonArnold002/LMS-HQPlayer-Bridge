@@ -317,6 +317,11 @@ sub topLevel {
 # the restart is authorised on the helper's side by this server's address
 # (its `allow` list). No helper answering means no row - the ordinary case.
 #
+# THE RESTART IS A JSON POST, NEVER A GET: the helper only waives the token for
+# that. LMS's own image proxy will GET any URL a client hands it, from THIS
+# server's address - so a GET-able restart was reachable from any web page on
+# the LAN (measured 2026-09-21 against `/status`).
+#
 # MANUAL ONLY. The bridge never restarts HQPlayer by itself - auto-recovery of
 # the NAA was DECLINED 2026-09-21 ("This is for Eversolo to fix").
 # ---------------------------------------------------------------------------
@@ -371,7 +376,9 @@ sub _restartConfirm {
 }
 
 # Answers when HQPlayer is back (the helper waits for the new process, ~7s on
-# a Mac), so the page that opens is the outcome. The control link drops and
+# a Mac), so the page that opens is the outcome. The helper bounds the whole
+# restart at 90s (`total_timeout`); this waits longer, or a slow service stop
+# would read as a failure that then succeeds. The control link drops and
 # comes back on its own backoff - nothing here touches it.
 sub _restartNow {
     my ( $client, $callback, $args, $pt ) = @_;
@@ -398,8 +405,8 @@ sub _restartNow {
             $log->warn( "restart on $ip failed: " . ( $r->{error} || $error || '?' ) );
             $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_FAIL', $r->{error} || $error || '?' ) );
         },
-        { timeout => 90 },
-    )->get( _restartUrl( $ip, '/restart' ) );
+        { timeout => 120 },
+    )->post( _restartUrl( $ip, '/restart' ), 'Content-Type' => 'application/json', '{}' );
 
     return;
 }

@@ -15,14 +15,18 @@ an app - and restarts it the same way:
 The last launch recipe seen is saved, so HQPlayer can be STARTED when it is not
 running at all. Every guess can be pinned in the config file.
 
-Endpoints (token required - `Authorization: Bearer <token>`, `X-Token`, or `?token=` -
-unless the caller's address is in the config's `allow` list):
+Endpoints (token required - `Authorization: Bearer <token>`, `X-Token`, or `?token=`).
+An address in the config's `allow` list is let in WITHOUT the token only on a POST
+sent as `Content-Type: application/json`: a GET would let anything that can make
+that host fetch a URL - LMS's own image proxy, a browser there - restart HQPlayer,
+and a JSON POST is one a browser will not send cross-site without a CORS preflight
+this server never answers.
 
     GET  /ping      {"ok", "service": "hqrestart"} - NO token; how the HQPlayer Bridge
                     finds out this host can be restarted
     GET  /status    {"running", "pid", "mode", "how"}
     POST /restart   {"ok", "old_pid", "new_pid", "mode", "how", "seconds"}
-    GET  /restart   same, so a browser bookmark or phone shortcut works
+    GET  /restart   same, WITH the token, so a browser bookmark or phone shortcut works
 
 Standard library only; Python 3.7+.
 """
@@ -62,6 +66,7 @@ DEFAULTS = {
     'stop_timeout':  20,      # seconds for a clean exit before SIGKILL
     'respawn_wait':  6,       # macOS app: seconds to let launchd relaunch it before we do
     'start_timeout': 30,      # seconds for the new process to appear
+    'total_timeout': 90,      # the whole restart; the HQPlayer Bridge waits a little longer
 }
 
 
@@ -189,6 +194,16 @@ def detect_darwin(pid, cfg):
     return {'mode': 'app', 'os': 'darwin', 'exe': exe, 'bundle': bundle}
 
 
+def own_unit():
+    """The systemd unit THIS helper runs in, if any."""
+    try:
+        with open('/proc/self/cgroup') as f:
+            m = re.search(r'/([^/\s]+\.service)\s*$', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
 def detect_linux(pid, cfg):
     try:
         with open('/proc/%d/cmdline' % pid, 'rb') as f:
@@ -207,7 +222,11 @@ def detect_linux(pid, cfg):
         # e.g. 0::/system.slice/hqplayerd.service
         #      0::/user.slice/user-1000.slice/user@1000.service/app.slice/hqplayerd.service
         m = re.search(r'/([^/\s]+\.service)\s*$', cg, re.M)
-        if m and not m.group(1).startswith('user@') and 'session-' not in cg:
+        # A copy WE relaunched without systemd-run sits in our own unit's
+        # cgroup; restarting "that service" would restart this helper and
+        # take HQPlayer down with it, starting nothing.
+        if (m and not m.group(1).startswith('user@') and 'session-' not in cg
+                and m.group(1) != own_unit()):
             unit = m.group(1)
             if user is None:
                 user = '/user@' in cg
@@ -238,7 +257,7 @@ def detect(pid, cfg):
 
 # ---------------------------------------------------------------- stop / start
 
-def stop_app(pid, cfg):
+def stop_app(pid, cfg, budget):
     if PLATFORM == 'win32':
         run(['taskkill', '/PID', str(pid)])            # polite close first
     else:
@@ -246,11 +265,11 @@ def stop_app(pid, cfg):
             os.kill(pid, signal.SIGTERM)                  # hqplayerd shuts down cleanly on TERM
         except ProcessLookupError:
             return
-    deadline = time.time() + cfg['stop_timeout']
+    deadline = time.time() + min(cfg['stop_timeout'], budget)
     while time.time() < deadline and alive(pid):
         time.sleep(0.25)
     if alive(pid):
-        log('pid %d ignored the polite stop for %ss, killing' % (pid, cfg['stop_timeout']))
+        log('pid %d ignored the polite stop, killing' % pid)
         if PLATFORM == 'win32':
             run(['taskkill', '/F', '/PID', str(pid)])
         else:
@@ -280,10 +299,16 @@ def start_app(how, cfg):
         kw['creationflags'] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
         kw['start_new_session'] = True                  # outlive this webhook
+        # Under systemd a new session is NOT a new cgroup: the app would stay
+        # in this helper's unit, be killed by its stop, and be mistaken for
+        # it next time. A transient scope gives it a cgroup of its own.
+        if PLATFORM == 'linux' and own_unit() and run(['systemd-run', '--version'])[0] == 0:
+            argv = (['systemd-run', '--scope', '--quiet', '--collect']
+                    + (['--user'] if os.geteuid() != 0 else []) + ['--'] + list(argv))
     subprocess.Popen(argv, **kw)
 
 
-def restart_service(how):
+def restart_service(how, budget):
     if how['os'] == 'darwin':
         argv = ['launchctl', 'kickstart', '-k', how['target']]
     elif how['os'] == 'linux':
@@ -292,7 +317,7 @@ def restart_service(how):
         argv = ['powershell', '-NoProfile', '-Command',
                 "Restart-Service -Name '%s' -Force" % how['target'].replace("'", "''")]
     log('restarting service: %s' % ' '.join(argv))
-    rc, out = run(argv, timeout=90)
+    rc, out = run(argv, timeout=max(1, budget))
     if rc != 0:
         raise RuntimeError('%s failed (rc %d): %s' % (argv[0], rc, out.strip()[:300]))
 
@@ -309,6 +334,12 @@ def wait_new_pid(cfg, old_pid, timeout):
 
 def restart(cfg):
     t0 = time.time()
+    deadline = t0 + cfg['total_timeout']
+
+    # Every wait is clipped to what is left, so the caller always hears back
+    # inside total_timeout - a slow service stop must not outlast the Bridge.
+    def left(want):
+        return max(0.0, min(want, deadline - time.time()))
     old = find_pid(cfg.names())
     if old:
         how = detect(old, cfg)
@@ -321,24 +352,24 @@ def restart(cfg):
     log('restart: pid %s, %s' % (old, json.dumps(how)))
 
     if how['mode'] == 'service':
-        restart_service(how)
-        new = wait_new_pid(cfg, old, cfg['start_timeout'])
+        restart_service(how, left(cfg['total_timeout']))
+        new = wait_new_pid(cfg, old, left(cfg['start_timeout']))
     else:
         if old:
-            stop_app(old, cfg)
+            stop_app(old, cfg, left(cfg['stop_timeout']))
         new = None
         if how['os'] == 'darwin' and old:
             # A login item / launchd can relaunch it by itself - give it the
             # chance, so we never end up with two copies.
-            new = wait_new_pid(cfg, old, cfg['respawn_wait'])
+            new = wait_new_pid(cfg, old, left(cfg['respawn_wait']))
             if new:
                 how = dict(how, respawned=True)
         if not new:
             start_app(how, cfg)
-            new = wait_new_pid(cfg, old, cfg['start_timeout'])
+            new = wait_new_pid(cfg, old, left(cfg['start_timeout']))
 
     if not new:
-        raise RuntimeError('HQPlayer did not come back within %ss' % cfg['start_timeout'])
+        raise RuntimeError('HQPlayer did not come back within %.0fs' % (time.time() - t0))
     return {'ok': True, 'old_pid': old, 'new_pid': new, 'mode': how['mode'], 'how': how,
             'seconds': round(time.time() - t0, 1)}
 
@@ -351,7 +382,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = 'hqrestart/1'
 
     def log_message(self, fmt, *args):
-        log('%s %s' % (self.client_address[0], fmt % args))
+        # never write the token: a bookmark call carries it in the query
+        log('%s %s' % (self.client_address[0], re.sub(r'(token=)[^&\s"]*', r'\1***', fmt % args)))
 
     def reply(self, code, body):
         data = (json.dumps(body, indent=2) + '\n').encode()
@@ -375,7 +407,13 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == '/ping':
             return self.reply(200, {'ok': True, 'service': 'hqrestart'})
-        if not (self.client_address[0] in self.cfg['allow'] or self.authorised(url)):
+        n = int(self.headers.get('Content-Length') or 0)
+        if n:
+            self.rfile.read(min(n, 65536))
+        trusted = (self.command == 'POST'
+                   and self.client_address[0] in self.cfg['allow']
+                   and (self.headers.get('Content-Type') or '').split(';')[0].strip() == 'application/json')
+        if not (trusted or self.authorised(url)):
             return self.reply(401, {'ok': False, 'error': 'bad or missing token'})
         if url.path == '/status':
             pid = find_pid(self.cfg.names())
