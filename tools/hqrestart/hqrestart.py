@@ -10,7 +10,7 @@ an app - and restarts it the same way:
     Linux    service: systemctl [--user] restart <unit>   (unit read from /proc/<pid>/cgroup)
              app:     SIGTERM, relaunch the recorded /proc/<pid>/cmdline, detached
     Windows  service: Restart-Service <name>              (the service owning the pid)
-             app:     Stop-Process, Start-Process <recorded exe path>
+             app:     taskkill, Start-Process <recorded exe path>
 
 The last launch recipe seen is saved, so HQPlayer can be STARTED when it is not
 running at all. Every guess can be pinned in the config file.
@@ -348,13 +348,17 @@ def alive(pid):
 
 # ---------------------------------------------------------------- how was it started?
 
+def launchd_domain():
+    return 'system' if os.geteuid() == 0 else 'gui/%d' % os.getuid()
+
+
 def detect_darwin(pid, cfg):
     exe = run(['ps', '-o', 'comm=', '-p', str(pid)])[1].strip()
     m = re.match(r'(.*?\.app)/', exe)
     bundle = m.group(1) if m else None
 
     label = cfg['service']
-    domain = 'system' if os.geteuid() == 0 else 'gui/%d' % os.getuid()
+    domain = launchd_domain()
     if not label:
         # `launchctl list` covers the caller's domain: the GUI session for a
         # LaunchAgent, the system domain when run as root.
@@ -517,15 +521,30 @@ def process_uid(pid):
     return None
 
 
+def win32_owner_sids(pid):
+    """(HQPlayer's owner SID, this helper's SID), or None when either cannot be read."""
+    rc, out = powershell(
+        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
+        "$o = if ($p) { (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid).Sid }; "
+        "\"$o $([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\"" % pid)
+    sids = out.split() if rc == 0 else []
+    if len(sids) == 2 and all(x.startswith('S-1-') for x in sids):
+        return sids[0], sids[1]
+    return None
+
+
 def same_owner(pid):
     """Whether HQPlayer runs as the user this helper runs as. An app is started
-    again as THIS helper's user, so a root helper (`--system`) against a user's
-    app would stop it and then run it as root - files in the user's HOME left
-    owned by root on Linux - or, on macOS, `open` it from outside the desktop
-    session, where it does not come back at all. An owner that cannot be read
-    is not a refusal: `may_signal` still stands behind it."""
+    again as THIS helper's user, so a root / SYSTEM helper (`--system`) against a
+    user's app would stop it and then run it as that account: on Linux with the
+    user's HOME (files left owned by root), on macOS `open`ed from outside the
+    desktop session, where it does not come back, on Windows in SYSTEM's
+    windowless session reading SYSTEM's profile - not the user's saved settings.
+    An owner that cannot be read is not a refusal: `may_signal` still stands
+    behind it."""
     if PLATFORM == 'win32':
-        return True
+        sids = win32_owner_sids(pid)
+        return sids is None or sids[0] == sids[1]
     uid = process_uid(pid)
     return uid is None or uid == os.geteuid()
 
@@ -634,6 +653,19 @@ def wait_new_pid(cfg, old_pid, timeout):
     return None
 
 
+def pinned_how(cfg):
+    """How to start HQPlayer from the config alone, or None when it does not say."""
+    if cfg['mode'] != 'app' and cfg['service']:
+        if PLATFORM == 'darwin':
+            return {'mode': 'service', 'os': 'darwin', 'target': '%s/%s' % (launchd_domain(), cfg['service'])}
+        if PLATFORM == 'linux':
+            return {'mode': 'service', 'os': 'linux', 'target': cfg['service'], 'user': bool(cfg['user_service'])}
+        return {'mode': 'service', 'os': PLATFORM, 'target': cfg['service']}
+    if cfg['mode'] != 'service' and cfg['start_command']:
+        return {'mode': 'app', 'os': PLATFORM}
+    return None
+
+
 def restart(cfg):
     t0 = time.time()
     deadline = t0 + cfg['total_timeout']
@@ -663,10 +695,14 @@ def restart(cfg):
                                    'again; set "start_command" in the config' % old)
         cfg.save_state(how)
     else:
-        how = cfg.load_state()
+        # What is PINNED wins, as it does in detect(): the state file is only
+        # written by a restart that found HQPlayer running, so without this a
+        # helper that has never restarted it could not start it at all - and the
+        # error below would send the user to settings that changed nothing.
+        how = pinned_how(cfg) or cfg.load_state()
         if not how:
             raise RuntimeError('HQPlayer is not running and has never been seen running, '
-                               'so how to start it is unknown; set "mode"/"service"/"start_command"')
+                               'so how to start it is unknown; set "service" or "start_command"')
     log('restart: pid %s, %s' % (old, json.dumps(how)))
 
     if how['mode'] == 'service':

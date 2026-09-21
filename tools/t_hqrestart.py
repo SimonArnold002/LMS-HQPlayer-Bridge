@@ -337,6 +337,55 @@ finally:
     os.geteuid = real_geteuid
     hq.run = real_run
 
+print('== Windows: a SYSTEM helper against a USER\'s app: LEFT RUNNING')
+real_run = hq.run
+def ps_sids(out):
+    return lambda argv, timeout=30: (0, out) if argv[0] == 'powershell' else (1, '')
+try:
+    for sids, refused, label in (('S-1-5-21-9-1001 S-1-5-18\n', True, 'a user app under a SYSTEM helper is refused'),
+                                 ('S-1-5-21-9-1001 S-1-5-21-9-1001\n', False, 'the same account still restarts'),
+                                 ('', False, 'an owner PowerShell cannot read is not a refusal')):
+        cfg = setup('win32', pinned=[EXE])
+        hq.detect = lambda pid, c: {'mode': 'app', 'os': 'win32', 'exe': EXE}
+        hq.run = ps_sids(sids)
+        r, e = run(cfg)
+        stopped = any(c[0] == 'stop' for c in calls)
+        if refused:
+            ok(e and 'another user' in e and not stopped, '%s (%s)' % (label, e))
+        else:
+            ok(e is None and stopped, '%s (%s)' % (label, e))
+finally:
+    hq.run = real_run
+
+print('== HQPlayer NOT running: what is PINNED starts it, with no saved state')
+def not_running(cfg):
+    # nothing runs until something is started
+    hq.find_pid = lambda names: 200 if any(c[0] in ('start', 'service') for c in calls) else None
+    return cfg
+cfg = not_running(setup('linux'))
+cfg.c['service'] = 'hqplayerd.service'
+hq.restart_service = lambda how, b: calls.append(('service', how['target'], how.get('user')))
+r, e = run(cfg)
+ok(e is None and ('service', 'hqplayerd.service', False) in calls, 'a pinned service is started (%s)' % e)
+cfg = not_running(setup('linux', pinned=[EXE]))
+r, e = run(cfg)
+ok(e is None and any(c[0] == 'start' and c[1] == [EXE] for c in calls), 'a pinned start_command is run (%s)' % e)
+cfg = not_running(setup('linux'))
+r, e = run(cfg)
+ok(e and 'set "service" or "start_command"' in e, 'nothing pinned or saved still says what to set (%s)' % e)
+# pinned beats saved, as it does in detect()
+cfg = not_running(setup('linux', state={'mode': 'app', 'os': 'linux', 'argv': [EXE, '--old']}))
+cfg.c['service'] = 'hqplayerd.service'
+hq.restart_service = lambda how, b: calls.append(('service', how['target'], how.get('user')))
+r, e = run(cfg)
+ok(e is None and any(c[0] == 'service' for c in calls) and not any(c[0] == 'start' for c in calls),
+   'the pinned service wins over a saved app recipe (%s)' % e)
+# CONTROL: with nothing pinned, the saved recipe is still used
+cfg = not_running(setup('linux', state={'mode': 'app', 'os': 'linux', 'argv': [EXE, '--old']}))
+r, e = run(cfg)
+ok(e is None and any(c[0] == 'start' and c[1] == [EXE, '--old'] for c in calls), 'the saved recipe still starts it (%s)' % e)
+hq.find_pid = REAL_FIND_PID
+
 print('== a config key of the WRONG SHAPE is corrected, not carried into the code')
 def conf(**kw):
     d = tempfile.mkdtemp(); f = os.path.join(d, 'hqrestart.json')

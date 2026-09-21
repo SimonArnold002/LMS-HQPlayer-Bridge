@@ -25,6 +25,7 @@ perl -I. t_plugin.pl
 perl -I. t_live.pl
 python3 t_hqrestart.py   # its own log is silenced inside; a traceback must be VISIBLE
 sh -n hqrestart/install.sh && echo "  ok   the macOS/Linux installer parses"   # nothing else reads it
+python3 t_powershell.py  # install.ps1 + every command the helper builds, parsed by pwsh (skips without it)
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="

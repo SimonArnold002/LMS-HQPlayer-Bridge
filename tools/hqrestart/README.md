@@ -18,7 +18,8 @@ started, and restarts it the same way:
 | Linux | `systemctl [--user] restart` on the unit found in `/proc/<pid>/cgroup` | SIGTERM, then rerun its original command line |
 | Windows | `Restart-Service` on the service that owns the process | stop it, then start the same `.exe` |
 
-It remembers the last launch it saw, so it can also start HQPlayer when it is not running.
+It can also start HQPlayer when it is not running: from `service` or `start_command` if the config
+pins one, otherwise from the last launch it saw.
 
 ## Install
 
