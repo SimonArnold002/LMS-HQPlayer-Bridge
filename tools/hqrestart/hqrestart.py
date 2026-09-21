@@ -81,8 +81,14 @@ DEFAULTS = {
     'stop_timeout':  20,      # seconds for a clean exit before SIGKILL
     'respawn_wait':  6,       # macOS app: seconds to let launchd relaunch it before we do
     'start_timeout': 30,      # seconds for the new process to appear
-    'total_timeout': 90,      # the whole restart; the HQPlayer Bridge waits a little longer
+    'total_timeout': 90,      # the whole restart; the HQPlayer Bridge waits BRIDGE_WAIT
 }
+
+
+# What the HQPlayer Bridge allows one restart (Plugin.pm, `timeout => 120`).
+# A `total_timeout` above this outlives the caller: the Bridge reports a failure
+# while the restart it asked for is still running, and succeeds unseen.
+BRIDGE_WAIT = 120
 
 
 def same_addr(a, b):
@@ -209,6 +215,11 @@ class Config:
                 log('config: "%s" must be a positive number; using %r'
                     % (k, DEFAULTS[k]))
                 self.c[k] = DEFAULTS[k]
+
+        if self.c['total_timeout'] > BRIDGE_WAIT - 10:
+            log('config: "total_timeout" is %gs, and the HQPlayer Bridge gives up at %ds - a '
+                'restart that runs longer is reported there as failed even when it works'
+                % (self.c['total_timeout'], BRIDGE_WAIT))
 
     def __getitem__(self, k):
         return self.c[k]

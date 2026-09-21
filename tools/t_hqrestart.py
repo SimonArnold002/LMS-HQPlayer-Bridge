@@ -305,6 +305,19 @@ except Exception as e:
 ok(real_open(bad).read() == '{ "token": "abc", }', 'and the file is NOT rewritten over the user\'s edits')
 ok(conf(start_command=[EXE, 7])['start_command'] == [EXE, '7'], 'start_command elements are text - a number raises on the way to Popen')
 
+# The Bridge gives up at 120s (Plugin.pm), so a longer bound here is reported
+# there as a failure while the restart carries on and succeeds unseen.
+import io as _io2
+_e, sys.stderr = sys.stderr, _io2.StringIO()
+try:
+    conf(total_timeout=300); loud = sys.stderr.getvalue()
+    sys.stderr = _io2.StringIO()
+    conf(total_timeout=90); quiet = sys.stderr.getvalue()
+finally:
+    sys.stderr = _e
+ok('gives up at 120' in loud, 'a total_timeout past the Bridge\'s wait is warned about')
+ok(quiet == '', 'and the default is not (%r)' % quiet[:60])
+
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')

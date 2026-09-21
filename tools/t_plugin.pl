@@ -809,6 +809,11 @@ print "-- the restart row --\n";
     # The helper bounds a restart at total_timeout = 90s; waiting only as long
     # reads a slow service stop as a failure that then succeeds.
     ok(scalar( $REQ->[0]{timeout} > 90 ), 'and it waits LONGER than the helper\'s 90s bound');
+    # The helper names this number (BRIDGE_WAIT) to warn a user who sets a
+    # `total_timeout` past it; the two must not drift apart silently.
+    my $hsrc = do { local (@ARGV,$/) = ('hqrestart/hqrestart.py'); <> };
+    my ($bw) = ($hsrc // '') =~ /^BRIDGE_WAIT = (\d+)/m;
+    is($bw, $REQ->[0]{timeout}, 'and the helper knows that same number');
     $page = undef;
     $REQ->[0]{cb}->( FakeRes->new('{"ok": true, "old_pid": 1, "new_pid": 2, "seconds": 7.1}') );
     is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_OK', 'success says so');
