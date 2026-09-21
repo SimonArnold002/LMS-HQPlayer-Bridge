@@ -113,17 +113,7 @@ class Config:
             with open(path) as f:
                 data = json.load(f)
         self.c = dict(DEFAULTS, **data)
-        # These are hand-edited, and a key written as a bare string instead of a
-        # list is the easy mistake. `addr in "1.2.3.4"` is a SUBSTRING test, so a
-        # string `allow` would let 1.2.3 and 1.2 past the token as well.
-        for k in ('allow', 'hostnames', 'process_names'):
-            if isinstance(self.c[k], str):
-                log('config: "%s" should be a list; reading it as one entry' % k)
-                self.c[k] = [self.c[k]]
-        if isinstance(self.c['start_command'], str):
-            log('config: "start_command" should be a list; splitting it')
-            self.c['start_command'] = shlex.split(self.c['start_command'],
-                                                  posix=(PLATFORM != 'win32'))
+        self._coerce()
         if not self.c['token']:
             self.c['token'] = secrets.token_urlsafe(24)
             data['token'] = self.c['token']
@@ -134,6 +124,43 @@ class Config:
             except OSError:
                 pass
             log('generated a token and saved it to %s' % path)
+
+    def _coerce(self):
+        """Make every hand-edited key the SHAPE the code expects, and say what was
+        corrected. This file is edited by hand, and the wrong shape does not fail
+        cleanly: `addr in "1.2.3.4"` is a SUBSTRING test (so a string `allow` would
+        admit 1.2.3 and 1.2 without the token), and a timeout written as a string
+        raises INSIDE the stop - after the SIGTERM, so HQPlayer is left down."""
+        for k in ('allow', 'hostnames', 'process_names'):
+            v = self.c[k]
+            if v is None and k == 'process_names':
+                continue                                # documented: use the defaults
+            if isinstance(v, str):
+                v = [v]
+                log('config: "%s" should be a list; reading it as one entry' % k)
+            elif not isinstance(v, (list, tuple)):
+                log('config: "%s" should be a list; ignoring %r' % (k, v))
+                v = []
+            self.c[k] = [str(x).strip() for x in v if str(x).strip()]
+
+        cmd = self.c['start_command']
+        if isinstance(cmd, str):
+            log('config: "start_command" should be a list; splitting it')
+            self.c['start_command'] = shlex.split(cmd, posix=(PLATFORM != 'win32'))
+        elif cmd is not None and not isinstance(cmd, (list, tuple)):
+            log('config: "start_command" should be a list; ignoring %r' % (cmd,))
+            self.c['start_command'] = None
+
+        for k in ('port', 'stop_timeout', 'respawn_wait', 'start_timeout', 'total_timeout'):
+            try:
+                v = float(self.c[k])
+                if v <= 0:
+                    raise ValueError(v)
+                self.c[k] = int(v) if k == 'port' else v
+            except (TypeError, ValueError):
+                log('config: "%s" must be a positive number; using %r'
+                    % (k, DEFAULTS[k]))
+                self.c[k] = DEFAULTS[k]
 
     def __getitem__(self, k):
         return self.c[k]

@@ -165,8 +165,9 @@ cfg = setup('linux', linux_proc('./hqplayerd', GONE_CWD, exe=DENY))
 r, e = run(cfg)
 ok(e and 'left running' in e and not any(c[0] == 'stop' for c in calls), 'refused, nothing stopped (%s)' % e)
 
-print('== a list key written as a bare string is read as ONE entry')
 import json as _json
+
+print('== a list key written as a bare string is read as ONE entry')
 d = tempfile.mkdtemp(); cfgp = os.path.join(d, 'hqrestart.json')
 _json.dump({'token': 't', 'allow': '192.168.1.234', 'hostnames': 'hq.local',
             'start_command': '%s --flag' % EXE}, real_open(cfgp, 'w'))
@@ -180,6 +181,28 @@ ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not
 # CONTROL: a proper list is untouched.
 _json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
 ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
+
+print('== a config key of the WRONG SHAPE is corrected, not carried into the code')
+def conf(**kw):
+    d = tempfile.mkdtemp(); f = os.path.join(d, 'hqrestart.json')
+    _json.dump(dict({'token': 't'}, **kw), real_open(f, 'w'))
+    return hq.Config(f)
+
+# `addr in None` raises inside the handler; `min("20", 5.0)` raises INSIDE the
+# stop, i.e. after the SIGTERM - HQPlayer stopped and then left down.
+c3 = conf(allow=None, hostnames=123, stop_timeout='20', total_timeout=0, port='8090')
+ok(c3['allow'] == [] and c3['hostnames'] == [], 'a non-list allow/hostnames becomes an empty list, not a crash')
+ok(c3['stop_timeout'] == 20.0, 'a numeric string timeout is a number (%r)' % (c3['stop_timeout'],))
+ok(c3['total_timeout'] == 90, 'a nonsense timeout falls back to the default (%r)' % (c3['total_timeout'],))
+ok(c3['port'] == 8090 and isinstance(c3['port'], int), 'port is an int (%r)' % (c3['port'],))
+ok('1.2.3.4' not in c3['allow'], 'and nothing is trusted by an empty allow')
+c4 = conf(allow=[' 192.168.1.234 ', ''], process_names=None, start_command={'x': 1})
+ok(c4['allow'] == ['192.168.1.234'], 'entries are stripped and blanks dropped (%r)' % (c4['allow'],))
+ok(c4.names() == hq.DEFAULT_NAMES.get(hq.PLATFORM, ['hqplayerd']), 'process_names null still means the defaults')
+ok(c4['start_command'] is None, 'a start_command that is not a list is ignored')
+# CONTROL: sane values are untouched.
+c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
+ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)
