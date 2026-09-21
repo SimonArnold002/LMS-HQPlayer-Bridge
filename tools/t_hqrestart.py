@@ -300,6 +300,43 @@ cfg = setup('linux', linux_proc(EXE, BIN, exe=EXE))
 r, e = run(cfg)
 ok(e is None and any(c[0] == 'stop' for c in calls), 'a process we may signal still restarts (%s)' % e)
 
+print('== a ROOT helper against a USER\'s app: LEFT RUNNING, not restarted as root')
+# kill(pid, 0) always succeeds for root, so may_signal cannot see this one.
+real_geteuid = os.geteuid
+def owned_by(uid):
+    pr = linux_proc(EXE, BIN, exe=EXE)
+    pr['/proc/100/status'] = ('Name:\thqplayerd\nUid:\t%d\t%d\t%d\t%d\n' % ((uid,) * 4)).encode()
+    return pr
+try:
+    os.geteuid = lambda: 0
+    cfg = setup('linux', owned_by(1000))
+    ok(lambda: hq.may_signal(100) is True, 'may_signal alone lets root through (why same_owner exists)')
+    r, e = run(cfg)
+    ok(e and 'another user' in e and 'left running' in e, 'refused, and says why (%s)' % e)
+    ok(not any(c[0] in ('stop', 'start') for c in calls), 'nothing stopped, nothing started as root')
+    # CONTROLS: root against root's own app, and an owner that cannot be read
+    cfg = setup('linux', owned_by(0))
+    r, e = run(cfg)
+    ok(e is None and any(c[0] == 'stop' for c in calls), 'the same owner still restarts (%s)' % e)
+    cfg = setup('linux', linux_proc(EXE, BIN, exe=EXE))            # no status file
+    r, e = run(cfg)
+    ok(e is None and any(c[0] == 'stop' for c in calls), 'an unreadable owner is not a refusal (%s)' % e)
+    os.geteuid = lambda: 1000                                        # a per-user helper, its own app
+    cfg = setup('linux', owned_by(1000))
+    r, e = run(cfg)
+    ok(e is None and any(c[0] == 'stop' for c in calls), 'a user helper and its own app restart (%s)' % e)
+    # macOS reads the owner from ps
+    real_run = hq.run
+    hq.PLATFORM = 'darwin'
+    os.geteuid = lambda: 0
+    hq.run = lambda argv, timeout=30: (0, '  501\n') if argv[:3] == ['ps', '-o', 'uid='] else (1, '')
+    ok(lambda: hq.same_owner(100) is False, 'macOS: a root helper and uid 501 are not the same owner')
+    hq.run = lambda argv, timeout=30: (1, '')
+    ok(lambda: hq.same_owner(100) is True, 'macOS: ps failing is not a refusal')
+finally:
+    os.geteuid = real_geteuid
+    hq.run = real_run
+
 print('== a config key of the WRONG SHAPE is corrected, not carried into the code')
 def conf(**kw):
     d = tempfile.mkdtemp(); f = os.path.join(d, 'hqrestart.json')

@@ -484,10 +484,11 @@ def stop_app(pid, cfg, budget):
 
 def may_signal(pid):
     """Whether this helper is allowed to signal that process. `kill(pid, 0)` asks
-    without sending anything. HQPlayer running as another user (the helper
-    installed per-user against a system service, or the other way round) is an
-    INSTALL mistake, and it reads as a bare "Operation not permitted" unless it
-    is caught here, before the stop."""
+    without sending anything. A per-user helper against HQPlayer run by someone
+    else is an INSTALL mistake, and it reads as a bare "Operation not permitted"
+    unless it is caught here, before the stop. The REVERSE mistake - a root
+    helper against a user's app - passes this, because root may signal anything:
+    that one is `same_owner`'s."""
     if PLATFORM == 'win32':
         return True                                 # taskkill reports its own failure
     try:
@@ -497,6 +498,36 @@ def may_signal(pid):
         return False
     except OSError:
         return True                                 # already gone: not a rights problem
+
+
+def process_uid(pid):
+    """The user id HQPlayer runs as, or None when it cannot be read."""
+    if PLATFORM == 'linux':
+        try:
+            with open('/proc/%d/status' % pid) as f:
+                for line in f:
+                    if line.startswith('Uid:'):
+                        return int(line.split()[1])     # the real uid
+        except (OSError, ValueError, IndexError):
+            return None
+    elif PLATFORM == 'darwin':
+        rc, out = run(['ps', '-o', 'uid=', '-p', str(pid)])
+        if rc == 0 and out.strip().isdigit():
+            return int(out.strip())
+    return None
+
+
+def same_owner(pid):
+    """Whether HQPlayer runs as the user this helper runs as. An app is started
+    again as THIS helper's user, so a root helper (`--system`) against a user's
+    app would stop it and then run it as root - files in the user's HOME left
+    owned by root on Linux - or, on macOS, `open` it from outside the desktop
+    session, where it does not come back at all. An owner that cannot be read
+    is not a refusal: `may_signal` still stands behind it."""
+    if PLATFORM == 'win32':
+        return True
+    uid = process_uid(pid)
+    return uid is None or uid == os.geteuid()
 
 
 def launch_cwd(how):
@@ -614,10 +645,11 @@ def restart(cfg):
     old = find_pid(cfg.names())
     if old:
         how = detect(old, cfg)
-        if how['mode'] == 'app' and not may_signal(old):
-            raise RuntimeError('HQPlayer (pid %d) runs as another user, so this helper cannot '
-                               'stop it and it was left running. Install the helper the same way '
-                               'HQPlayer runs - see --system in the README.' % old)
+        if how['mode'] == 'app' and not (may_signal(old) and same_owner(old)):
+            raise RuntimeError('HQPlayer (pid %d) runs as another user, so it was left running: '
+                               'this helper could not stop it, or would start it again as the '
+                               'wrong user. Install the helper the same way HQPlayer runs - see '
+                               '--system in the README.' % old)
         if how['mode'] == 'app' and not start_argv(how, cfg):
             # Never stop what we could not start again, and never save a recipe
             # that cannot start it over one that could.

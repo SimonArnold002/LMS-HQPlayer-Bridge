@@ -23,7 +23,8 @@ It remembers the last launch it saw, so it can also start HQPlayer when it is no
 ## Install
 
 Install it the same way HQPlayer runs. For a system service the webhook needs root / SYSTEM. For
-an app, it must run as the logged-in user.
+an app, it must run as the logged-in user. Installed the wrong way round, a restart is refused
+before anything is stopped, with "runs as another user", and HQPlayer keeps playing.
 
 ```
 ./install.sh                  # macOS/Linux, HQPlayer is an app (or a user service)
