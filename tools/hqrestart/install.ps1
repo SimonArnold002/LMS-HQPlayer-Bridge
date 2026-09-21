@@ -17,8 +17,21 @@ else         { $dir = Join-Path $env:LOCALAPPDATA 'hqrestart' }
 Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
 if ($Uninstall) { "removed task $task (config left in $dir)"; return }
 
-$py = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
-if (-not $py) { $py = (Get-Command python.exe -ErrorAction Stop).Source }
+$pyw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
+$pyc = (Get-Command python.exe  -ErrorAction SilentlyContinue).Source
+if (-not $pyw -and -not $pyc) {
+    throw "Python not found on PATH. Install Python 3.7+ from python.org with 'Add to PATH' ticked."
+}
+# 3.7 is needed for ThreadingHTTPServer: an older one fails at IMPORT, before
+# the helper can log anything, and the task would be restarted for ever. Ask
+# python.exe for the version - pythonw.exe has no console, so it prints nowhere.
+if ($pyc) { $ver = (& $pyc -c "import sys; print('%d.%d' % sys.version_info[:2])") }
+else      { $ver = (Get-Item $pyw).VersionInfo.ProductVersion }   # e.g. 3.11.5
+if ($ver -match '^(\d+)\.(\d+)' -and [version]"$($Matches[1]).$($Matches[2])" -lt [version]'3.7') {
+    throw "hqrestart needs Python 3.7 or newer; found $ver."
+}
+# The helper is run with pythonw where there is one: no console window.
+$py = if ($pyw) { $pyw } else { $pyc }
 
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item (Join-Path $PSScriptRoot 'hqrestart.py') (Join-Path $dir 'hqrestart.py') -Force

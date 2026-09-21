@@ -14,7 +14,14 @@ set -e
 
 SRC="$(cd "$(dirname "$0")" && pwd)/hqrestart.py"
 PY="$(command -v python3 || true)"
-[ -n "$PY" ] || { echo "python3 not found" >&2; exit 1; }
+[ -n "$PY" ] || { echo "python3 not found - install Python 3.7 or newer first" >&2; exit 1; }
+# 3.7 for ThreadingHTTPServer. Older pythons (3.6 is still the default on some
+# distributions) fail at IMPORT, before the helper can log anything, and the
+# service manager then restarts it for ever - so it is refused here instead.
+"$PY" - <<'PYEOF' || { echo "hqrestart needs Python 3.7 or newer; $PY is $("$PY" -c 'import platform;print(platform.python_version())' 2>/dev/null)" >&2; exit 1; }
+import sys
+sys.exit(0 if sys.version_info >= (3, 7) else 1)
+PYEOF
 
 SYSTEM=0; UNINSTALL=0
 for a in "$@"; do

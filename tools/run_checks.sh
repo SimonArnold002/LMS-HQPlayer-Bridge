@@ -24,6 +24,7 @@ perl -I. t_stream.pl
 perl -I. t_plugin.pl
 perl -I. t_live.pl
 python3 t_hqrestart.py 2>/dev/null   # the helper's own log goes to stderr
+sh -n hqrestart/install.sh && echo "  ok   the macOS/Linux installer parses"   # nothing else reads it
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="
