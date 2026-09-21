@@ -53,6 +53,12 @@ DEFAULT_NAMES = {
     'win32':  ['hqplayerd.exe', 'HQPlayer6Desktop.exe', 'HQPlayer5Desktop.exe'],
 }
 
+# What a relaunched Linux app needs from its session, and nothing more: the
+# helper usually runs as a service with none of it, and a GUI HQPlayer
+# (Desktop) cannot open a window without the display variables.
+SESSION_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
+               'DBUS_SESSION_BUS_ADDRESS', 'HOME', 'LANG', 'LC_ALL', 'PULSE_SERVER')
+
 DEFAULTS = {
     'listen':        '0.0.0.0',
     'port':          8090,
@@ -145,6 +151,11 @@ def find_pid(names):
                     return int(cols[1])
         return None
     for n in names:
+        # Linux keeps only the first 15 characters of a process name (comm),
+        # and pgrep -x matches against that: `hqplayer6desktop` is 16, so the
+        # full name never matches anything.
+        if PLATFORM == 'linux':
+            n = n[:15]
         rc, out = run(['pgrep', '-x', n])
         pids = [int(x) for x in out.split() if x.isdigit()]
         if pids:
@@ -219,6 +230,15 @@ def detect_linux(pid, cfg):
         cwd = os.readlink('/proc/%d/cwd' % pid)
     except OSError:
         argv, cwd = None, None
+    env = {}
+    try:
+        with open('/proc/%d/environ' % pid, 'rb') as f:
+            for kv in f.read().split(b'\0'):
+                k, _, v = kv.decode('utf-8', 'replace').partition('=')
+                if k in SESSION_ENV:
+                    env[k] = v
+    except OSError:
+        pass                                        # another user's process: none of it
 
     unit, user = cfg['service'], cfg['user_service']
     if not unit:
@@ -242,7 +262,7 @@ def detect_linux(pid, cfg):
         if not unit:
             raise RuntimeError('mode is "service" but no systemd unit found; set "service" in the config')
         return {'mode': 'service', 'os': 'linux', 'target': unit, 'user': bool(user)}
-    return {'mode': 'app', 'os': 'linux', 'argv': argv, 'cwd': cwd}
+    return {'mode': 'app', 'os': 'linux', 'argv': argv, 'cwd': cwd, 'env': env}
 
 
 def detect_win32(pid, cfg):
@@ -281,7 +301,10 @@ def stop_app(pid, cfg, budget):
         if PLATFORM == 'win32':
             run(['taskkill', '/F', '/PID', str(pid)])
         else:
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass    # it exited between the check and the kill: stopped, as wanted
         time.sleep(1)
 
 
@@ -303,6 +326,8 @@ def start_app(how, cfg):
     log('starting: %s' % ' '.join(argv))
     kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
           'close_fds': True, 'cwd': how.get('cwd') or None}
+    if how.get('env'):
+        kw['env'] = dict(os.environ, **how['env'])
     if PLATFORM == 'win32':
         kw['creationflags'] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
     else:
@@ -311,8 +336,19 @@ def start_app(how, cfg):
         # in this helper's unit, be killed by its stop, and be mistaken for
         # it next time. A transient scope gives it a cgroup of its own.
         if PLATFORM == 'linux' and own_unit() and run(['systemd-run', '--version'])[0] == 0:
-            argv = (['systemd-run', '--scope', '--quiet', '--collect']
-                    + (['--user'] if os.geteuid() != 0 else []) + ['--'] + list(argv))
+            scoped = (['systemd-run', '--scope', '--quiet', '--collect']
+                      + (['--user'] if os.geteuid() != 0 else []) + ['--'] + list(argv))
+            p = subprocess.Popen(scoped, **kw)
+            # systemd-run execs the app once the scope exists, so it only EXITS
+            # this fast when it could not make one (no user bus, say). Then a
+            # plain launch beats leaving HQPlayer stopped.
+            for _ in range(10):
+                time.sleep(0.1)
+                if p.poll() is not None:
+                    break
+            if p.returncode is None or p.returncode == 0:
+                return
+            log('systemd-run failed (rc %d); starting it without a scope' % p.returncode)
     subprocess.Popen(argv, **kw)
 
 
@@ -388,6 +424,7 @@ class Handler(BaseHTTPRequestHandler):
     cfg = None
     lock = threading.Lock()
     server_version = 'hqrestart/1'
+    timeout = 30        # a client that connects and sends nothing must not hold a thread
 
     def log_message(self, fmt, *args):
         # never write the token: a bookmark call carries it in the query
@@ -415,7 +452,10 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == '/ping':
             return self.reply(200, {'ok': True, 'service': 'hqrestart'})
-        n = int(self.headers.get('Content-Length') or 0)
+        try:
+            n = max(0, int(self.headers.get('Content-Length') or 0))
+        except ValueError:
+            n = 0
         if n:
             self.rfile.read(min(n, 65536))
         trusted = (self.command == 'POST'

@@ -83,7 +83,16 @@ Under systemd, a process the helper starts would otherwise stay in the helper's 
 Stopping the helper would then kill it, and the next restart would mistake it for the helper's
 own service. So on Linux an app is relaunched through `systemd-run --scope`, the helper
 ignores its own unit when working out how HQPlayer was started, and its unit has
-`KillMode=process`.
+`KillMode=process`. If `systemd-run` can't create a scope (for example, no user session bus),
+the app is started without one rather than left stopped.
+
+A relaunched app also gets back its session's display and desktop variables (`DISPLAY`,
+`WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, the D-Bus address, `HOME`, the locale),
+read from the running process. A helper running as a service has none of them, and HQPlayer
+Desktop can't open its window without them. No other variables are copied.
+
+Linux keeps only the first 15 characters of a process name, so `hqplayer6desktop` is looked
+for as `hqplayer6deskto`.
 
 ## Tested
 
