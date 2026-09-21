@@ -8,7 +8,16 @@ spec = importlib.util.spec_from_file_location('hq', sys.argv[1] if len(sys.argv)
 spec.loader.exec_module(hq)
 P = F = 0
 def ok(c, name):
+    """c may be a callable, so a missing attribute or a raise inside the check
+    FAILS here instead of killing the run - which is what an older build under
+    test does, and a suite that dies reports nothing at all."""
     global P, F
+    if callable(c):
+        try:
+            c = c()
+        except Exception as e:
+            c = False
+            name = '%s [%s: %s]' % (name, type(e).__name__, e)
     if c: P += 1; print('  ok  ', name)
     else: F += 1; print('  FAIL', name)
 
@@ -181,6 +190,28 @@ ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not
 # CONTROL: a proper list is untouched.
 _json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
 ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
+
+print('== HQPlayer running as ANOTHER user: LEFT RUNNING, and the message says why')
+# kill(pid, 0) asks without sending anything; os.kill is shared, so it is restored.
+real_kill = os.kill
+def denied(pid, sig):
+    raise PermissionError(1, 'Operation not permitted')
+cfg = setup('linux', linux_proc(EXE, BIN, exe=EXE))
+try:
+    os.kill = denied
+    ok(lambda: hq.may_signal(100) is False, 'may_signal says no when the signal is refused')
+    try:
+        r, e = run(cfg)
+    except Exception as ex:
+        r, e = None, '%s: %s' % (type(ex).__name__, ex)
+finally:
+    os.kill = real_kill
+ok(e and 'another user' in e and 'left running' in e, 'the error names the cause (%s)' % e)
+ok(not any(c[0] == 'stop' for c in calls), 'nothing was stopped')
+# CONTROL: the same case when the signal IS allowed still restarts.
+cfg = setup('linux', linux_proc(EXE, BIN, exe=EXE))
+r, e = run(cfg)
+ok(e is None and any(c[0] == 'stop' for c in calls), 'a process we may signal still restarts (%s)' % e)
 
 print('== a config key of the WRONG SHAPE is corrected, not carried into the code')
 def conf(**kw):

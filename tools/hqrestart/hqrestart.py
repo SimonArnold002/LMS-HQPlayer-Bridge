@@ -381,6 +381,8 @@ def stop_app(pid, cfg, budget):
             os.kill(pid, signal.SIGTERM)                  # hqplayerd shuts down cleanly on TERM
         except ProcessLookupError:
             return
+        except PermissionError:                          # checked before the stop; belt and braces
+            raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
     deadline = time.time() + min(cfg['stop_timeout'], budget)
     while time.time() < deadline and alive(pid):
         time.sleep(0.25)
@@ -393,7 +395,26 @@ def stop_app(pid, cfg, budget):
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass    # it exited between the check and the kill: stopped, as wanted
+            except PermissionError:
+                raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
         time.sleep(1)
+
+
+def may_signal(pid):
+    """Whether this helper is allowed to signal that process. `kill(pid, 0)` asks
+    without sending anything. HQPlayer running as another user (the helper
+    installed per-user against a system service, or the other way round) is an
+    INSTALL mistake, and it reads as a bare "Operation not permitted" unless it
+    is caught here, before the stop."""
+    if PLATFORM == 'win32':
+        return True                                 # taskkill reports its own failure
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True                                 # already gone: not a rights problem
 
 
 def launch_cwd(how):
@@ -511,6 +532,10 @@ def restart(cfg):
     old = find_pid(cfg.names())
     if old:
         how = detect(old, cfg)
+        if how['mode'] == 'app' and not may_signal(old):
+            raise RuntimeError('HQPlayer (pid %d) runs as another user, so this helper cannot '
+                               'stop it and it was left running. Install the helper the same way '
+                               'HQPlayer runs - see --system in the README.' % old)
         if how['mode'] == 'app' and not start_argv(how, cfg):
             # Never stop what we could not start again, and never save a recipe
             # that cannot start it over one that could.
