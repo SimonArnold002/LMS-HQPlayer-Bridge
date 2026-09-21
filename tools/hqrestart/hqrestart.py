@@ -151,6 +151,23 @@ class Config:
             log('config: "start_command" should be a list; ignoring %r' % (cmd,))
             self.c['start_command'] = None
 
+        # `mode` is compared VERBATIM against 'app' / 'service' / 'auto', so
+        # "Service" or a typo silently means app mode - the opposite of what was
+        # asked for - instead of being refused.
+        mode = str(self.c['mode'] or '').strip().lower()
+        if mode not in ('auto', 'app', 'service'):
+            log('config: "mode" must be auto, app or service; using "auto" (was %r)'
+                % (self.c['mode'],))
+            mode = 'auto'
+        self.c['mode'] = mode
+
+        # The auth path does token.encode(), and the listen address is handed to
+        # the socket: a number in either raises rather than being compared or bound.
+        for k in ('token', 'listen', 'service'):
+            if self.c[k] is not None and not isinstance(self.c[k], str):
+                log('config: "%s" must be text; reading %r as one' % (k, self.c[k]))
+                self.c[k] = str(self.c[k])
+
         for k in ('port', 'stop_timeout', 'respawn_wait', 'start_timeout', 'total_timeout'):
             try:
                 v = float(self.c[k])

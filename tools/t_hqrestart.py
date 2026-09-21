@@ -200,6 +200,12 @@ c4 = conf(allow=[' 192.168.1.234 ', ''], process_names=None, start_command={'x':
 ok(c4['allow'] == ['192.168.1.234'], 'entries are stripped and blanks dropped (%r)' % (c4['allow'],))
 ok(c4.names() == hq.DEFAULT_NAMES.get(hq.PLATFORM, ['hqplayerd']), 'process_names null still means the defaults')
 ok(c4['start_command'] is None, 'a start_command that is not a list is ignored')
+c6 = conf(mode='Service', token=12345, listen=0)
+ok(c6['mode'] == 'service', 'a capitalised mode is understood, not read as app (%r)' % (c6['mode'],))
+ok(conf(mode='servce')['mode'] == 'auto', 'a typo falls back to auto rather than silently meaning app')
+# `cfg['token'].encode()` raises on a number, so every tokened request 500s.
+ok(c6['token'] == '12345' and c6['listen'] == '0', 'token and listen are text (%r, %r)' % (c6['token'], c6['listen']))
+
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')
