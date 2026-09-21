@@ -101,7 +101,7 @@ PLUGIN_HQPLAYER_LIVE_WAITING
 	EN	Waiting for the player to connect
 
 PLUGIN_HQPLAYER_RESTART
-	EN	Restart HQPlayer
+	EN	Restart %s
 
 PLUGIN_HQPLAYER_RESTART_NOW
 	EN	Restart %s now

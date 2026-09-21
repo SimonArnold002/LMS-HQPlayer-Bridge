@@ -77,6 +77,11 @@ my %bridges;
 my %restartable;
 my %probedAt;       # ip => when it was last asked, for the feed's throttled re-ask
 
+# The Restart rows, in the order they first appeared: bridge ids, APPEND-ONLY
+# for the server run, plus the name each was last seen under. See topLevel.
+my @restartRows;
+my %restartName;
+
 sub getDisplayName { 'PLUGIN_HQPLAYER_BRIDGE' }
 
 sub initPlugin {
@@ -244,22 +249,36 @@ sub topLevel {
         image   => ICON,
     } );
 
+    # THE RESTART ROWS: ONE BLOCK, RIGHT UNDER THE LIVE VIEW, APPEND-ONLY.
+    #
+    # An item_id is a row POSITION, and a tap is resolved by walking the feed
+    # again from here - both taps of the confirm-then-restart pair. Inside each
+    # instance's block, a row moved whenever an EARLIER instance left
+    # discovery, and a tap on B's "Restart ... now" then restarted C (simulated
+    # 2026-09-21: the page read "Restart HQPlayer B now" and C was restarted).
+    #
+    # So these rows live in one block above everything that can move, and the
+    # block only ever APPENDS: a host that becomes restartable is added at the
+    # end, and a bridge that goes away KEEPS its row (tapping it says so). No
+    # actionable row can change position within a run; what shifts below it is
+    # text, which does nothing when tapped.
+    for my $id ( sort keys %bridges ) {
+        my $b = $bridges{$id} or next;
+        next unless $restartable{ ( $b->{instance} || {} )->{ip} // '' };
+        push @restartRows, $id unless exists $restartName{$id};
+        $restartName{$id} = $b->{name};
+    }
+    push @items, map { {
+        name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART', $restartName{$_} ),
+        type        => 'link',
+        url         => \&_restartConfirm,
+        passthrough => [ { id => $_ } ],
+    } } @restartRows;
+
     for my $id ( sort keys %bridges ) {
         my $b = $bridges{$id} or next;
 
         push @items, { name => $b->{name}, type => 'text' };
-
-        # THE ONE ACTION IN AN INSTANCE'S BLOCK, so it goes at the TOP of it -
-        # and only for a host whose restart helper has answered (_probeRestart).
-        # That set only ever GROWS within a server run: an item_id is a row
-        # POSITION re-resolved against a rebuilt feed, so a row that could
-        # vanish between render and tap would send the tap to its neighbour.
-        push @items, {
-            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART' ),
-            type        => 'link',
-            url         => \&_restartConfirm,
-            passthrough => [ { id => $id } ],
-        } if $restartable{ ( $b->{instance} || {} )->{ip} // '' };
 
         # A host missed at link-up is asked again when the list is drawn, or
         # the row stays hidden until the link next drops - days on a healthy
@@ -336,6 +355,8 @@ use constant RESTART_PORT  => 8090;
 use constant REPROBE_AFTER => 60;    # seconds between the feed's re-asks of one host
 
 sub restartable { return \%restartable }
+sub restartRows  { return \@restartRows }    # for the tests
+sub restartNames { return \%restartName }
 
 sub _restartUrl { return 'http://' . $_[0] . ':' . RESTART_PORT . $_[1] }
 
@@ -376,11 +397,9 @@ sub _probeRestart {
 # The first tap only asks: a restart stops playback, and a browse row is easy
 # to hit by accident.
 #
-# IT NAMES THE INSTANCE. The row that opened this was found by POSITION, and an
-# instance dropping out of discovery between render and tap shifts every block
-# after it up by one - with three or more hosts that lands on the NEXT one's
-# row (simulated 2026-09-21). This cannot stop that; it makes it visible
-# before anything is restarted.
+# Both taps are resolved by POSITION from topLevel, which is why the rows that
+# open this sit in an append-only block that never moves (see topLevel). A
+# bridge gone by then gets text at the same position, so nothing to tap.
 sub _restartConfirm {
     my ( $client, $callback, $args, $pt ) = @_;
 

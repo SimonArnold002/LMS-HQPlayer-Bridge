@@ -667,27 +667,91 @@ print "-- the restart row --\n";
     ok(scalar( $src !~ /delete \$restartable/ ),
        'and nothing ever REMOVES a host - a row that vanished would shift the positional item_ids under a tap');
 
-    # THE ROW: at the top of its instance's block, right after the name.
+    # THE ROW: in the restart block, right under the Live View row and above
+    # every instance block - see topLevel for why it cannot live inside one.
     %$reg = ( 'aa' => {
         name => 'HQPlayer (Test)', control => FeedCtl->new,
         instance => { ip => '10.0.0.5' }, client => FeedClient->new({ active_mode => 'PCM' }),
     } );
     Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
     my @r = @{ $feed->{items} };
-    is($r[1]{name}, 'HQPlayer (Test)', 'the instance name row');
-    is($r[2]{name}, 'PLUGIN_HQPLAYER_RESTART', 'then Restart HQPlayer, at the TOP of the block it acts on');
-    is($r[2]{type}, 'link', 'as a link');
-    is($r[2]{passthrough}[0]{id}, 'aa', 'carrying the bridge id, not an address that can move');
-    ok(scalar( !exists $r[2]{nextWindow} ), 'with no nextWindow - it opens a page, it is not the banned Refresh row');
-    is(scalar( grep { ($_->{type} // '') ne 'text' } @r[3 .. $#r] ), '0',
-       'and every row after it is still text');
+    is($r[0]{name}, 'PLUGIN_HQPLAYER_LIVE_TITLE', 'the Live View row is still first');
+    is($r[1]{name}, 'PLUGIN_HQPLAYER_RESTART', 'then Restart, ABOVE the instance blocks');
+    is($r[1]{type}, 'link', 'as a link');
+    is($r[1]{passthrough}[0]{id}, 'aa', 'carrying the bridge id, not an address that can move');
+    ok(scalar( !exists $r[1]{nextWindow} ), 'with no nextWindow - it opens a page, it is not the banned Refresh row');
+    is($r[2]{name}, 'HQPlayer (Test)', 'then the instance name row');
+    is(scalar( grep { ($_->{type} // '') ne 'text' } @r[2 .. $#r] ), '0',
+       'and every row below the restart block is text - nothing below it can be tapped');
 
     # CONTROL: an unknown host gets no row.
-    $reg->{aa}{instance}{ip} = '10.0.0.6';
-    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
-    is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_RESTART' } @{ $feed->{items} } ), '0',
-       'a host whose helper never answered has NO restart row');
-    $reg->{aa}{instance}{ip} = '10.0.0.5';
+    {
+        my @keep = @{ Plugins::HQPlayerBridge::Plugin::restartRows() };
+        @{ Plugins::HQPlayerBridge::Plugin::restartRows() } = ();
+        %{ Plugins::HQPlayerBridge::Plugin::restartNames() } = ();
+        $reg->{aa}{instance}{ip} = '10.0.0.6';
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_RESTART' } @{ $feed->{items} } ), '0',
+           'a host whose helper never answered has NO restart row');
+        $reg->{aa}{instance}{ip} = '10.0.0.5';
+        @{ Plugins::HQPlayerBridge::Plugin::restartRows() } = @keep;
+    }
+
+    # BOTH TAPS ARE RESOLVED BY POSITION, walking the feed again from topLevel.
+    # With the row inside each instance's block, A leaving discovery while B's
+    # confirm page was open made "Restart HQPlayer B now" restart C (simulated
+    # 2026-09-21). The block is append-only, so no tappable row moves.
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Plugin::cstring = sub { join ' ', grep { defined } @_[1 .. $#_] };
+        @{ Plugins::HQPlayerBridge::Plugin::restartRows() } = ();
+        %{ Plugins::HQPlayerBridge::Plugin::restartNames() } = ();
+        %$reg = map { my ($id, $ip) = @$_; ( $id => {
+            name => "HQ $id", control => FeedCtl->new, instance => { ip => $ip },
+            client => FeedClient->new({}) } ) } ( [ 'A', '10.0.1.1' ], [ 'B', '10.0.1.2' ], [ 'C', '10.0.1.3' ] );
+        $rs->{$_} = 1 for qw(10.0.1.1 10.0.1.2 10.0.1.3);
+        my $walk = sub {    # XMLBrowser: item_id "p.q" -> topLevel item p, its page's item q
+            my ( $p, $q ) = @_;
+            my $top; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $top = shift->{items} }, {} );
+            my $it = $top->[$p] or return;
+            return $it unless defined $q;
+            my $page; $it->{url}->( undef, sub { $page = shift->{items} }, {}, $it->{passthrough}[0] );
+            return $page->[$q];
+        };
+        my $top; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $top = shift->{items} }, {} );
+        my ($posB) = grep { ( ( $top->[$_]{passthrough} || [{}] )->[0]{id} // '' ) eq 'B' } 0 .. $#$top;
+        is($walk->( $posB, 0 )->{name}, 'PLUGIN_HQPLAYER_RESTART_NOW HQ B', 'the confirm page reads "Restart HQ B now"');
+
+        delete $reg->{A};                       # A leaves while that page is open
+        my $now = $walk->( $posB, 0 );
+        is($now->{passthrough}[0]{id}, 'B', 'the second tap still restarts B, not C');
+        is($now->{name}, 'PLUGIN_HQPLAYER_RESTART_NOW HQ B', 'and the page still names B');
+        is($walk->( $posB )->{passthrough}[0]{id}, 'B', 'and the first tap still lands on B\'s row');
+
+        my ($posA) = grep { ( ( $top->[$_]{passthrough} || [{}] )->[0]{id} // '' ) eq 'A' } 0 .. $#$top;
+        is($walk->( $posA )->{passthrough}[0]{id}, 'A', 'A keeps its row after leaving - rows never close up');
+        my $gone = $walk->( $posA, 0 );
+        is($gone->{name}, 'PLUGIN_HQPLAYER_RESTART_GONE', 'and tapping it says A is no longer connected');
+        is($gone->{type}, 'text', 'as text, so there is nothing to tap through to');
+
+        # A NEW host only ever APPENDS, after every existing row.
+        $reg->{D} = { name => 'HQ D', control => FeedCtl->new, instance => { ip => '10.0.1.0' }, client => FeedClient->new({}) };
+        $rs->{'10.0.1.0'} = 1;
+        is($walk->( $posB )->{passthrough}[0]{id}, 'B', 'a host arriving later does not move B - it sorts first but appends');
+        is($walk->( $posB + 2 )->{passthrough}[0]{id}, 'D', 'it goes at the END of the block');
+
+        # CONTROL: the old in-block placement WOULD have shifted - the rows below are text now.
+        my $all; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $all = shift->{items} }, {} );
+        is(scalar( grep { ( $_->{type} // '' ) eq 'link' && ref $_->{url} } @$all ), '4',
+           'exactly the four restart rows are tappable, and all sit in the block');
+
+        @{ Plugins::HQPlayerBridge::Plugin::restartRows() } = ();
+        %{ Plugins::HQPlayerBridge::Plugin::restartNames() } = ();
+        %$reg = ( 'aa' => {
+            name => 'HQPlayer (Test)', control => FeedCtl->new,
+            instance => { ip => '10.0.0.5' }, client => FeedClient->new({ active_mode => 'PCM' }),
+        } );
+    }
 
     # A HOST MISSED AT LINK-UP IS ASKED AGAIN WHEN THE LIST IS DRAWN - the
     # helper and hqplayerd start at login in no fixed order - but throttled.
