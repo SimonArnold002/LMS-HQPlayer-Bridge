@@ -56,6 +56,7 @@ os.readlink = f_readlink
 calls = []
 ORIG_DETECT, ORIG_RESTART_SERVICE = hq.detect, hq.restart_service
 REAL_FIND_PID = hq.find_pid
+REAL_STOP_APP = hq.stop_app       # setup() stubs it and never puts it back
 REAL_POPEN = hq.subprocess.Popen
 def setup(platform, proc=None, state=None, pinned=None):
     # some cases below replace these; a leaked patch would silently answer the
@@ -438,6 +439,65 @@ ok(c7['respawn_wait'] == 0, 'respawn_wait 0 is kept (%r)' % (c7['respawn_wait'],
 ok(c7['port'] == 8090, 'a port outside 1-65535 falls back (%r)' % (c7['port'],))
 ok(c7['stop_timeout'] == 20, 'but a zero stop_timeout does not - it would mean give up at once (%r)'
    % (c7['stop_timeout'],))
+
+print('== a kill that did NOT take: LEFT RUNNING, never a second copy')
+real_run, real_kill, real_wait = hq.run, os.kill, getattr(hq, 'KILL_WAIT', 3)
+hq.KILL_WAIT = 0.3
+kcfg = conf(stop_timeout=0.3)
+try:
+    # Windows: taskkill /F refused (an elevated HQPlayer), tasklist still lists it
+    hq.PLATFORM = 'win32'
+    hq.run = lambda argv, timeout=30: ((0, '"hqplayerd.exe","100","Console"\n') if argv[0] == 'tasklist'
+                                       else (1, 'ERROR: Access is denied.'))
+    try:
+        REAL_STOP_APP(100, kcfg, 5); e = None
+    except RuntimeError as ex:
+        e = str(ex)
+    ok(e and 'left running' in e, 'Windows: a refused taskkill is not taken for a stop (%s)' % e)
+    # a tasklist that FAILS knows nothing - it must not read as "gone"
+    hq.run = lambda argv, timeout=30: (127, '')
+    ok(lambda: hq.alive(100) is True, 'Windows: a failed tasklist is not "the process is gone"')
+    # CONTROL: taskkill works, tasklist then finds nothing
+    gone = []
+    def works(argv, timeout=30):
+        if argv[0] == 'taskkill': gone.append(1); return 0, 'SUCCESS'
+        return (0, 'INFO: No tasks are running which match the specified criteria.\n') if gone else \
+               (0, '"hqplayerd.exe","100","Console"\n')
+    hq.run = works
+    try:
+        REAL_STOP_APP(100, kcfg, 5); e = None
+    except RuntimeError as ex:
+        e = str(ex)
+    ok(e is None, 'Windows: a stop that worked still returns (%s)' % e)
+    # POSIX: a process that outlives SIGKILL
+    hq.PLATFORM = 'linux'
+    os.kill = lambda pid, sig: None                 # every signal "sent", nothing dies
+    try:
+        REAL_STOP_APP(100, kcfg, 5); e = None
+    except RuntimeError as ex:
+        e = str(ex)
+    ok(e and 'left running' in e, 'POSIX: a process that outlives SIGKILL is not restarted over (%s)' % e)
+    # and restart() starts nothing after it
+    os.kill = real_kill
+    cfg = setup('linux', linux_proc(EXE, BIN, exe=EXE))
+    def stuck(pid, c, b):
+        calls.append(('stop', pid)); raise RuntimeError('HQPlayer (pid %d) would not stop, so it was left running' % pid)
+    hq.stop_app = stuck
+    r, e = run(cfg)
+    ok(e and not any(c[0] == 'start' for c in calls), 'restart() starts no second copy (%s)' % e)
+finally:
+    hq.run, os.kill, hq.KILL_WAIT = real_run, real_kill, real_wait
+
+print('== a PINNED unit still has its user/system kind detected')
+for cg, want, label in ((b'0::/user.slice/user-1000.slice/user@1000.service/app.slice/hqplayerd.service\n', True, 'a user unit'),
+                        (b'0::/system.slice/hqplayerd.service\n', False, 'a system unit')):
+    pr = dict(linux_proc(EXE, BIN, exe=EXE), **{'/proc/100/cgroup': cg})
+    setup('linux', pr)
+    how = hq.detect_linux(100, conf(service='hqplayerd.service'))
+    ok(how['mode'] == 'service' and how['user'] is want, '%s, pinned by name, is restarted as one (%r)' % (label, how.get('user')))
+setup('linux', dict(linux_proc(EXE, BIN, exe=EXE), **{'/proc/100/cgroup': b'0::/user.slice/user-1000.slice/user@1000.service/app.slice/hqplayerd.service\n'}))
+how = hq.detect_linux(100, conf(service='hqplayerd.service', user_service=False))
+ok(how['user'] is False, 'an explicit user_service still wins over the detection')
 
 print('== an `allow` entry that can never match says so')
 logged()

@@ -67,6 +67,8 @@ DEFAULT_NAMES = {
 SESSION_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
                'DBUS_SESSION_BUS_ADDRESS', 'HOME', 'LANG', 'LC_ALL', 'PULSE_SERVER')
 
+KILL_WAIT = 3       # seconds for a forced kill to take before the restart gives up
+
 DEFAULTS = {
     'listen':        '::',    # dual-stack where IPv6 exists; falls back to 0.0.0.0
     'port':          8090,
@@ -328,7 +330,9 @@ def alive(pid):
         return False
     if PLATFORM == 'win32':
         rc, out = run(['tasklist', '/FI', 'PID eq %d' % pid, '/FO', 'CSV', '/NH'])
-        return ('"%d"' % pid) in out
+        # A tasklist that FAILED knows nothing: reading its empty output as
+        # "gone" would start a second HQPlayer next to one still running.
+        return rc != 0 or ('"%d"' % pid) in out
     # A copy WE started (a relaunch) is our child: once it exits it lingers as
     # a zombie that kill(pid, 0) still reports alive, so every stop would wait
     # out stop_timeout and SIGKILL a process that had already gone. Reap first.
@@ -415,12 +419,17 @@ def detect_linux(pid, cfg):
         pass                                        # another user's process: none of it
 
     unit, user = cfg['service'], cfg['user_service']
+    # Read even when the unit is PINNED: whether it is a user unit comes from
+    # where the process runs, and pinning the NAME must not switch that
+    # detection off - a user unit would then get a system `systemctl restart`.
+    try:
+        with open('/proc/%d/cgroup' % pid) as f:
+            cg = f.read()
+    except OSError:
+        cg = ''
+    if unit and user is None and cg:
+        user = '/user@' in cg
     if not unit:
-        try:
-            with open('/proc/%d/cgroup' % pid) as f:
-                cg = f.read()
-        except OSError:
-            cg = ''
         # e.g. 0::/system.slice/hqplayerd.service
         #      0::/user.slice/user-1000.slice/user@1000.service/app.slice/hqplayerd.service
         m = re.search(r'/([^/\s]+\.service)\s*$', cg, re.M)
@@ -483,7 +492,16 @@ def stop_app(pid, cfg, budget):
                 pass    # it exited between the check and the kill: stopped, as wanted
             except PermissionError:
                 raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
-        time.sleep(1)
+        # Nothing else checks the kill worked (taskkill /F answers Access
+        # denied for an elevated process; a process stuck in the kernel
+        # outlives SIGKILL for a while), and starting HQPlayer now would put
+        # a SECOND copy next to it, both wanting port 4321.
+        deadline = time.time() + KILL_WAIT
+        while time.time() < deadline and alive(pid):
+            time.sleep(0.25)
+        if alive(pid):
+            raise RuntimeError('HQPlayer (pid %d) would not stop, so it was left running '
+                               'rather than started a second time' % pid)
 
 
 def may_signal(pid):
@@ -494,7 +512,7 @@ def may_signal(pid):
     helper against a user's app - passes this, because root may signal anything:
     that one is `same_owner`'s."""
     if PLATFORM == 'win32':
-        return True                                 # taskkill reports its own failure
+        return True                                 # stop_app checks the kill worked
     try:
         os.kill(pid, 0)
         return True

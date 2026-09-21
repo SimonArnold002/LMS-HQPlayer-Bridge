@@ -94,7 +94,7 @@ Every key is optional except `token`, which is generated on first run.
 | `hostnames` | `[]` | host names, besides an IP address or `localhost`, that the tokenless route may be addressed by |
 | `mode` | `auto` | force `app` or `service` |
 | `service` | detected | pin the launchd label, systemd unit or Windows service name |
-| `user_service` | detected | Linux: `true` for `systemctl --user` |
+| `user_service` | detected | Linux: `true` for `systemctl --user`. Detected from where HQPlayer runs, even with `service` pinned; set it if HQPlayer is a user unit and may be stopped when you restart it |
 | `start_command` | detected | pin how the app is started, as a list, e.g. `["open", "-a", "/Applications/hqplayerd.app"]` |
 | `process_names` | per OS | process names to look for |
 | `stop_timeout` | `20` | seconds allowed for a clean exit before it is killed |
@@ -102,7 +102,7 @@ Every key is optional except `token`, which is generated on first run.
 | `start_timeout` | `30` | seconds for the new process to appear |
 | `total_timeout` | `90` | the whole restart, every wait included. The Bridge waits 120s, so keep this below that |
 
-## If it can't work out how to start HQPlayer
+## When it refuses and leaves HQPlayer running
 
 For an app, the helper decides how it will start HQPlayer again *before* it stops it, and
 checks that the program is still there. If it can't tell (for example the app was deleted
@@ -110,6 +110,10 @@ or moved since it was launched, or the helper isn't allowed to see where it runs
 it uses the last way it saw HQPlayer started, if that still works. Failing that, the
 restart fails with "HQPlayer (pid N) was left running" and HQPlayer keeps playing. To fix
 it for good, set `start_command`.
+
+The same goes for a copy of HQPlayer the helper cannot stop - one running as administrator
+on Windows, say. If it is still there a few seconds after a forced stop, the restart gives
+up with "would not stop, so it was left running" rather than starting a second copy.
 
 ## Windows notes
 
@@ -145,4 +149,6 @@ under launchd, every minute under Task Scheduler) until the config is fixed.
 macOS app mode, 2026-09-21: `hqplayerd` Embedded 6.0.2 on macOS 26.6, restarted in 7.1s. The
 saved SDM settings came back (`Set dither: 9` / `Set modulator: 18`), and the Bridge and the
 Eversolo NAA reconnected. The same again from the HQPlayer Bridge's Restart row (1.0.13): about 7s, and
-playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux, Windows. The Linux cgroup handling is tested in a harness only.
+playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux, Windows.
+Linux and Windows are covered by a test suite that fakes the OS, and every piece of PowerShell
+is checked to parse with `pwsh` - but neither has run on a real Linux or Windows machine.
