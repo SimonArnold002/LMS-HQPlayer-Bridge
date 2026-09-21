@@ -75,6 +75,7 @@ my %bridges;
 # ip => 1 once that host's restart helper answered; never shrinks in a run.
 # See _probeRestart.
 my %restartable;
+my %probedAt;       # ip => when it was last asked, for the feed's throttled re-ask
 
 sub getDisplayName { 'PLUGIN_HQPLAYER_BRIDGE' }
 
@@ -260,6 +261,12 @@ sub topLevel {
             passthrough => [ { id => $id } ],
         } if $restartable{ ( $b->{instance} || {} )->{ip} // '' };
 
+        # A host missed at link-up is asked again when the list is drawn, or
+        # the row stays hidden until the link next drops - days on a healthy
+        # host. hqplayerd and the helper start at login in no fixed order, so
+        # the miss is ordinary. Throttled; the row shows on the NEXT open.
+        _probeRestart( ( $b->{instance} || {} )->{ip}, 1 );
+
         my $p = signalPathFor( $client, $b );
 
         # Every row is `text`: these are facts to read. A non-playable item
@@ -325,7 +332,8 @@ sub topLevel {
 # MANUAL ONLY. The bridge never restarts HQPlayer by itself - auto-recovery of
 # the NAA was DECLINED 2026-09-21 ("This is for Eversolo to fix").
 # ---------------------------------------------------------------------------
-use constant RESTART_PORT => 8090;
+use constant RESTART_PORT  => 8090;
+use constant REPROBE_AFTER => 60;    # seconds between the feed's re-asks of one host
 
 sub restartable { return \%restartable }
 
@@ -337,10 +345,18 @@ sub _decode {
     return ref $r eq 'HASH' ? $r : {};
 }
 
-# Once per link-up; a host already known is not asked again.
+# The clock, as a sub so the tests can move it; `time` is a builtin that a
+# glob assignment cannot reach.
+sub _now { return time() }
+
+# At every link-up, and - throttled - whenever the Apps list is drawn while the
+# host is still unknown. A host already known is never asked again.
 sub _probeRestart {
-    my $ip = shift or return;
+    my ( $ip, $throttled ) = @_;
+    return unless $ip;
     return if $restartable{$ip};
+    return if $throttled && _now() - ( $probedAt{$ip} || 0 ) < REPROBE_AFTER;
+    $probedAt{$ip} = _now();
 
     Slim::Networking::SimpleAsyncHTTP->new(
         sub {
@@ -359,12 +375,23 @@ sub _probeRestart {
 
 # The first tap only asks: a restart stops playback, and a browse row is easy
 # to hit by accident.
+#
+# IT NAMES THE INSTANCE. The row that opened this was found by POSITION, and an
+# instance dropping out of discovery between render and tap shifts every block
+# after it up by one - with three or more hosts that lands on the NEXT one's
+# row (simulated 2026-09-21). This cannot stop that; it makes it visible
+# before anything is restarted.
 sub _restartConfirm {
     my ( $client, $callback, $args, $pt ) = @_;
 
+    my $b = $bridges{ ( $pt || {} )->{id} // '' };
+    return $callback->( { items => [
+        { name => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_GONE' ), type => 'text' },
+    ] } ) unless $b;
+
     $callback->( { items => [
         {
-            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_NOW' ),
+            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_NOW', $b->{name} ),
             type        => 'link',
             url         => \&_restartNow,
             passthrough => [ $pt ],

@@ -689,13 +689,50 @@ print "-- the restart row --\n";
        'a host whose helper never answered has NO restart row');
     $reg->{aa}{instance}{ip} = '10.0.0.5';
 
-    # THE FIRST TAP ONLY ASKS.
+    # A HOST MISSED AT LINK-UP IS ASKED AGAIN WHEN THE LIST IS DRAWN - the
+    # helper and hqplayerd start at login in no fixed order - but throttled.
+    {
+        no warnings 'redefine';
+        my $now = 1_000_000;
+        local *Plugins::HQPlayerBridge::Plugin::_now = sub { $now };
+        Slim::Networking::SimpleAsyncHTTP::_reset();
+        $reg->{aa}{instance}{ip} = '10.0.0.7';
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar(@$REQ), '1', 'drawing the list asks an unknown host again');
+        is($REQ->[0]{url}, 'http://10.0.0.7:8090/ping', 'at /ping');
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar(@$REQ), '1', 'but not again on every draw');
+        $now += 61;
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar(@$REQ), '2', 'and again once a minute has passed');
+        Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.7');
+        is(scalar(@$REQ), '3', 'while a link-up is never throttled');
+        $REQ->[2]{cb}->( FakeRes->new('{"ok": true, "service": "hqrestart"}') );
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_RESTART' } @{ $feed->{items} } ), '1',
+           'and once it answers, the row is there on the next open');
+        $now += 3600;
+        Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        is(scalar(@$REQ), '3', 'and a known host is never asked again');
+        $reg->{aa}{instance}{ip} = '10.0.0.5';
+    }
+
+    # THE FIRST TAP ONLY ASKS - and names the instance, because the row that
+    # opened it was found by POSITION and can have shifted onto a neighbour.
     Slim::Networking::SimpleAsyncHTTP::_reset();
     my $page;
-    Plugins::HQPlayerBridge::Plugin::_restartConfirm( undef, sub { $page = shift }, {}, { id => 'aa' } );
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Plugin::cstring = sub { join ' ', grep { defined } @_[1 .. $#_] };
+        Plugins::HQPlayerBridge::Plugin::_restartConfirm( undef, sub { $page = shift }, {}, { id => 'aa' } );
+    }
     is(scalar(@$REQ), '0', 'the first tap restarts NOTHING - it only asks');
-    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_NOW', 'it offers Restart now');
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_NOW HQPlayer (Test)',
+       'it offers Restart now, NAMING the instance it will restart');
     is($page->{items}[0]{passthrough}[0]{id}, 'aa', 'for the same bridge');
+    Plugins::HQPlayerBridge::Plugin::_restartConfirm( undef, sub { $page = shift }, {}, { id => 'gone' } );
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_GONE', 'and a bridge gone by then offers nothing to tap');
+    is($page->{items}[0]{type}, 'text', 'as plain text');
 
     # THE SECOND DOES IT, and the page that opens is the outcome.
     Plugins::HQPlayerBridge::Plugin::_restartNow( undef, sub { $page = shift }, {}, { id => 'aa' } );

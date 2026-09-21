@@ -104,7 +104,7 @@ PLUGIN_HQPLAYER_RESTART
 	EN	Restart HQPlayer
 
 PLUGIN_HQPLAYER_RESTART_NOW
-	EN	Restart now
+	EN	Restart %s now
 
 PLUGIN_HQPLAYER_RESTART_DESC
 	EN	Playback stops. HQPlayer restarts with its saved settings, which also makes it find a network audio adapter that was switched off and on again.

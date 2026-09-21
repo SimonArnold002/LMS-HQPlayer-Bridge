@@ -158,6 +158,14 @@ def alive(pid):
     if PLATFORM == 'win32':
         rc, out = run(['tasklist', '/FI', 'PID eq %d' % pid, '/FO', 'CSV', '/NH'])
         return ('"%d"' % pid) in out
+    # A copy WE started (a relaunch) is our child: once it exits it lingers as
+    # a zombie that kill(pid, 0) still reports alive, so every stop would wait
+    # out stop_timeout and SIGKILL a process that had already gone. Reap first.
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:
+        pass                                        # not ours - the usual case
     try:
         os.kill(pid, 0)
         return True
