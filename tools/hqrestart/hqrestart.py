@@ -27,7 +27,7 @@ Host, which is what the Host rule refuses.
 
     GET  /ping      {"ok", "service": "hqrestart"} - NO token; how the HQPlayer Bridge
                     finds out this host can be restarted
-    GET  /status    {"running", "pid", "mode", "how"}
+    GET  /status    {"ok", "running", "pid", "mode", "how"}
     POST /restart   {"ok", "old_pid", "new_pid", "mode", "how", "seconds"}
     GET  /restart   same, WITH the token, so a browser bookmark or phone shortcut works
 

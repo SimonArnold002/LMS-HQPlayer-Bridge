@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause, seek, set its volume and see its artwork from Material or any control point, while HQPlayer does the upsampling, filtering and modulation exactly as it always has.</p>
   <div class="badges">
-    <span class="badge accent">v1.0.13</span>
+    <span class="badge accent">v1.0.14</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -210,7 +210,7 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <tr><td>runs as</td><td>a LaunchAgent (LaunchDaemon for a service)</td><td>a systemd unit</td><td>a scheduled task</td></tr>
 </tbody></table>
 <ul>
-<li><strong>Windows:</strong> if PowerShell refuses to run the script, use <code>powershell -ExecutionPolicy Bypass -File .\install.ps1</code>. Opening port 8090 in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
+<li><strong>Windows:</strong> if PowerShell refuses to run the script, use <code>powershell -ExecutionPolicy Bypass -File .\install.ps1</code>. Opening the helper's port (8090 unless you change <code>port</code>) in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
 </li>
 <li><strong>Linux, app mode:</strong> the helper runs only while you're logged in, unless you run <code>sudo loginctl enable-linger &lt;your user&gt;</code> (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
 </li>

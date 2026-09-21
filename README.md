@@ -105,7 +105,7 @@ The plugin sends no token, so a restart is only accepted from an address in `all
 | log | `~/Library/Logs/hqrestart.log` (`/Library/Logs/` for a service) | `journalctl --user -u hqrestart` (no `--user` for a service) | `hqrestart.log` in the config folder |
 | runs as | a LaunchAgent (LaunchDaemon for a service) | a systemd unit | a scheduled task |
 
-- **Windows:** if PowerShell refuses to run the script, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Opening port 8090 in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
+- **Windows:** if PowerShell refuses to run the script, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Opening the helper's port (8090 unless you change `port`) in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
 - **Linux, app mode:** the helper runs only while you're logged in, unless you run `sudo loginctl enable-linger <your user>` (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
 - The helper can also be called without LMS, with the token, e.g. from a phone shortcut. See [`tools/hqrestart/README.md`](tools/hqrestart/README.md) for that and for every config option.
 

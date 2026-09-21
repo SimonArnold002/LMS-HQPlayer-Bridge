@@ -125,7 +125,7 @@ ignores its own unit when working out how HQPlayer was started, and its unit has
 the app is started without one rather than left stopped.
 
 A relaunched app also gets back its session's display and desktop variables (`DISPLAY`,
-`WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, the D-Bus address, `HOME`, the locale),
+`WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, the D-Bus address, `HOME`, the locale, `PULSE_SERVER`),
 read from the running process. A helper running as a service has none of them, and HQPlayer
 Desktop can't open its window without them. No other variables are copied.
 
@@ -142,4 +142,5 @@ under launchd, every minute under Task Scheduler) until the config is fixed.
 
 macOS app mode, 2026-09-21: `hqplayerd` Embedded 6.0.2 on macOS 26.6, restarted in 7.1s. The
 saved SDM settings came back (`Set dither: 9` / `Set modulator: 18`), and the Bridge and the
-Eversolo NAA reconnected. **Not yet run:** macOS service mode, Linux, Windows. The Linux cgroup handling is tested in a harness only.
+Eversolo NAA reconnected. The same again from the HQPlayer Bridge's Restart row (1.0.13): about 7s, and
+playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux, Windows. The Linux cgroup handling is tested in a harness only.
