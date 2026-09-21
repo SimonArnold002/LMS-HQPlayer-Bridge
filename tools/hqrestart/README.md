@@ -132,6 +132,12 @@ Desktop can't open its window without them. No other variables are copied.
 Linux keeps only the first 15 characters of a process name, so `hqplayer6desktop` is looked
 for as `hqplayer6deskto`.
 
+If the helper refuses to start - a config file that doesn't parse, or a port it can't bind -
+it says so in one line and exits 2, and the systemd unit's `RestartPreventExitStatus=2` leaves
+it stopped rather than retrying for ever: `systemctl --user status hqrestart` shows the reason.
+A crash still restarts. On macOS and Windows there is no such filter, so it retries (every 10s
+under launchd, every minute under Task Scheduler) until the config is fixed.
+
 ## Tested
 
 macOS app mode, 2026-09-21: `hqplayerd` Embedded 6.0.2 on macOS 26.6, restarted in 7.1s. The

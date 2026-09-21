@@ -102,6 +102,11 @@ Restart=always
 # stopping or updating the helper must never take a relaunched HQPlayer with it
 KillMode=process
 RestartSec=3
+# The helper exits 2 when it REFUSES to start - a config that does not parse, a
+# port it cannot bind - and says why in one line. Without this, Restart=always
+# retries that refusal every 3s for ever and buries the line in its own repeats.
+# A crash (any other code) still restarts.
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=$WANTED

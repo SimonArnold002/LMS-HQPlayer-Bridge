@@ -236,6 +236,16 @@ code, said, tries = bind_test(OSError(_errno.EAFNOSUPPORT, 'Address family not s
 ok(tries == ['::', '0.0.0.0'], 'no IPv6 here falls back to 0.0.0.0 (%r)' % (tries,))
 ok('no IPv6' in said and 'listening on 0.0.0.0' in said, 'and says so once')
 
+print('== the unit and the exit code agree about a refusal')
+# The helper says why ONCE and exits 2; a unit that retries that every 3s buries
+# the line under its own repeats, which is the whole point of saying it once.
+_inst = real_open(os.path.join(_here, 'hqrestart', 'install.sh')).read()
+ok('RestartPreventExitStatus=2' in _inst, 'the systemd unit does not retry exit 2')
+import re as _re
+ok(len(_re.findall(r'^Restart=always$', _inst, _re.M)) == 1, 'and still restarts a crash')
+_src = real_open(os.path.join(_here, 'hqrestart', 'hqrestart.py')).read()
+ok(_src.count('raise SystemExit(2)') == 2, 'both refusals use that code (config, and bind)')
+
 print('== HQPlayer running as ANOTHER user: LEFT RUNNING, and the message says why')
 # kill(pid, 0) asks without sending anything; os.kill is shared, so it is restored.
 real_kill = os.kill
