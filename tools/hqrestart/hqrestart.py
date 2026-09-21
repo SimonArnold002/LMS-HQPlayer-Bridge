@@ -110,13 +110,19 @@ def log(msg):
 
 
 def run(argv, timeout=30):
-    """Run a command; return (rc, stdout). Never raises for a missing binary."""
+    """Run a command; return (rc, stdout). Never raises for a missing binary.
+
+    A failure returns EMPTY output, never the exception text, because callers
+    SCRAPE this string: `find_pid` reads bare digits out of it, and "timed out
+    after 30 seconds" handed it pid 30 - a real, unrelated process, which a root
+    helper would then stop. The reason goes to the log instead."""
     try:
         p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            timeout=timeout, universal_newlines=True)
         return p.returncode, p.stdout
     except (OSError, subprocess.TimeoutExpired) as e:
-        return 127, str(e)
+        log('%s failed: %s' % (argv[0], e))
+        return 127, ''
 
 
 def powershell(script, timeout=60):
@@ -176,6 +182,16 @@ class Config:
                 log('config: "%s" should be a list; ignoring %r' % (k, v))
                 v = []
             self.c[k] = [str(x).strip() for x in v if str(x).strip()]
+            if k == 'allow':
+                # `allow` is matched against the CLIENT ADDRESS, so a name here
+                # can never match: the Restart row still appears (/ping needs no
+                # token) and every restart answers 401 with nothing saying why.
+                for entry in self.c[k]:
+                    try:
+                        ipaddress.ip_address(entry)
+                    except ValueError:
+                        log('config: "allow" entry %r is not an IP address, so nothing will '
+                            'match it - use the address of the LMS server' % entry)
 
         cmd = self.c['start_command']
         if isinstance(cmd, str):
@@ -208,17 +224,26 @@ class Config:
         # `respawn_wait` 0 is a real choice - "do not give launchd a chance to
         # relaunch it, start it myself" - so zero is only refused where it would
         # mean "give up at once".
+        # The bound is "more than zero", NOT "one or more": half a second is a
+        # perfectly good timeout, and a floor of 1 silently swapped it for the
+        # 30s default - the over-reach this very block exists to avoid.
         for k in ('port', 'stop_timeout', 'respawn_wait', 'start_timeout', 'total_timeout'):
-            floor = 0 if k == 'respawn_wait' else 1
             try:
                 v = float(self.c[k])
-                if v < floor or (k == 'port' and v > 65535):
-                    raise ValueError(v)
+                if k == 'port':
+                    bad, want = not 1 <= v <= 65535, 'a port between 1 and 65535'
+                elif k == 'respawn_wait':
+                    bad, want = v < 0, 'a number of seconds, 0 or more'
+                else:
+                    bad, want = v <= 0, 'a number of seconds above 0'
+                if bad:
+                    raise ValueError(want)
                 self.c[k] = int(v) if k == 'port' else v
             except (TypeError, ValueError):
                 log('config: "%s" must be %s; using %r'
                     % (k, 'a port between 1 and 65535' if k == 'port' else
-                          'a number of seconds (%s or more)' % floor, DEFAULTS[k]))
+                          'a number of seconds, 0 or more' if k == 'respawn_wait' else
+                          'a number of seconds above 0', DEFAULTS[k]))
                 self.c[k] = DEFAULTS[k]
 
         if self.c['total_timeout'] > BRIDGE_WAIT - 10:
@@ -254,6 +279,8 @@ def find_pid(names):
     if PLATFORM == 'win32':
         for n in names:
             rc, out = run(['tasklist', '/FI', 'IMAGENAME eq %s' % n, '/FO', 'CSV', '/NH'])
+            if rc != 0:
+                continue
             for line in out.splitlines():
                 cols = [c.strip('"') for c in line.split('","')]
                 if len(cols) > 1 and cols[0].lower() == n.lower() and cols[1].isdigit():
@@ -266,6 +293,8 @@ def find_pid(names):
         if PLATFORM == 'linux':
             n = n[:15]
         rc, out = run(['pgrep', '-x', n])
+        if rc != 0:                                 # 1 = no match, 127 = pgrep itself failed
+            continue
         pids = [int(x) for x in out.split() if x.isdigit()]
         if pids:
             return min(pids)

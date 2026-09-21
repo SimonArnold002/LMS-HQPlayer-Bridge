@@ -23,7 +23,7 @@ perl -I. t_player.pl
 perl -I. t_stream.pl
 perl -I. t_plugin.pl
 perl -I. t_live.pl
-python3 t_hqrestart.py 2>/dev/null   # the helper's own log goes to stderr
+python3 t_hqrestart.py   # its own log is silenced inside; a traceback must be VISIBLE
 sh -n hqrestart/install.sh && echo "  ok   the macOS/Linux installer parses"   # nothing else reads it
 
 echo

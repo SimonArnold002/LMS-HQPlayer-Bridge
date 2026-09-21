@@ -6,6 +6,13 @@ import builtins, importlib.util, io, json, os, sys, tempfile
 _here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location('hq', sys.argv[1] if len(sys.argv) > 1 else os.path.join(_here, 'hqrestart', 'hqrestart.py')); hq = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hq)
+# The helper logs to stderr on nearly every call. Silencing it HERE, rather
+# than with 2>/dev/null in run_checks.sh, keeps a real traceback visible.
+_said = []
+hq.log = lambda msg: _said.append(msg)
+def logged():
+    """Everything the helper has logged since the last look, as one string."""
+    out = '\n'.join(_said); del _said[:]; return out
 P = F = 0
 def ok(c, name):
     """c may be a callable, so a missing attribute or a raise inside the check
@@ -48,6 +55,8 @@ os.readlink = f_readlink
 
 calls = []
 ORIG_DETECT, ORIG_RESTART_SERVICE = hq.detect, hq.restart_service
+REAL_FIND_PID = hq.find_pid
+REAL_POPEN = hq.subprocess.Popen
 def setup(platform, proc=None, state=None, pinned=None):
     # some cases below replace these; a leaked patch would silently answer the
     # NEXT case and its assertions would be measuring nothing
@@ -191,11 +200,35 @@ ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not
 _json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
 ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
 
+print('== a command that FAILS must not look like output')
+# run() used to return the exception text in the stdout slot, and find_pid scrapes
+# bare digits out of that: "timed out after 30 seconds" IS pid 30 - a real,
+# unrelated process, which a root helper would then SIGTERM.
+import subprocess as _sp
+real_run = hq.run
+hq.PLATFORM = 'darwin'
+stub_popen, hq.subprocess.Popen = hq.subprocess.Popen, REAL_POPEN   # the cases above recorded starts
+try:
+    hq.run = lambda argv, timeout=30: (1, '')                              # pgrep: no match
+    ok(lambda: REAL_FIND_PID(['hqplayerd']) is None, 'nothing matching means no pid')
+    hq.run = lambda argv, timeout=30: (127, str(_sp.TimeoutExpired(argv, 30)))
+    ok(lambda: REAL_FIND_PID(['hqplayerd']) is None, 'a TIMED-OUT pgrep yields no pid, not 30')
+    hq.run = lambda argv, timeout=30: (0, '  12345\n')
+    ok(lambda: REAL_FIND_PID(['hqplayerd']) == 12345, 'and a real answer still yields its pid')
+    # the text itself never reaches a caller
+    logged()
+    rc, out = real_run(['/no/such/binary/hqrestart-test'])
+    ok(rc == 127 and out == '', 'run() gives EMPTY output on failure (%r)' % (out,))
+    ok('failed:' in logged(), 'and puts the reason in the log instead')
+finally:
+    hq.run = real_run
+    hq.subprocess.Popen = stub_popen
+
 print('== a bind that fails is reported once, and blames the right thing')
 # Driven through server_for rather than a real port: whether binding `::` clashes
 # with a socket held on 127.0.0.1 differs by platform, and a test that sometimes
 # BINDS would hang in serve_forever instead of failing.
-import errno as _errno, io as _io
+import errno as _errno
 def bind_test(err, second=None):
     """(exit code, what was logged) for a server_for that raises `err`."""
     tries = []
@@ -212,7 +245,7 @@ def bind_test(err, second=None):
     _json.dump({'token': 't', 'port': 8090}, real_open(c4, 'w'))     # listen: the `::` default
     real_server_for, hq.server_for = hq.server_for, fake
     argv, sys.argv = sys.argv[:], ['hqrestart.py', c4]
-    err_out, sys.stderr = sys.stderr, _io.StringIO()
+    logged()                                        # start from a clean slate
     code = 'no exit'
     try:
         hq.main()
@@ -221,9 +254,8 @@ def bind_test(err, second=None):
     except Exception as e:
         code = '%s: %s' % (type(e).__name__, e)
     finally:
-        said, sys.stderr = sys.stderr.getvalue(), err_out
         sys.argv = argv; hq.server_for = real_server_for
-    return code, said, tries
+    return code, logged(), tries
 
 code, said, tries = bind_test(OSError(_errno.EADDRINUSE, 'Address already in use'))
 ok(code == 2, 'a port already in use stops the helper (exit %r)' % (code,))
@@ -307,14 +339,9 @@ ok(conf(start_command=[EXE, 7])['start_command'] == [EXE, '7'], 'start_command e
 
 # The Bridge gives up at 120s (Plugin.pm), so a longer bound here is reported
 # there as a failure while the restart carries on and succeeds unseen.
-import io as _io2
-_e, sys.stderr = sys.stderr, _io2.StringIO()
-try:
-    conf(total_timeout=300); loud = sys.stderr.getvalue()
-    sys.stderr = _io2.StringIO()
-    conf(total_timeout=90); quiet = sys.stderr.getvalue()
-finally:
-    sys.stderr = _e
+logged()
+conf(total_timeout=300); loud = logged()
+conf(total_timeout=90);  quiet = logged()
 ok('gives up at 120' in loud, 'a total_timeout past the Bridge\'s wait is warned about')
 ok(quiet == '', 'and the default is not (%r)' % quiet[:60])
 
@@ -325,6 +352,23 @@ ok(c7['respawn_wait'] == 0, 'respawn_wait 0 is kept (%r)' % (c7['respawn_wait'],
 ok(c7['port'] == 8090, 'a port outside 1-65535 falls back (%r)' % (c7['port'],))
 ok(c7['stop_timeout'] == 20, 'but a zero stop_timeout does not - it would mean give up at once (%r)'
    % (c7['stop_timeout'],))
+
+print('== an `allow` entry that can never match says so')
+logged()
+conf(allow=['nuc.local', '192.168.1.234'])
+_said_now = logged()
+ok('not an IP address' in _said_now, 'a host name in `allow` is called out (%r)' % _said_now[-70:])
+logged(); conf(allow=['192.168.1.234'])
+ok('not an IP address' not in logged(), 'and an address is not')
+
+# Round 19 put a floor of ONE second on the timeouts, and a start_timeout of 0.5
+# - this suite's own setting - was swapped for the 30s default in silence. The
+# only symptom was a suite 30s slower. A fraction of a second is a real value.
+logged()
+c8 = conf(start_timeout=0.5, stop_timeout=2.5)
+ok(c8['start_timeout'] == 0.5 and c8['stop_timeout'] == 2.5, 'fractional timeouts are kept (%r, %r)'
+   % (c8['start_timeout'], c8['stop_timeout']))
+ok('must be' not in logged(), 'and nothing is logged as corrected')
 
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)

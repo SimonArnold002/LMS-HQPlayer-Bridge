@@ -50,7 +50,13 @@ if ($System) {
 Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 Start-ScheduledTask -TaskName $task
 
-$port = 8090
+# The port the helper actually listens on: a config that sets one must open THAT
+# port, or the rule is for 8090 and LMS still cannot reach it, with no warning.
+# The config is written on the first start, so wait for it here.
+for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
+$conf = $null
+try { $conf = Get-Content $cfg -Raw -ErrorAction Stop | ConvertFrom-Json } catch { }
+$port = if ($conf -and $conf.port) { [int]$conf.port } else { 8090 }
 if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyContinue)) {
     # only once: a re-install must not stack duplicate rules
     New-NetFirewallRule -DisplayName 'hqrestart' -Direction Inbound -Protocol TCP -LocalPort $port `
@@ -67,9 +73,7 @@ if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyCont
 # never fatally: with ErrorActionPreference 'Stop' a config that is not there yet
 # would otherwise abort the script, losing the firewall rule and every line below
 # and leaving a working install looking like a failed one.
-$token = $null
-for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
-try { $token = (Get-Content $cfg -Raw -ErrorAction Stop | ConvertFrom-Json).token } catch { }
+$token = if ($conf) { $conf.token } else { $null }
 
 "installed. config: $cfg"
 "log:     $(Join-Path $dir 'hqrestart.log')"
