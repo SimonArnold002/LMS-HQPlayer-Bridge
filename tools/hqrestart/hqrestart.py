@@ -724,8 +724,11 @@ def main():
         srv = server_for(listen, int(cfg['port']))
     except OSError as e:
         # A machine with IPv6 switched off cannot bind `::` at all, and that is
-        # the DEFAULT here - fall back rather than refusing to run.
-        if listen == DEFAULTS['listen']:
+        # the DEFAULT here - fall back rather than refusing to run. But a port
+        # already taken, or one we may not have, is NOT an IPv6 problem: falling
+        # back there would fail the same way under a message blaming IPv6.
+        busy = getattr(e, 'errno', None) in (errno.EADDRINUSE, errno.EACCES)
+        if listen == DEFAULTS['listen'] and not busy:
             log('no IPv6 here (%s) - listening on 0.0.0.0 instead' % e)
             try:
                 listen = '0.0.0.0'

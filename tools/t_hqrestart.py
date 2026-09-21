@@ -191,23 +191,50 @@ ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not
 _json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
 ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
 
-print('== a port it cannot bind is reported once, not retried for ever')
-import socket as _socket
-held = _socket.socket(); held.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-held.bind(('127.0.0.1', 0)); held.listen(1)
-busy = held.getsockname()[1]
-d2 = tempfile.mkdtemp(); c_busy = os.path.join(d2, 'hqrestart.json')
-_json.dump({'token': 't', 'listen': '127.0.0.1', 'port': busy}, real_open(c_busy, 'w'))
-argv = sys.argv[:]
-sys.argv = ['hqrestart.py', c_busy]
-try:
-    hq.main(); ok(False, 'a taken port stops the helper')
-except SystemExit as e:
-    ok(e.code == 2, 'a taken port stops the helper with a plain message (exit %r)' % (e.code,))
-except Exception as e:
-    ok(False, 'a taken port raised %s instead' % type(e).__name__)
-finally:
-    sys.argv = argv; held.close()
+print('== a bind that fails is reported once, and blames the right thing')
+# Driven through server_for rather than a real port: whether binding `::` clashes
+# with a socket held on 127.0.0.1 differs by platform, and a test that sometimes
+# BINDS would hang in serve_forever instead of failing.
+import errno as _errno, io as _io
+def bind_test(err, second=None):
+    """(exit code, what was logged) for a server_for that raises `err`."""
+    tries = []
+    def fake(listen, port):
+        tries.append(listen)
+        e = second if (len(tries) > 1 and second is not None) else err
+        if e is None:
+            class S:
+                socket = None
+                def serve_forever(self): raise SystemExit('served')
+            return S()
+        raise e
+    d4 = tempfile.mkdtemp(); c4 = os.path.join(d4, 'hqrestart.json')
+    _json.dump({'token': 't', 'port': 8090}, real_open(c4, 'w'))     # listen: the `::` default
+    real_server_for, hq.server_for = hq.server_for, fake
+    argv, sys.argv = sys.argv[:], ['hqrestart.py', c4]
+    err_out, sys.stderr = sys.stderr, _io.StringIO()
+    code = 'no exit'
+    try:
+        hq.main()
+    except SystemExit as e:
+        code = e.code
+    except Exception as e:
+        code = '%s: %s' % (type(e).__name__, e)
+    finally:
+        said, sys.stderr = sys.stderr.getvalue(), err_out
+        sys.argv = argv; hq.server_for = real_server_for
+    return code, said, tries
+
+code, said, tries = bind_test(OSError(_errno.EADDRINUSE, 'Address already in use'))
+ok(code == 2, 'a port already in use stops the helper (exit %r)' % (code,))
+ok('already in use' in said and 'no IPv6' not in said,
+   'and blames the port, not IPv6 - which would send the reader the wrong way')
+ok(tries == ['::'], 'it does not retry the same busy port on 0.0.0.0 (%r)' % (tries,))
+
+# IPv6 switched off: `::` is unbindable, and falling back is the whole point.
+code, said, tries = bind_test(OSError(_errno.EAFNOSUPPORT, 'Address family not supported'), second=None)
+ok(tries == ['::', '0.0.0.0'], 'no IPv6 here falls back to 0.0.0.0 (%r)' % (tries,))
+ok('no IPv6' in said and 'listening on 0.0.0.0' in said, 'and says so once')
 
 print('== HQPlayer running as ANOTHER user: LEFT RUNNING, and the message says why')
 # kill(pid, 0) asks without sending anything; os.kill is shared, so it is restored.
