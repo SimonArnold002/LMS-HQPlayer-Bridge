@@ -99,3 +99,21 @@ PLUGIN_HQPLAYER_CTL_VOLUP
 
 PLUGIN_HQPLAYER_LIVE_WAITING
 	EN	Waiting for the player to connect
+
+PLUGIN_HQPLAYER_RESTART
+	EN	Restart HQPlayer
+
+PLUGIN_HQPLAYER_RESTART_NOW
+	EN	Restart now
+
+PLUGIN_HQPLAYER_RESTART_DESC
+	EN	Playback stops. HQPlayer restarts with its saved settings, which also makes it find a network audio adapter that was switched off and on again.
+
+PLUGIN_HQPLAYER_RESTART_OK
+	EN	HQPlayer restarted (%s s)
+
+PLUGIN_HQPLAYER_RESTART_FAIL
+	EN	Restart failed: %s
+
+PLUGIN_HQPLAYER_RESTART_GONE
+	EN	This HQPlayer is no longer connected

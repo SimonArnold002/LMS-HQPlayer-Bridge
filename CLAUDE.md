@@ -56,6 +56,14 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `_remoteArt`, a dead / unfetchable cover showing LMS's `radio.png` | ACCEPTED 2026-09-17, Simon's call — no bridge-side detection | `The image proxy answers a dead cover with 200 and radio.png` |
 | `flush()`'s `<PlaylistClear/>` dropped by `cancelQueued('track')` | MOOT 2026-09-11 — both `_newGeneration` callers cover it | `` `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` `` |
 | `np_extid`, `_extid`, `loadEmblems`, the live page's service badge missing | BY DESIGN 2026-09-20, Simon's call — only Material draws badges | `only Material shows badges, and that is the whole point` |
+| `_idsFor` splitting one daemon into two players after a DHCP move (a remembered address counted as a second instance) | **FIXED** 1.0.9 — `_liveOf` freshness gate plus the `_isSplit` pair guard; 1.0.8 had the gate WITHOUT the guard and must not be installed | `A CORPSE IS NOT AN INSTANCE` |
+| `_liveOf` collapsing an established PAIR when one member misses a round (`_isSplit`, `_onInstances` passing `\%bridges`) | **FIXED** 1.0.9 — found in review 2026-09-21, introduced by 1.0.8 | `AN ESTABLISHED PAIR IS NOT A DHCP MOVE` |
+| a DEAD address in a still-duplicated group keeping an address-qualified player until it expires (`_idsFor`, the `@$group` loop) | **DECLINED** 2026-09-21 — pre-existing in 1.0.7, it is `INSTANCE_TTL`'s designed grace, and looping `@$live` would strip that grace from a quiet member of a real pair | `a quiet pair member and a dead address are the same row` |
+| a brand-new same-named instance appearing while the first is QUIET is treated as a DHCP move for one round | **RESIDUAL, ACCEPTED** 2026-09-21 — inherent to fixing the DHCP move; bounded and characterised | `S9 - the one-round residual` |
+| one host on TWO interfaces (Ethernet + Wi-Fi), a PERMANENT split | **DECLINED** 2026-09-20, Simon's call — the vendor documents single-interface operation | `more than one interface active is DECLINED` |
+| the licence `fingerprint` as a stable machine identity | **WRONG, MEASURED** 2026-09-20 — it is INTERFACE-derived, DO NOT RE-PROPOSE | `the fingerprint is not a machine identity` |
+| renaming an instance making a NEW player and stranding its settings (`_idFor`, the discovery name) | **KNOWN, UNFIXED** 2026-09-20 — the name is a user-editable field, not a product string | `the discovery name is a SETTING` |
+| NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -120,7 +128,9 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` before it reaches the wire, so a deleted pre-queued track is left in HQPlayer's playlist until the next full load (`Player.pm`, `flush` / `_newGeneration`) | **MOOT** 2026-09-11 — raised in review, verified here, NO code change | The cancel is real; the consequence is not. `cancelQueued` has exactly one caller, `_newGeneration`, and that has exactly two: `_startTrack` and `stop()`. **Both cover the clear they cancel.** Down `_startTrack` the very next call is `_queueTrack`, which re-sends `<Stop/>` + `<PlaylistClear/>` in the NEW generation — so the cancel removes a redundant clear that the load's own clear supersedes, which is what the scope is for. Down `stop()` the item genuinely does survive, and it cannot be reached: the engine is stopped, `stop()` zeroes `hqStarted` and `hqPlayAck` so `_canHandOver` refuses every hand-over, and the only route back to playback is `play()` → `_startTrack`, which opens Stop + PlaylistClear. Nothing can play the stale item, and `resume()` is not that route — LMS reaches it from `pause()`, never from a stop. **The stated consequence is the DESIGNED steady state, not a defect**: `_appendTrack` only ever adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer's list is a HISTORY of the run and every track already played sits in it on exactly the same terms. Trimming it was offered and declined — see `HQPlayer's playlist should show the whole LMS queue`. **No writer reaches the harmful branch**, which is the whole verdict: the review named a branch, not a route to it. Suite green at the time of checking (62 + 133 + others, 0 failed). |
 | The image proxy answers a dead cover with 200 and radio.png, so since 1.0.1 an expired CDN link or dead station logo shows a radio icon on the endpoint where it used to show nothing (`Player.pm` `_remoteArt`) | **ACCEPTED** 2026-09-17, Simon's call | Measured live: a 404 origin through `/imageproxy/.../image_600x600_o.jpg` answers `200 image/png`, 41,647 B, LMS's 512x512 `radio.png`. In 9.1 `_artworkError` has `$response->code($code)` commented out, so no status reaches the endpoint; only `Cache-Control: no-cache` and a past `Expires` mark it. `_coverURL` still returns a URL, so `_reusableArt` never runs and the log shows no miss. Detecting it would need the bridge to serve its own cover route and turn that header into a 404; declined as not worth the LMS-internals dependency. It is what LMS's own screens show for a dead cover. |
 | The live page's service badge is drawn only where Material is installed: `loadEmblems()` fetches `/material/html/misc/emblems.json` and the logo comes from `/material/svg/<name>`, so on a server without Material the fetch 404s, `EMBLEMS` stays null and no badge is ever drawn (`Live.pm`, `np-badge`) | **BY DESIGN** 2026-09-20, Simon's call: "only material shows badges so this is expected" - badge itself **VERIFIED LIVE** on 1.0.3 | **Only Material shows badges, and that is the whole point** — the badge exists to match the one Material already draws on LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows, so it uses Material's own emblem table and its own recoloured logos rather than a copy that would drift the moment Material changes a colour or adds a service. A skin that draws no badges anywhere has nothing to match, and a fallback drawn from some other asset would be a second, divergent badge. The fetch failing costs the badge and nothing else on the page. **Not a defect, and not a gap to fill with a fallback.** |
-| One host on TWO interfaces (Ethernet + Wi-Fi) could split into two players, and nothing de-duplicates them by machine (`_idsFor`, `tools/probe_identity.py`) | **PARKED** 2026-09-20, Simon: "dont implement this yet" - measured, not built | `one host on two interfaces` - the licence `fingerprint` is the candidate key (128-bit, stable across a restart, present even at `valid="0"`); the rig has never reached the address-qualifying branch, and the open question is what address the host has on Ethernet |
+| One host on TWO interfaces (Ethernet + Wi-Fi) splitting into two players (`_idsFor`, `tools/probe_identity.py`) | **DECLINED** 2026-09-20, Simon's call | Superseded the PARKED entry of the same day. The split is REAL and was reproduced live - see `A CORPSE IS NOT AN INSTANCE` - but running HQPlayer with more than one interface active is documented upstream as unsupported, so the plugin does not defend against it. The DHCP-move half of the same bug IS fixed. |
+| The licence `fingerprint` identifies the MACHINE, so it can key a player across a rename or a move | **WRONG, MEASURED** 2026-09-20 | `the fingerprint is not a machine identity` |
+| The bridge should detect the Eversolo NAA coming back and press HQPlayer's **Refresh devices** itself, because after the endpoint is powered off and on hqplayerd does not use it until that button is pressed — the NAA vanishes and a refresh drops DSD | **DECLINED** 2026-09-21, Simon's call: *"This is for Eversolo to fix"* | Measured in hqplayerd's `:8088/log` 2026-09-21. **(1) hqplayerd never noticed the endpoint was gone:** it sat idle holding the NAA TCP link, and logged **zero** of its 2-second `NAA output discovery` scans all morning; it found out only when the next command failed — `11:28:35 Stop` → `clNetEngine::Stop(): send(): Broken pipe`, then `PushSDM(): not connected to adapter`. **(2) Its own reconnect stalled:** it rediscovered and connected to `192.168.1.197:43210` by itself at 11:28:38 (`attempting to reinitialize...`) but never logged `NAA output network engine started`; Play at 11:28:47 ran with `hardware: 0`. **(3) Refresh devices fixes the link but drops the user's mode:** the button is `GET /config/refresh` behind HTTP Digest auth (`/` and `/log` need none). After it, HQPlayer came back in **PCM 768k / TPDF / poly-sinc-gauss-long** while the saved config says **SDM / LNS15 / poly-sinc-gauss-hires-lp**, and it had been running SDM at 5.6 MHz before. The bridge sends no `SetMode`/`SetRate`/`SetFilter`/`SetShaping`/`SetTransport` — none has a call site, `%KNOWN` in `Control.pm` only whitelists — so the refresh itself did it. The Eversolo still advertised DSD 2.8–22.5 MHz on reconnect. **Also no route on the control socket:** there is no rescan verb, and `ConfigurationLoad` needs Signalyst's Ed25519 client key plus a session key. An auto-refresh would recover the endpoint and silently drop DSD, and would need the web login stored in the plugin plus HTTP brought back (removed 0.2.54). **A full daemon restart DOES restore the mode** (Simon, 11:48 same day): the startup applies the saved settings explicitly — `Set dither: 9`, `Set modulator: 18` right after `HQPlayer Engine version` — and it came back SDM 5.6 MHz, ASDM7EC-light, `NAA output network engine started at: 5644800`. The `/config/refresh` restart logs no such `Set` lines. Untested, and the only thing that could reopen this: whether re-POSTing the unchanged `/config` form (Apply) straight after restores SDM. **DISPROVEN 2026-09-21: `http://<hq>:8088/restart` is NOT a remote restart.** Tried unauthenticated from LAN and from 127.0.0.1, and by Simon logged in via curl and in the browser: every one `200` + an empty page, PID unchanged, no `Server stopping...`. The 15:20:04 restart it was credited with was a **Dock-tile Quit**: macOS log `15:20:03.556 DockHelper spawned` → `15:20:04.641 Dock: Calling force quit` → `libquit: hqplayerd [85837] force quit` → launchd respawned it as pid 20799 at 15:20:08 (Chrome was frontmost, hence the mix-up). That restart DID restore SDM (`Set dither: 9`/`Set modulator: 18`, then `engine started at: 5644800`), so a daemon restart remains the manual fix, but there is still NO HTTP route to it. Check a claimed restart by the PID and the macOS `libquit` line, not by timing. **MANUAL RESTART BUILT 2026-09-21 (on top of the uncommitted 1.0.9), Simon's brief:** `tools/hqrestart/` is a stdlib-Python webhook on the HQPlayer host (:8090) that restarts HQPlayer the way it was started, app or service, on macOS/Linux/Windows; macOS app mode verified live (7.1s, SDM restored). The Bridge gets a **Restart HQPlayer** row per instance in the Apps feed, confirm-then-act, shown only once `http://<instance ip>:8090/ping` has answered as the helper (`%restartable`, never shrinks in a run, because `item_id` is positional). **Still no settings page:** the helper authorises the LMS server by its `allow` list, not a token. **Still manual:** the bridge never restarts on its own, so the auto-refresh DECLINE above stands. Bridge side offline-tested only (t_plugin.pl, 25 assertions). **BUILT as 1.0.10** 2026-09-21 (with the 1.0.9 DHCP-split fix), committed on dev, NOT pushed, NOT yet installed or run on LMS. |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -2154,45 +2164,194 @@ for all of them — id *and* display name, since two identically named players
 are unusable anyway. Re-keying when a second instance appears costs that
 player's prefs once; the thrash cost them every round.
 
-### PARKED: one host on two interfaces (2026-09-20)
+### Player identity: what moves it and what does not (2026-09-20)
 
-**Simon's instruction: "dont implement this yet". This is a PARKED scope
-decision, not a gap - do not report the absence of any of it as a finding.**
+**SUPERSEDES the PARKED entry written earlier the same day.** That entry called
+the licence `fingerprint` a stable candidate key and said the open question was
+what address the host has on Ethernet. Both are answered below and the first is
+WRONG. Everything here was measured on the rig with `tools/probe_identity.py`
+(read-only: port 4321, `GetLicense` + `GetInfo`, multicast and unicast
+discovery, never a subnet sweep).
 
-The question, from a session running alongside the 1.0.x badge work: when a
-machine has both Ethernet and Wi-Fi up, does LMS end up with two HQPlayer
-players? `_idsFor` above already qualifies a shared name by address, so two
-LIVE addresses for one daemon would split into two players.
+#### the discovery name is a SETTING, not a product string
 
-**Measured on the rig with `tools/probe_identity.py` (read-only: port 4321,
-`GetLicense` + `GetInfo`, multicast discovery, never a subnet sweep):**
+`_idsFor`'s own comment calls it "a PRODUCT string, not an identity". That is
+wrong on both products, and the error is load-bearing because `_idFor` hashes it
+into the player id.
 
-* **`<GetLicense/>` carries a `fingerprint`** - `M30kG1/2sPVkASFB4Uz2CA==`,
-  16 bytes base64, so 128 bits and NOT a 6-byte MAC. It came back **unchanged
-  across two runs ~1h apart spanning an hqplayerd restart**, and it is present
-  **even though `valid="0"`**, so identity by fingerprint would not depend on
-  licence state. This is the candidate key if the work is ever taken up.
-* **`GetInfo name` is NOT a second key.** It answers `HQPlayerEmbedded`, which
-  is exactly the discovery string, so it buys nothing over what `_idsFor`
-  already has. (The probe's first version compared `name` against `product`
-  instead of against the DISCOVERY name and would have called it a cheap key -
-  corrected 2026-09-20, with the reason in the code.)
-* **The rig holds ONE player, `02:ab:88:42:4c:69`** = `_idFor("HQPlayerEmbedded")`
-  exactly, plain name-derived, display name carrying no address suffix. So the
-  address-qualifying branch **has never fired there**, and the one-entry player
-  history says it has left no orphans.
-* Discovery answered from a single address (`192.168.1.109`), so the run does
-  **not** settle the two-live-address case. **The open question is what address
-  the host has on Ethernet**: if the router hands it the same one, the case
-  cannot arise on this rig at all and the whole thing is theoretical here.
+* It is a **user-editable field in HQPlayer's own UI**. Embedded defaults it to
+  `HQPlayerEmbedded`; Desktop defaults it to the machine's Bonjour hostname.
+* **PROVEN on the rig.** Renamed the instance to `ManCave`; the id moved from
+  `02:ab:88:42:4c:69` (`_idFor('HQPlayerEmbedded')`) to `02:ff:3a:76:8a:c7`
+  (`_idFor('ManCave')`) - predicted in advance, then observed. The old player
+  was removed and everything configured on it was left behind.
+* **LMS does not notice at once.** The daemon answered `ManCave` at 22:42:38;
+  the player flipped at 22:46:27. That is the discovery cadence, up to
+  `IDLE_PERIOD` (10 min) when the control link is up. Not a UI refresh problem.
+* **FIELD FAILURE, and this is what started the whole investigation.** A user on
+  HQPlayer Desktop 5 lost every setting on his player. macOS had appended its
+  duplicate-name suffix to his hostname - `Michaels-Mac-mini.local` became
+  `Michaels-Mac-mini-2.local` - so the discovery name changed, so the id changed.
+  His old player is `02:bc:d0:b6:83:89`. Nothing to do with the plugin version:
+  he had moved from a dev build to the main repo at the same time, which was
+  coincidence. `_idFor` is byte-identical on main and dev, and the derivation
+  changed exactly once ever, at 0.2.8, where it was a no-op for one instance.
+* **The settings are not destroyed, only orphaned.** `Slim::Player::Client::forgetClient`
+  (read from LMS 9.0 source) unsyncs, forgets the display, clears the button,
+  alarm, timer and web structures, deletes the client from `%clientHash` and
+  closes the socket. **It does not touch client prefs.** So renaming BACK to the
+  old string restores the player and everything on it.
+* **UNFIXED, and it needs no exotic conditions** - one person tidying up a name,
+  or one OS-level hostname change. The only identity a user cannot casually
+  change would be the licence fingerprint, and that is disproven below. The
+  workaround is to SET the name explicitly rather than leave it at its default,
+  which pins it against the OS.
 
-**Seen in the same log window and NOT diagnosed** (19:13-19:30 local
-2026-09-20): hqplayerd refused every load - `<PlaylistAdd result="Error">
-std::exception</PlaylistAdd>`, seven breaker trips, then `control link down`
-and `connect refused` twice. It recovered on its own; the badge work was
-verified live after it and played normally. **`valid="0"` is the obvious
-suspect** for an Embedded 6 throwing on `PlaylistAdd` and then exiting, but
-nothing tests that yet. See also "hqplayerd 'crashes': it is NOT crashing".
+#### A CORPSE IS NOT AN INSTANCE (the DHCP-move split) - FIXED
+
+`%found` is keyed by the sender address; identity is keyed by the name. A
+remembered address that the daemon has left still counted as a second instance,
+so one daemon read as two and `_idsFor` qualified BOTH by address.
+
+REPRODUCED live 2026-09-20 by moving hqplayerd from Wi-Fi to Ethernet with the
+daemon running:
+
+    22:13:10.56  discovery: found 'HQPlayerEmbedded' at 192.168.1.238
+    22:13:10.56  2 instances answer to 'HQPlayerEmbedded'
+                 (192.168.1.109, 192.168.1.238) - identifying them by address instead
+    22:13:12.45  HQPlayerEmbedded: no longer answering, removing player
+
+The plain-id player was torn down and replaced by two address-qualified ones -
+`_idFor('HQPlayerEmbedded@192.168.1.238')` and `...@192.168.1.109` - verified
+against the arithmetic. The user's settings went with the plain id.
+
+**The fix is `_liveOf`:** the count that decides "duplicated" is of instances
+STILL ANSWERING, judged relative to the newest reply in the group rather than
+against a fixed age (discovery's period is 10s, 60s or 10 MINUTES depending on
+state, so any fixed threshold buries a healthy instance). One live address takes
+the plain name-derived id and the corpses get none. A PARTIAL list defers the
+whole group, because mid-round the instances that have not answered yet still
+carry the previous round's `lastSeen` and would all read as stale. No timing at
+all means everything counts as live, which is what the fixtures build.
+
+Pinned by six assertions in `t_plugin.pl` under "identity: stale addresses",
+including two controls: two instances BOTH answering are still two players, and
+a lone instance gone quiet keeps its id so `INSTANCE_TTL`'s grace is untouched.
+
+**AN ESTABLISHED PAIR IS NOT A DHCP MOVE - the 1.0.8 gate alone was WRONG.**
+Found in review 2026-09-21. `lastSeen` cannot tell "the same daemon at an
+address it has left" from "a SECOND daemon that is briefly quiet", and
+hqplayerd restarts on any configuration change. With two real same-named
+instances, one missing a single ~12s round made the gate collapse the group:
+the instance that did NOT restart was re-keyed onto the plain id mid-playback,
+BOTH address-qualified players were torn down, and the next round flipped it
+back. The six assertions above missed it because their "TTL grace" control
+covered a lone instance, never a pair.
+
+The separating signal is what is already RUNNING: a DHCP move leaves the
+PLAIN-id player in place, an established pair already holds ADDRESS-QUALIFIED
+ones. `_onInstances` now hands `_idsFor` the registry (`\%bridges`), and the
+collapse fires only when `_isSplit` finds no member holding a qualified player.
+A pair keeps 1.0.7's behaviour exactly.
+
+**How it was verified before it went into the code** (sandbox copies, the repo
+untouched until the result was in):
+
+* **16 multi-round scenarios through the REAL `_onInstances`**, with
+  `_create`/`_teardown` stubbed only to record events, and discovery emulated
+  faithfully - new addresses announced as PARTIAL lists first while the others
+  still carry last round's `lastSeen`, then refreshed, expired at
+  `INSTANCE_TTL`, and reconciled as a complete round, at the measured 11.9s
+  spacing. Run against 1.0.7, 1.0.8 and the candidate. The candidate passed all
+  16 and was **event-for-event identical to shipped 1.0.7 in 13**. The three
+  that differ are the two the fix exists for - a DHCP move, and two moves inside
+  one TTL, where four spurious players and zero reconnects become one clean
+  reconnect on the plain id - and the residual below.
+* **Mutation-tested.** Eight new assertions, half of them driving
+  `_onInstances` itself. Each fails against a build broken the way it guards:
+  1.0.8 fails all four pair tests; the candidate with the `\%bridges` argument
+  deleted passes the `_idsFor` unit tests but FAILS the reconciliation ones -
+  which is why they exist, since a test handing `_idsFor` the map directly
+  cannot see the wiring; a candidate that never collapses fails all seven
+  DHCP-move tests.
+* Suite 813 passed, 0 failed, sweep clean.
+
+**a quiet pair member and a dead address are the same row - DECLINED.** The
+review also noted that when two addresses still answer, a THIRD, dead one in the
+group keeps an address-qualified player until it expires (e.g. one of a pair
+DHCP-moves). True, and unchanged from 1.0.7, which loops `@$group` exactly as
+now. It is `INSTANCE_TTL`'s designed grace. The suggested `@$live` loop would
+also strip that grace from a quiet member of a real pair - indistinguishable by
+`lastSeen` from a dead address - which is the bug above in another form.
+
+**S9 - the one-round residual, ACCEPTED.** If LMS has only ever seen one
+instance and a brand-new second one with the same name appears for the FIRST
+time during the round the first is quiet, there is no qualified player yet, so
+it reads as a DHCP move: the first player - its prefs, its playlist - is pointed
+at the newcomer for one round (~12s), then both split correctly. 1.0.7 avoids
+this only because it never collapses, which is exactly why it fails the DHCP
+move; any rule that fixes the move has this edge. Worst case CHECKED IN CODE:
+link-up sends only `GetInfo`, `GetTransport`, `VolumeRange`, `Status` and the
+`SetRepeat value="0"` asserted on every daemon; nothing pushes LMS's volume to
+HQPlayer; and the teardown `<Stop/>` cannot escape, because `_teardown` closes
+the control first, `close` sets `closing`, `connect` refuses once it is set, and
+`_pump` needs a live socket. The only effect is LMS-side - during that round the
+first player follows the newcomer's status, so it may pick up its volume.
+
+#### the fingerprint is not a machine identity - DISPROVEN, DO NOT RE-PROPOSE
+
+`<GetLicense/>` carries a 128-bit `fingerprint`, and it is tempting as a key
+that survives a rename. It is **interface-derived**:
+
+    Wi-Fi    192.168.1.109   M30kG1/2sPVkASFB4Uz2CA==   valid="0"
+    Ethernet 192.168.1.238   t2WNlXhmzLc39n82qJFG7Q==   valid="1"
+
+Deterministic per interface, not per daemon start - the Ethernet value was
+identical across an hqplayerd restart. So keying a player on it would re-key on
+every interface change, which is worse than the bug it was meant to fix. The
+earlier entry's "stable across a restart" was true only because both readings
+were taken on the same interface.
+
+The reasoning that killed it is also worth keeping: "the licence keeps working
+across a wired/wireless switch, so it cannot be MAC-based" is FALSE. It does not
+keep working - it reports `valid="0"` on Wi-Fi and HQPlayer runs unlicensed. You
+do not notice because **playback continues normally at `valid="0"`** (measured:
+a Qobuz tier 5 stream, a pre-queued local tier 1 file, and four skip tests, all
+unlicensed). That also retires `valid="0"` as the "obvious suspect" for the
+`<PlaylistAdd result="Error">std::exception</PlaylistAdd>` failures logged
+earlier that day; those were the Mac dropping the network in low-power mode on
+Wi-Fi, Simon's call, and the same trigger already closed on 2026-09-06.
+
+`GetLicense` stays OUT of `Control.pm`'s `%KNOWN` - nothing in the plugin sends
+it, and after this there is no reason to.
+
+#### hqplayerd answers multicast ONCE but unicast on EVERY address
+
+Measured with both interfaces up: the multicast probe was answered only from
+`192.168.1.238`, three probes, three replies, never from `.109`. A **unicast**
+probe to each address was answered by BOTH, with the same name.
+
+That matters because `_probe` unicasts to every address already in `%found`. So
+a remembered address keeps refreshing its own `lastSeen` for as long as its
+interface is up and **never ages out** - a multi-interface split is PERMANENT,
+not transient. The earlier belief that `INSTANCE_TTL` would heal it in fifteen
+minutes is wrong; the rig only recovered because LMS was restarted while the
+daemon happened to be wedged.
+
+**Running HQPlayer with more than one interface active is DECLINED as scope**
+(Simon's call 2026-09-20): the vendor documents single-interface operation. The
+`_liveOf` gate deliberately does NOT collapse two addresses that are both
+answering, and that is correct for the supported configuration - a DHCP move
+leaves a corpse, which it does collapse.
+
+#### GetInfo `name` is not a second key
+
+`<GetInfo/>` answers `name`, `product`, `version`, `platform` and `engine`, and
+its `name` is the SAME string discovery reports - `ManCave` after the rename,
+`HQPlayerEmbedded` before it. It buys nothing over what `_idsFor` already has.
+(`probe_identity.py`'s first version compared `name` against `product` instead
+of against the DISCOVERY name and would have reported a useless key as a cheap
+one; corrected the same day, with the reason in the code.)
 
 ## Testing without LMS
 
@@ -4922,6 +5081,41 @@ disc with a broken-image glyph, and `Plugin::_extid` gained Material's
 `includes` substring tier for a plain `https://` stream favourite (e.g.
 Radio Paradise, Bandcamp) that no URL prefix matches. No cache-key prefixes
 exist in this plugin to clear.
+
+## 1.0.9 (2026-09-21): the DHCP-move fix, without breaking pairs
+
+DEV BUILD. Built, NOT committed and NOT pushed - and not installed on the rig, so
+nothing in it is verified live. 1.0.8's `_liveOf` gate plus the `_isSplit` pair
+guard: the collapse onto the plain id now fires only when no member of the name
+group already holds an address-qualified player, so an established pair whose
+member misses a round keeps 1.0.7's behaviour exactly. `_onInstances` passes the
+registry to `_idsFor`. The comment in `_onInstances` that claimed a corpse is
+always dropped now states the real condition. Eight assertions added (813 total),
+mutation-tested. Verified in sandbox before it went into the code - see
+`AN ESTABLISHED PAIR IS NOT A DHCP MOVE`. Live check still owed: move the host
+between addresses and expect `address changed ... reconnecting` and ONE player
+keeping its id.
+
+## 1.0.8 (2026-09-20): the DHCP-move player split - SUPERSEDED BY 1.0.9, DO NOT INSTALL
+
+**1.0.8 breaks two real same-named instances** - see `AN ESTABLISHED PAIR IS NOT
+A DHCP MOVE`. It was built but never committed, pushed or installed; the zip in
+the tree was replaced by 1.0.9. Kept for the record of what it did.
+
+DEV BUILD. Ships the `_liveOf` fix described above under
+"A CORPSE IS NOT AN INSTANCE (the DHCP-move split) - FIXED": `_idsFor` was
+counting rows in the discovery table rather than instances still ANSWERING, so
+a remembered address left behind by a DHCP move read as a second instance
+under the same name - both got address-qualified ids, and the plain
+name-derived player, carrying the user's settings, was torn down. `_liveOf`
+judges freshness relative to the newest reply in the group rather than a fixed
+age (discovery's own period runs 10s to 10 minutes, so no fixed threshold
+works); one live address keeps the plain id, corpses get none, and a PARTIAL
+mid-round list defers the whole group rather than acting on stale `lastSeen`
+values. Six regression assertions added to `tools/t_plugin.pl` under "identity:
+stale addresses", including two controls (two instances both answering are
+still two players; a lone instance gone quiet keeps its id, so `INSTANCE_TTL`'s
+grace is untouched). No cache-key prefixes exist in this plugin to clear.
 
 ## BBC Sounds ("iPlayer") choppy playback - what is established
 

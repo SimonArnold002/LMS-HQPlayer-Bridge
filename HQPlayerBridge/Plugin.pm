@@ -30,9 +30,12 @@ use Digest::MD5 qw(md5_hex);
 # "usage: (port,iaddr) = sockaddr_in(sin_sv)".
 use Socket qw(pack_sockaddr_in INADDR_LOOPBACK);
 
+use JSON::PP ();
+
 use Slim::Utils::Log;
 use Slim::Utils::PluginManager;
 use Slim::Control::Request;
+use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Player::Source;
 
 use Plugins::HQPlayerBridge::Live;
@@ -68,6 +71,10 @@ my $log = Slim::Utils::Log->addLogCategory({
 
 # id => { instance => {...}, control => $ctl, client => $client }
 my %bridges;
+
+# ip => 1 once that host's restart helper answered; never shrinks in a run.
+# See _probeRestart.
+my %restartable;
 
 sub getDisplayName { 'PLUGIN_HQPLAYER_BRIDGE' }
 
@@ -241,6 +248,18 @@ sub topLevel {
 
         push @items, { name => $b->{name}, type => 'text' };
 
+        # THE ONE ACTION IN AN INSTANCE'S BLOCK, so it goes at the TOP of it -
+        # and only for a host whose restart helper has answered (_probeRestart).
+        # That set only ever GROWS within a server run: an item_id is a row
+        # POSITION re-resolved against a rebuilt feed, so a row that could
+        # vanish between render and tap would send the tap to its neighbour.
+        push @items, {
+            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART' ),
+            type        => 'link',
+            url         => \&_restartConfirm,
+            passthrough => [ { id => $id } ],
+        } if $restartable{ ( $b->{instance} || {} )->{ip} // '' };
+
         my $p = signalPathFor( $client, $b );
 
         # Every row is `text`: these are facts to read. A non-playable item
@@ -280,6 +299,107 @@ sub topLevel {
     }
 
     $callback->( { items => \@items } );
+
+    return;
+}
+
+# ---------------------------------------------------------------------------
+# RESTARTING HQPLAYER, through the hqrestart helper (tools/hqrestart/).
+#
+# WHY: a power-cycled NAA endpoint is often not used again until hqplayerd
+# restarts, and nothing on HQPlayer's side can do that remotely. The control
+# API has no restart verb, `:8088/restart` is a no-op (measured 2026-09-21),
+# and the web UI's Refresh devices drops the saved SDM mode to PCM - a restart
+# reloads it. So a small webhook runs on the HQPlayer host and does it.
+#
+# NO CONFIGURATION, which is still true of this plugin: the helper listens on
+# a fixed port of the host discovery already found, `/ping` needs no token, and
+# the restart is authorised on the helper's side by this server's address
+# (its `allow` list). No helper answering means no row - the ordinary case.
+#
+# MANUAL ONLY. The bridge never restarts HQPlayer by itself - auto-recovery of
+# the NAA was DECLINED 2026-09-21 ("This is for Eversolo to fix").
+# ---------------------------------------------------------------------------
+use constant RESTART_PORT => 8090;
+
+sub restartable { return \%restartable }
+
+sub _restartUrl { return 'http://' . $_[0] . ':' . RESTART_PORT . $_[1] }
+
+sub _decode {
+    my $body = shift;
+    my $r = eval { JSON::PP::decode_json( $body // '' ) };
+    return ref $r eq 'HASH' ? $r : {};
+}
+
+# Once per link-up; a host already known is not asked again.
+sub _probeRestart {
+    my $ip = shift or return;
+    return if $restartable{$ip};
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $r = _decode( eval { $_[0]->content } );
+            return unless ( $r->{service} // '' ) eq 'hqrestart';
+
+            $restartable{$ip} = 1;
+            main::INFOLOG && $log->is_info && $log->info("restart helper found on $ip");
+        },
+        sub { },    # nothing listening: no helper installed, the normal case
+        { timeout => 3 },
+    )->get( _restartUrl( $ip, '/ping' ) );
+
+    return;
+}
+
+# The first tap only asks: a restart stops playback, and a browse row is easy
+# to hit by accident.
+sub _restartConfirm {
+    my ( $client, $callback, $args, $pt ) = @_;
+
+    $callback->( { items => [
+        {
+            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_NOW' ),
+            type        => 'link',
+            url         => \&_restartNow,
+            passthrough => [ $pt ],
+        },
+        { name => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_DESC' ), type => 'text' },
+    ] } );
+
+    return;
+}
+
+# Answers when HQPlayer is back (the helper waits for the new process, ~7s on
+# a Mac), so the page that opens is the outcome. The control link drops and
+# comes back on its own backoff - nothing here touches it.
+sub _restartNow {
+    my ( $client, $callback, $args, $pt ) = @_;
+
+    my $say = sub { $callback->( { items => [ { name => shift, type => 'text' } ] } ) };
+
+    my $b  = $bridges{ ( $pt || {} )->{id} // '' };
+    my $ip = $b && ( $b->{instance} || {} )->{ip};
+    return $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_GONE' ) ) unless $ip;
+
+    main::INFOLOG && $log->is_info && $log->info("asking the helper on $ip to restart HQPlayer");
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $r = _decode( eval { $_[0]->content } );
+            return $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_OK', $r->{seconds} // '?' ) )
+                if $r->{ok};
+            $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_FAIL', $r->{error} // '?' ) );
+        },
+        sub {
+            # A 401 / 409 / 500 lands HERE, with the helper's reason in the body.
+            my ( undef, $error, $res ) = @_;
+            my $r = _decode( eval { $res->content } );
+            $log->warn( "restart on $ip failed: " . ( $r->{error} || $error || '?' ) );
+            $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_FAIL', $r->{error} || $error || '?' ) );
+        },
+        { timeout => 90 },
+    )->get( _restartUrl( $ip, '/restart' ) );
 
     return;
 }
@@ -663,11 +783,24 @@ sub _onInstances {
 
     my %seen;
 
-    my $ids = _idsFor($instances);
+    my $ids = _idsFor( $instances, $partial, \%bridges );
 
     for my $inst (@$instances) {
-        my $id   = $ids->{ $inst->{ip} }->{id};
-        my $name = $ids->{ $inst->{ip} }->{name};
+        # NO ENTRY MEANS DELIBERATELY NOT ACTED ON, and it is not an error.
+        # _idsFor drops an address that has stopped answering when EXACTLY ONE
+        # address still answers to the same name and that name is not already
+        # split into address-qualified players (it is then the same daemon,
+        # seen at the address a DHCP move left), and it defers a whole name
+        # group on a PARTIAL list
+        # because freshness cannot be judged until the round is complete.
+        # Either way the address gets no player this round; a deferred group is
+        # resolved by the complete round ~LISTEN_TIME later, and a dropped
+        # corpse is torn down by the removal pass below because nothing marks
+        # its id seen.
+        my $entry = $ids->{ $inst->{ip} } or next;
+
+        my $id   = $entry->{id};
+        my $name = $entry->{name};
 
         $seen{$id} = 1;
 
@@ -738,6 +871,53 @@ sub _nameFor {
     return $name;
 }
 
+# How far apart two replies may be and still count as the same round.  Covers
+# the probe burst plus LISTEN_TIME in Discovery.pm, with room to spare.
+use constant ADDR_SLACK => 10;
+
+# Which members of a name group are STILL ANSWERING.
+#
+# Freshness is judged RELATIVE to the newest reply in the group, never against
+# a fixed age.  Discovery's period is 10s, 60s or 10 MINUTES depending on what
+# it already knows (see _schedule in Discovery.pm), so a perfectly healthy
+# instance can carry a lastSeen ten minutes old and any fixed threshold would
+# bury it.  Everything that answered alongside the newest reply is live;
+# anything materially older is an address the daemon has left.
+#
+# NO TIMING AT ALL means every member counts as live.  That is the case the
+# suite's fixtures build, and it is the conservative answer: it keeps two
+# genuinely separate instances apart rather than silently merging them.
+sub _liveOf {
+    my $group = shift;
+
+    my ($newest) = sort { $b <=> $a }
+                   grep { defined }
+                   map  { $_->{lastSeen} } @$group;
+
+    return [@$group] unless defined $newest;
+
+    my @live = grep { !defined $_->{lastSeen}
+                      || $_->{lastSeen} >= $newest - ADDR_SLACK } @$group;
+
+    # Belt and braces: never hand back an empty group.
+    return @live ? \@live : [@$group];
+}
+
+# True when any member of a name group already holds an ADDRESS-QUALIFIED
+# player - i.e. the name is an established pair, not one daemon that has moved.
+# No $existing (the suite's direct calls) means nothing is running yet.
+sub _isSplit {
+    my ( $name, $group, $existing ) = @_;
+
+    return 0 unless $existing;
+
+    for my $inst (@$group) {
+        return 1 if exists $existing->{ _idFor( $name . '@' . $inst->{ip} ) };
+    }
+
+    return 0;
+}
+
 # Player id for every discovered instance, keyed by ip.
 #
 # The id is derived from the instance NAME rather than its address, so that a
@@ -756,8 +936,42 @@ sub _nameFor {
 # own, and those instances are told apart by address.  A name only one instance
 # answers to - the ordinary case, and the only one where the prefs actually
 # matter - keeps the plain name-derived id and its DHCP immunity.
+#
+# LIVE IS THE WHOLE WORD, AND IT USED TO GO UNENFORCED.  REPRODUCED on the rig
+# 2026-09-20: the Mac running hqplayerd was moved from Wi-Fi (.109) onto
+# Ethernet (.238) with the daemon left running.  hqplayerd answers the
+# multicast probe from ONE address only - whichever the routing table picks -
+# so .238 arrived while .109 was still sitting in %found inside INSTANCE_TTL,
+# and one live address plus one corpse counted as two instances:
+#
+#   discovery: found 'HQPlayerEmbedded' at 192.168.1.238
+#   2 instances answer to 'HQPlayerEmbedded' (192.168.1.109, 192.168.1.238)
+#     - identifying them by address instead
+#   HQPlayerEmbedded: no longer answering, removing player
+#
+# The plain-id player was torn down and replaced by TWO address-qualified ones,
+# taking the user's settings with it - they live under the id.  So the count
+# that decides this is of instances STILL ANSWERING, never of rows in the table.
+#
+# THE CASE THIS FIXES IS A DHCP MOVE, which is the one `_idFor`'s comment above
+# already promises immunity from: the lease moves, nothing is left at the old
+# address, the corpse stops answering and the group collapses back to one.
+#
+# IT DELIBERATELY DOES NOT MERGE TWO ADDRESSES THAT ARE BOTH ANSWERING, and an
+# interface move is exactly that once the daemon is healthy.  MEASURED the same
+# day: hqplayerd answers the MULTICAST probe from one address only, but answers
+# a UNICAST probe on EVERY address it holds - and `_probe` unicasts to every
+# address already in %found.  So a remembered address refreshes its own
+# lastSeen for as long as its interface is up and never ages out; that split is
+# PERMANENT, not a fifteen-minute window.  Running HQPlayer on more than one
+# active interface is DECLINED as scope (Simon, 2026-09-20; the vendor
+# documents single-interface operation), so collapsing it is not this gate's
+# job - and merging on the name alone would take two REAL instances with it.
+# See CLAUDE.md, `more than one interface active is DECLINED`.
 sub _idsFor {
-    my $instances = shift || [];
+    my ( $instances, $partial, $existing ) = @_;
+
+    $instances ||= [];
 
     my %byName;
 
@@ -776,6 +990,47 @@ sub _idsFor {
                 id   => _idFor($name),
                 name => _nameFor( $inst, 0 ),
             };
+            next;
+        }
+
+        # A PARTIAL list is mid-round: the instances that have not answered
+        # YET still carry the previous round's lastSeen, so every one of them
+        # would read as stale and a genuinely second instance would be demoted
+        # to a corpse.  Defer the whole group - the complete round decides it
+        # ~LISTEN_TIME later, and until then nothing is touched.
+        next if $partial;
+
+        my $live = _liveOf($group);
+
+        # One address still answering, the rest are the same daemon at
+        # addresses it has left.  Keep the plain name-derived id - that is what
+        # the player's prefs, playlist and sync group hang off - and leave the
+        # corpses without one.
+        #
+        # BUT ONLY WHEN THE NAME IS NOT ALREADY AN ESTABLISHED PAIR.  lastSeen
+        # cannot tell "the same daemon at an address it has left" from "a
+        # SECOND daemon that is briefly quiet" - hqplayerd restarts on any
+        # configuration change and misses a round or more while it does.
+        # Collapsing that re-keyed the instance that did NOT restart onto the
+        # plain id mid-playback, tore down BOTH address-qualified players, and
+        # flipped it back on the next round (found in review 2026-09-21).
+        # What separates the two cases is what is already running: a DHCP move
+        # leaves the PLAIN-id player in place, an established pair already
+        # holds ADDRESS-QUALIFIED ones.  A pair keeps today's behaviour, and
+        # its quiet member sits out INSTANCE_TTL's grace untouched.
+        if ( @$live == 1 && !_isSplit( $name, $group, $existing ) ) {
+            my $inst = $live->[0];
+
+            main::INFOLOG && $log->is_info && $log->info(
+                "'$name' is in the discovery table at "
+              . join( ', ', map { $_->{ip} } @$group )
+              . " but only $inst->{ip} is still answering - keeping the plain id" );
+
+            $id{ $inst->{ip} } = {
+                id   => _idFor($name),
+                name => _nameFor( $inst, 0 ),
+            };
+
             next;
         }
 
@@ -894,6 +1149,8 @@ sub _onLinkState {
         # closing the socket, and discovery reads that link state to decide how
         # hard to keep probing - see _statusWatchdog in Player.pm.
         $client->_startPolling;
+
+        _probeRestart( ( $b->{instance} || {} )->{ip} );
     }
     else {
         $client->_stopPolling;

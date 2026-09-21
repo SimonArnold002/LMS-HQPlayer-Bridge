@@ -59,6 +59,151 @@ is($named->{'10.0.0.5'}->{id}, $solo->{'10.0.0.5'}->{id},
 is($named->{'10.0.0.7'}->{name}, 'HQPlayer (Study)', 'and is named after itself');
 
 # ---------------------------------------------------------------------------
+# A CORPSE IS NOT AN INSTANCE.
+#
+# REPRODUCED on the rig 2026-09-20: hqplayerd moved from Wi-Fi to Ethernet with
+# the daemon running.  It answers the multicast probe from ONE address only, so
+# the new address arrived while the old one was still in %found inside
+# INSTANCE_TTL - and one live address plus one corpse was counted as two
+# instances.  The plain-id player was torn down for two address-qualified ones,
+# taking the player's settings with it.
+#
+# These call _idsFor directly and assert its ANSWER, because that is the layer
+# the fix lives at: a test driven through discovery would pass against a build
+# where the gate does nothing.
+# ---------------------------------------------------------------------------
+print "-- identity: stale addresses --\n";
+
+my $now = time();
+
+my $ghosted = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now },
+]);
+
+is($ghosted->{'10.0.0.7'}->{id}, $solo->{'10.0.0.5'}->{id},
+   'the address still answering keeps the PLAIN id - the settings move with it');
+ok(!exists $ghosted->{'10.0.0.5'},
+   'and the address that stopped answering is given no player at all');
+ok(($ghosted->{'10.0.0.7'}->{name} || '') !~ /10\.0\.0\./,
+   'the surviving player is not renamed with an address');
+
+# CONTROL: the gate must not merge two instances that are both answering -
+# that is the case the address-qualifying branch exists for.
+my $both = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now - 1 },
+]);
+
+ok($both->{'10.0.0.5'}->{id} ne $both->{'10.0.0.7'}->{id},
+   'two instances BOTH answering are still two players');
+
+# CONTROL: INSTANCE_TTL's grace is untouched.  A lone instance that has gone
+# quiet - a daemon restart - keeps its id, and its player is held rather than
+# rebuilt.
+my $blip = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
+]);
+
+is($blip->{'10.0.0.5'}->{id}, $solo->{'10.0.0.5'}->{id},
+   'a lone instance gone quiet keeps its id - the TTL grace still holds it');
+
+# A PARTIAL list is mid-round, so the instances that have not answered yet
+# still carry the previous round's lastSeen and would all read as stale.
+my $mid = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now },
+], 1);
+
+ok(!keys %$mid,
+   'a PARTIAL list defers the whole group rather than judging it mid-round');
+
+# ---------------------------------------------------------------------------
+# AN ESTABLISHED PAIR IS NOT A DHCP MOVE.
+#
+# Found in review 2026-09-21: lastSeen cannot tell "the same daemon at an
+# address it has left" from "a SECOND daemon that is briefly quiet", and
+# hqplayerd restarts on any configuration change.  Collapsing a pair re-keyed
+# the instance that did NOT restart onto the plain id mid-playback, tore down
+# BOTH address-qualified players, and flipped it back a round later.  What
+# separates the cases is what is already running, so _idsFor is handed the
+# existing players - and _onInstances must hand them over, which is why the
+# second half of this drives the real reconciliation and not just _idsFor.
+# ---------------------------------------------------------------------------
+print "-- identity: an established pair --\n";
+
+my $idFor = \&Plugins::HQPlayerBridge::Plugin::_idFor;
+my $PN    = 'HQPlayerEmbedded';
+my ( $q5, $q7, $pl ) = ( $idFor->("$PN\@10.0.0.5"), $idFor->("$PN\@10.0.0.7"), $idFor->($PN) );
+
+my $pairQuiet = $ids->([
+    { ip => '10.0.0.5', name => $PN, lastSeen => $now },
+    { ip => '10.0.0.7', name => $PN, lastSeen => $now - 12 },
+], undef, { $q5 => 1, $q7 => 1 });
+
+is($pairQuiet->{'10.0.0.5'}->{id}, $q5,
+   'an established pair keeps its address-qualified id when one member misses a round');
+is($pairQuiet->{'10.0.0.7'}->{id}, $q7,
+   'and the quiet member keeps its player - INSTANCE_TTL grace holds for a PAIR too');
+
+# CONTROL: with only the PLAIN player running it is a DHCP move, and the fix for
+# that must still fire - otherwise "never collapse" would pass the two above.
+my $moveUp = $ids->([
+    { ip => '10.0.0.5', name => $PN, lastSeen => $now - 900 },
+    { ip => '10.0.0.9', name => $PN, lastSeen => $now },
+], undef, { $pl => 1 });
+
+is($moveUp->{'10.0.0.9'}->{id}, $pl,
+   'with only the plain player running, the live address still takes the plain id');
+ok(!exists $moveUp->{'10.0.0.5'},
+   'and the address a DHCP move left behind still gets no player');
+
+# THROUGH THE REAL RECONCILIATION.  _create and _teardown are replaced only to
+# record what would have happened; the registry and _onInstances are real.
+{
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    my @ev;
+    no warnings 'redefine';
+    local *Plugins::HQPlayerBridge::Plugin::_create = sub {
+        my ( $id, $inst, $name ) = @_;
+        $reg->{$id} = { instance => $inst, name => $name };
+        push @ev, "create $id";
+    };
+    local *Plugins::HQPlayerBridge::Plugin::_teardown = sub {
+        my $id = shift;
+        delete $reg->{$id} or return;
+        push @ev, "teardown $id";
+    };
+    my $on = \&Plugins::HQPlayerBridge::Plugin::_onInstances;
+
+    %$reg = ();
+    my $t = $now;
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t },
+            { ip => '10.0.0.7', name => $PN, lastSeen => $t } ]);
+    @ev = ();
+    $t += 11.9;                                  # .7 restarting: misses one round
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t },
+            { ip => '10.0.0.7', name => $PN, lastSeen => $t - 11.9 } ]);
+    is(join(', ', @ev) || 'nothing', 'nothing',
+       'a pair member missing ONE round creates and tears down nothing');
+    is(join(', ', sort keys %$reg), join(', ', sort ($q5, $q7)),
+       'and both address-qualified players are still there');
+
+    %$reg = ();
+    $t = $now;
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t } ]);
+    @ev = ();
+    $t += 11.9;                                  # DHCP move: .5 left for .9
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t - 11.9 },
+            { ip => '10.0.0.9', name => $PN, lastSeen => $t } ]);
+    is(join(', ', @ev), "teardown $pl, create $pl",
+       'a DHCP move is ONE reconnect of the same plain-id player, nothing else');
+    is($reg->{$pl} && $reg->{$pl}->{instance}->{ip}, '10.0.0.9',
+       'and that player now follows the new address');
+    %$reg = ();
+}
+
+# ---------------------------------------------------------------------------
 # Version.  It used to be a hand-maintained constant, which sat at 0.2.3 while
 # install.xml and repo.xml were at 0.2.7 - so the startup log and the settings
 # page both named a build that had not been running for months.
@@ -480,6 +625,100 @@ print "-- and no Material means no tile, not a crash --\n";
     my $ok = eval { Plugins::HQPlayerBridge::Plugin::postinitPlugin(); 1 };
     ok($ok, 'postinitPlugin survives Material being absent');
     is(scalar(@reg), '0', 'and registers nothing');
+}
+
+
+# RESTARTING HQPLAYER through the hqrestart helper (tools/hqrestart/). No
+# settings: the bridge pings a fixed port on the host discovery already found,
+# and a restart row appears only once that answers as the helper.
+print "-- the restart row --\n";
+{
+    package FakeRes; sub new { bless { c => $_[1] }, $_[0] } sub content { $_[0]->{c} }
+}
+{
+    my $P   = 'Plugins::HQPlayerBridge::Plugin';
+    my $rs  = Plugins::HQPlayerBridge::Plugin::restartable();
+    my $REQ = \@Slim::Networking::SimpleAsyncHTTP::REQ;
+    %$rs = ();
+
+    Slim::Networking::SimpleAsyncHTTP::_reset();
+    Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.5');
+    is(scalar(@$REQ), '1', 'a link-up probes the host once');
+    is($REQ->[0]{url}, 'http://10.0.0.5:8090/ping', 'on the fixed port, at /ping (which needs no token)');
+
+    # CONTROL: something else answering on 8090 is not the helper.
+    $REQ->[0]{cb}->( FakeRes->new('<html>not it</html>') );
+    is($rs->{'10.0.0.5'} ? 1 : 0, 0, 'a stranger answering on 8090 does NOT make the host restartable');
+    $REQ->[0]{ecb}->( undef, 'Connect timed out' );
+    is($rs->{'10.0.0.5'} ? 1 : 0, 0, 'and nothing listening leaves it so, silently');
+
+    $REQ->[0]{cb}->( FakeRes->new('{"ok": true, "service": "hqrestart"}') );
+    is($rs->{'10.0.0.5'} ? 1 : 0, 1, 'the helper answering makes it restartable');
+
+    Slim::Networking::SimpleAsyncHTTP::_reset();
+    Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.5');
+    is(scalar(@$REQ), '0', 'a host already known is not probed again');
+
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    $src =~ s/^\s*#.*$//mg;
+    my ($ls) = $src =~ /sub _onLinkState \{(.*?)\n\}/s;
+    ok(scalar( defined $ls && $ls =~ /if \(\$up\) \{[^}]*_probeRestart/s ),
+       'the probe runs on link UP');
+    ok(scalar( $src !~ /delete \$restartable/ ),
+       'and nothing ever REMOVES a host - a row that vanished would shift the positional item_ids under a tap');
+
+    # THE ROW: at the top of its instance's block, right after the name.
+    %$reg = ( 'aa' => {
+        name => 'HQPlayer (Test)', control => FeedCtl->new,
+        instance => { ip => '10.0.0.5' }, client => FeedClient->new({ active_mode => 'PCM' }),
+    } );
+    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+    my @r = @{ $feed->{items} };
+    is($r[1]{name}, 'HQPlayer (Test)', 'the instance name row');
+    is($r[2]{name}, 'PLUGIN_HQPLAYER_RESTART', 'then Restart HQPlayer, at the TOP of the block it acts on');
+    is($r[2]{type}, 'link', 'as a link');
+    is($r[2]{passthrough}[0]{id}, 'aa', 'carrying the bridge id, not an address that can move');
+    ok(scalar( !exists $r[2]{nextWindow} ), 'with no nextWindow - it opens a page, it is not the banned Refresh row');
+    is(scalar( grep { ($_->{type} // '') ne 'text' } @r[3 .. $#r] ), '0',
+       'and every row after it is still text');
+
+    # CONTROL: an unknown host gets no row.
+    $reg->{aa}{instance}{ip} = '10.0.0.6';
+    Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+    is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_RESTART' } @{ $feed->{items} } ), '0',
+       'a host whose helper never answered has NO restart row');
+    $reg->{aa}{instance}{ip} = '10.0.0.5';
+
+    # THE FIRST TAP ONLY ASKS.
+    Slim::Networking::SimpleAsyncHTTP::_reset();
+    my $page;
+    Plugins::HQPlayerBridge::Plugin::_restartConfirm( undef, sub { $page = shift }, {}, { id => 'aa' } );
+    is(scalar(@$REQ), '0', 'the first tap restarts NOTHING - it only asks');
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_NOW', 'it offers Restart now');
+    is($page->{items}[0]{passthrough}[0]{id}, 'aa', 'for the same bridge');
+
+    # THE SECOND DOES IT, and the page that opens is the outcome.
+    Plugins::HQPlayerBridge::Plugin::_restartNow( undef, sub { $page = shift }, {}, { id => 'aa' } );
+    is($REQ->[0]{url}, 'http://10.0.0.5:8090/restart', 'Restart now calls the helper');
+    ok(scalar( $REQ->[0]{timeout} >= 60 ), 'with a timeout that outlasts the restart itself');
+    $page = undef;
+    $REQ->[0]{cb}->( FakeRes->new('{"ok": true, "old_pid": 1, "new_pid": 2, "seconds": 7.1}') );
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_OK', 'success says so');
+
+    # CONTROL: a refusal must not read as success.
+    $page = undef;
+    $REQ->[0]{ecb}->( undef, '401 Unauthorized', FakeRes->new('{"ok": false, "error": "bad or missing token"}') );
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_FAIL', 'a refusal (this server not in `allow`) says it FAILED');
+    $page = undef;
+    $REQ->[0]{cb}->( FakeRes->new('garbage') );
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_FAIL', 'and so does an answer that is not the helper\'s');
+
+    Slim::Networking::SimpleAsyncHTTP::_reset();
+    Plugins::HQPlayerBridge::Plugin::_restartNow( undef, sub { $page = shift }, {}, { id => 'gone' } );
+    is(scalar(@$REQ), '0', 'a bridge that has gone away is not called');
+    is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_GONE', 'and the page says why');
+
+    %$reg = (); %$rs = ();
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;
