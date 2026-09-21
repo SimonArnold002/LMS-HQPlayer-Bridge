@@ -40,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -229,12 +230,22 @@ def own_unit():
 
 
 def detect_linux(pid, cfg):
+    # Read apart: cmdline is world-readable, but the cwd link needs ptrace
+    # rights a setcap'd or other-user HQPlayer denies - losing it must not
+    # throw away the command line too.
     try:
         with open('/proc/%d/cmdline' % pid, 'rb') as f:
-            argv = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
+            argv = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a] or None
+    except OSError:
+        argv = None
+    try:
         cwd = os.readlink('/proc/%d/cwd' % pid)
     except OSError:
-        argv, cwd = None, None
+        cwd = None
+    try:
+        exe = os.readlink('/proc/%d/exe' % pid)      # same rights as cwd
+    except OSError:
+        exe = None
     env = {}
     try:
         with open('/proc/%d/environ' % pid, 'rb') as f:
@@ -267,7 +278,7 @@ def detect_linux(pid, cfg):
         if not unit:
             raise RuntimeError('mode is "service" but no systemd unit found; set "service" in the config')
         return {'mode': 'service', 'os': 'linux', 'target': unit, 'user': bool(user)}
-    return {'mode': 'app', 'os': 'linux', 'argv': argv, 'cwd': cwd, 'env': env}
+    return {'mode': 'app', 'os': 'linux', 'argv': argv, 'cwd': cwd, 'exe': exe, 'env': env}
 
 
 def detect_win32(pid, cfg):
@@ -313,19 +324,45 @@ def stop_app(pid, cfg, budget):
         time.sleep(1)
 
 
-def start_app(how, cfg):
+def start_argv(how, cfg):
+    """The command that starts HQPlayer again, or None when there is none that
+    would work. Decided BEFORE anything is stopped: a restart that cannot start
+    HQPlayer again must leave it running, not stop it and fail."""
     argv = cfg['start_command']
+    if argv:
+        argv = list(argv)
+    elif how['os'] == 'darwin':
+        if how.get('bundle') and os.path.isdir(how['bundle']):
+            argv = ['open', '-a', how['bundle']]
+        elif how.get('exe'):
+            argv = [how['exe']]
+    elif how['os'] == 'linux':
+        argv = list(how.get('argv') or [])
+        # started by a bare name from a PATH this helper does not share
+        if (argv and os.sep not in argv[0] and not shutil.which(argv[0])
+                and how.get('exe') and os.path.isfile(how['exe'])):
+            argv[0] = how['exe']
+    elif how['os'] == 'win32' and how.get('exe') and os.path.isfile(how['exe']):
+        argv = ['powershell', '-NoProfile', '-Command',
+                "Start-Process -FilePath '%s'" % how['exe'].replace("'", "''")]
     if not argv:
-        if how['os'] == 'darwin':
-            if how.get('bundle'):
-                argv = ['open', '-a', how['bundle']]
-            elif how.get('exe'):
-                argv = [how['exe']]
-        elif how['os'] == 'linux':
-            argv = how.get('argv')
-        elif how['os'] == 'win32' and how.get('exe'):
-            argv = ['powershell', '-NoProfile', '-Command',
-                    "Start-Process -FilePath '%s'" % how['exe'].replace("'", "''")]
+        return None
+    exe = argv[0]
+    if os.sep in exe or (os.altsep and os.altsep in exe):
+        if not os.path.isabs(exe):
+            # relative to HQPlayer's own directory - unusable if that is unknown
+            if not how.get('cwd'):
+                return None
+            exe = argv[0] = os.path.normpath(os.path.join(how['cwd'], exe))
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            return None
+    elif not shutil.which(exe):
+        return None
+    return argv
+
+
+def start_app(how, cfg):
+    argv = start_argv(how, cfg)
     if not argv:
         raise RuntimeError('do not know how to start HQPlayer; set "start_command" in the config')
     log('starting: %s' % ' '.join(argv))
@@ -392,6 +429,17 @@ def restart(cfg):
     old = find_pid(cfg.names())
     if old:
         how = detect(old, cfg)
+        if how['mode'] == 'app' and not start_argv(how, cfg):
+            # Never stop what we could not start again, and never save a recipe
+            # that cannot start it over one that could.
+            saved = cfg.load_state()
+            if (saved.get('mode') == 'app' and saved.get('os') == how['os']
+                    and start_argv(saved, cfg)):
+                log('cannot tell how pid %d was started; using the saved recipe' % old)
+                how = saved
+            else:
+                raise RuntimeError('HQPlayer (pid %d) was left running: cannot tell how to start it '
+                                   'again; set "start_command" in the config' % old)
         cfg.save_state(how)
     else:
         how = cfg.load_state()

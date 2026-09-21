@@ -30,8 +30,6 @@ use Digest::MD5 qw(md5_hex);
 # "usage: (port,iaddr) = sockaddr_in(sin_sv)".
 use Socket qw(pack_sockaddr_in INADDR_LOOPBACK);
 
-use JSON::PP ();
-
 use Slim::Utils::Log;
 use Slim::Utils::PluginManager;
 use Slim::Control::Request;
@@ -360,9 +358,13 @@ sub restartNames { return \%restartName }
 
 sub _restartUrl { return 'http://' . $_[0] . ':' . RESTART_PORT . $_[1] }
 
+# JSON::PP is loaded at CALL TIME, not with a top-level `use`: it is core Perl
+# but not shipped by LMS, and a BEGIN failure on a platform that lacks it would
+# take the WHOLE plugin down over the one optional row that reads a reply. A
+# miss here costs the Restart row and nothing else.
 sub _decode {
     my $body = shift;
-    my $r = eval { JSON::PP::decode_json( $body // '' ) };
+    my $r = eval { require JSON::PP; JSON::PP::decode_json( $body // '' ) };
     return ref $r eq 'HASH' ? $r : {};
 }
 

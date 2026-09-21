@@ -821,6 +821,13 @@ print "-- the restart row --\n";
     $REQ->[0]{cb}->( FakeRes->new('garbage') );
     is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_FAIL', 'and so does an answer that is not the helper\'s');
 
+    # The reply parser must not be a LOAD-TIME dependency: JSON::PP is core Perl
+    # but LMS does not ship it, and a `use` that died at BEGIN would take the
+    # whole plugin down over one optional row.
+    my $psrc = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    ok(scalar( $psrc !~ /^\s*use\s+JSON/m ), 'JSON is not loaded at BEGIN - a missing one must not kill the plugin');
+    ok(scalar( $psrc =~ /require\s+JSON::PP/ ), 'it is required at call time instead');
+
     Slim::Networking::SimpleAsyncHTTP::_reset();
     Plugins::HQPlayerBridge::Plugin::_restartNow( undef, sub { $page = shift }, {}, { id => 'gone' } );
     is(scalar(@$REQ), '0', 'a bridge that has gone away is not called');

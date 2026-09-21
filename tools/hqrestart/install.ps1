@@ -38,8 +38,6 @@ Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Settin
 Start-ScheduledTask -TaskName $task
 
 $port = 8090
-for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
-$token = (Get-Content $cfg -Raw | ConvertFrom-Json).token
 if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyContinue)) {
     # only once: a re-install must not stack duplicate rules
     New-NetFirewallRule -DisplayName 'hqrestart' -Direction Inbound -Protocol TCP -LocalPort $port `
@@ -52,7 +50,21 @@ if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyCont
                    "From an ADMIN PowerShell run:`n  New-NetFirewallRule -DisplayName hqrestart " +
                    "-Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Private")
 }
+# The token is written by the helper on its first start, so it is read LAST and
+# never fatally: with ErrorActionPreference 'Stop' a config that is not there yet
+# would otherwise abort the script, losing the firewall rule and every line below
+# and leaving a working install looking like a failed one.
+$token = $null
+for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
+try { $token = (Get-Content $cfg -Raw -ErrorAction Stop | ConvertFrom-Json).token } catch { }
+
 "installed. config: $cfg"
 "log:     $(Join-Path $dir 'hqrestart.log')"
-"token:   $token"
-"test:    curl -H `"Authorization: Bearer $token`" http://$($env:COMPUTERNAME):$port/status"
+if ($token) {
+    "token:   $token"
+    "test:    curl -H `"Authorization: Bearer $token`" http://$($env:COMPUTERNAME):$port/status"
+} else {
+    Write-Warning ("The helper has not written its config yet, so there is no token to show. " +
+                   "It is generated on first start - read it from $cfg, or check the log above. " +
+                   "Check Python 3.7+ is on PATH if the file never appears.")
+}

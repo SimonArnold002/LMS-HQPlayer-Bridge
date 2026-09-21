@@ -34,11 +34,28 @@ sudo ./install.sh --system    # macOS/Linux, HQPlayer is a system service
 
 The installer prints the token. It is stored in `hqrestart.json` next to the installed script.
 
+For the HQPlayer Bridge's Restart row to work, add the LMS server's IP address to `allow` in
+that file (e.g. `"allow": ["192.168.1.234"]`), then run the installer again. Reinstalling
+keeps the config.
+
+## Uninstall
+
+```
+./install.sh --uninstall                  # macOS/Linux, app
+sudo ./install.sh --system --uninstall    # macOS/Linux, system service
+.\install.ps1 -Uninstall                  # Windows, app
+.\install.ps1 -System -Uninstall          # Windows, service (admin PowerShell)
+```
+
+This stops the helper and removes it from startup. The config folder is left in place; delete
+it if you won't reinstall. On Windows, also remove the firewall rule from an admin PowerShell:
+`Remove-NetFirewallRule -DisplayName hqrestart`.
+
 ## From LMS (HQPlayer Bridge)
 
 The Bridge needs no settings. When its control link to an HQPlayer comes up, it calls
 `http://<that HQPlayer>:8090/ping`, which needs no token. If that answers, the HQPlayer gets a
-**Restart HQPlayer** row in the Bridge's Apps list. The restart itself only works if the LMS
+**Restart *name*** row in the Bridge's Apps list, under HQPlayer Live View. The restart itself only works if the LMS
 server's address is in `allow`: the Bridge has no token to send.
 
 **Why only a JSON POST gets in without the token.** Anything that can make the LMS
@@ -82,6 +99,15 @@ Every key is optional except `token`, which is generated on first run.
 | `respawn_wait` | `6` | macOS app: seconds to let macOS relaunch it first |
 | `start_timeout` | `30` | seconds for the new process to appear |
 | `total_timeout` | `90` | the whole restart, every wait included. The Bridge waits 120s, so keep this below that |
+
+## If it can't work out how to start HQPlayer
+
+For an app, the helper decides how it will start HQPlayer again *before* it stops it, and
+checks that the program is still there. If it can't tell (for example the app was deleted
+or moved since it was launched, or the helper isn't allowed to see where it runs from),
+it uses the last way it saw HQPlayer started, if that still works. Failing that, the
+restart fails with "HQPlayer (pid N) was left running" and HQPlayer keeps playing. To fix
+it for good, set `start_command`.
 
 ## Windows notes
 

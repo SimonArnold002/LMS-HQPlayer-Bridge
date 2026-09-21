@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause, seek, set its volume and see its artwork from Material or any control point, while HQPlayer does the upsampling, filtering and modulation exactly as it always has.</p>
   <div class="badges">
-    <span class="badge accent">v1.0.2</span>
+    <span class="badge accent">v1.0.13</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -144,6 +144,7 @@
 <div class="card"><h4>Pause from either end</h4><p>Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Stable player identity</h4><p>Prefs, playlist and sync group survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Live view</h4><p>A page of its own: what's playing, transport, volume and the signal path, updating every second in your Material theme</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Restart HQPlayer from LMS</h4><p>One tap in Apps restarts HQPlayer, with your saved settings, e.g. after power-cycling your NAA endpoint</p><span class="needs">Needs: The optional restart helper on the HQPlayer machine</span></div>
 </div>
 </section>
 <section id="requirements">
@@ -169,6 +170,65 @@
 sudo unzip HQPlayerBridge.zip -d /var/lib/squeezeboxserver/Plugins/
 sudo chown -R squeezeboxserver:nogroup /var/lib/squeezeboxserver/Plugins/HQPlayerBridge
 sudo systemctl restart lyrionmusicserver</code></pre>
+</section>
+<section id="restarting-hqplayer-from-lms-optional">
+<h2>Restarting HQPlayer from LMS (optional)</h2>
+<p><strong>What it's for.</strong> If you switch your NAA endpoint off and on again, HQPlayer often won't use it again until HQPlayer itself is restarted. Signalyst's advice is to start the NAA first, then HQPlayer. HQPlayer's <strong>Refresh devices</strong> button reconnects the endpoint but drops your saved output mode (SDM comes back as PCM). A restart reloads your saved settings. HQPlayer's control API has no restart command, so doing this from LMS needs a small helper on the HQPlayer machine.</p>
+<p><strong>What it is.</strong> <code>hqrestart</code> is one Python script (standard library only) in <a href="tools/hqrestart/"><code>tools/hqrestart/</code></a> of this repository. It is <strong>not part of the plugin</strong>, and playback works exactly the same without it. It listens on port <strong>8090</strong>. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS, Linux or Windows. It never restarts anything by itself.</p>
+<p><strong>Using it.</strong> Once the helper is running, <strong>Apps → HQPlayer Bridge</strong> shows a **Restart <em>name</em><strong> row under HQPlayer Live View. Tap it, then </strong>Restart <em>name</em> now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.</p>
+<h3>Install the helper</h3>
+<p>On the <strong>HQPlayer machine</strong>, with <strong>Python 3.7 or later</strong>:</p>
+<p><strong>Step 1.</strong> Download this repository (<strong>Code → Download ZIP</strong> on GitHub) and open the <code>tools/hqrestart/</code> folder in a terminal.</p>
+<p><strong>Step 2.</strong> Run the installer that matches how HQPlayer runs there:</p>
+<table>
+<thead><tr>
+<th>HQPlayer runs as…</th>
+<th>macOS / Linux</th>
+<th>Windows (PowerShell)</th>
+</tr></thead>
+<tbody>
+<tr><td>an app, or a Linux user service</td><td><code>./install.sh</code></td><td><code>.\install.ps1</code></td></tr>
+<tr><td>a system service</td><td><code>sudo ./install.sh --system</code></td><td><code>.\install.ps1 -System</code> (as administrator)</td></tr>
+</tbody></table>
+<p>The helper starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, <code>hqrestart.json</code>.</p>
+<p><strong>Step 3.</strong> Open <code>hqrestart.json</code> and add your <strong>LMS server's IP address</strong> to <code>allow</code>, leaving the generated <code>token</code> as it is:</p>
+<pre><code>{ "token": "...", "allow": ["192.168.1.234"] }</code></pre>
+<p>The plugin sends no token, so a restart is only accepted from an address in <code>allow</code>. Without this step the row appears but the restart is refused.</p>
+<p><strong>Step 4.</strong> Run the same installer again to load the change. Reinstalling keeps your config.</p>
+<p><strong>Step 5.</strong> Check it from the LMS machine: <code>curl http://&lt;hqplayer-ip&gt;:8090/ping</code> should answer with <code>"service": "hqrestart"</code>. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.</p>
+<table>
+<thead><tr>
+<th></th>
+<th>macOS</th>
+<th>Linux</th>
+<th>Windows</th>
+</tr></thead>
+<tbody>
+<tr><td>config (app)</td><td><code>~/Library/Application Support/hqrestart/</code></td><td><code>~/.config/hqrestart/</code></td><td><code>%LOCALAPPDATA%\hqrestart\</code></td></tr>
+<tr><td>config (service)</td><td><code>/Library/Application Support/hqrestart/</code></td><td><code>/etc/hqrestart/</code></td><td><code>%ProgramData%\hqrestart\</code></td></tr>
+<tr><td>log</td><td><code>~/Library/Logs/hqrestart.log</code> (<code>/Library/Logs/</code> for a service)</td><td><code>journalctl --user -u hqrestart</code> (no <code>--user</code> for a service)</td><td><code>hqrestart.log</code> in the config folder</td></tr>
+<tr><td>runs as</td><td>a LaunchAgent (LaunchDaemon for a service)</td><td>a systemd unit</td><td>a scheduled task</td></tr>
+</tbody></table>
+<ul>
+<li><strong>Windows:</strong> if PowerShell refuses to run the script, use <code>powershell -ExecutionPolicy Bypass -File .\install.ps1</code>. Opening port 8090 in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
+</li>
+<li><strong>Linux, app mode:</strong> the helper runs only while you're logged in, unless you run <code>sudo loginctl enable-linger &lt;your user&gt;</code> (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
+</li>
+<li>The helper can also be called without LMS, with the token, e.g. from a phone shortcut. See <a href="tools/hqrestart/README.md"><code>tools/hqrestart/README.md</code></a> for that and for every config option.
+</li></ul>
+<h3>Uninstall the helper</h3>
+<p>Run the installer from the same folder with the uninstall option, matching how you installed it:</p>
+<table>
+<thead><tr>
+<th></th>
+<th>macOS / Linux</th>
+<th>Windows (PowerShell)</th>
+</tr></thead>
+<tbody>
+<tr><td>app</td><td><code>./install.sh --uninstall</code></td><td><code>.\install.ps1 -Uninstall</code></td></tr>
+<tr><td>service</td><td><code>sudo ./install.sh --system --uninstall</code></td><td><code>.\install.ps1 -System -Uninstall</code> (as administrator)</td></tr>
+</tbody></table>
+<p>This stops the helper and removes it from startup. Your config folder (above) is left in place; delete it if you won't reinstall. On Windows, remove the firewall rule too, from an administrator PowerShell: <code>Remove-NetFirewallRule -DisplayName hqrestart</code>. The Restart row disappears from Apps when LMS next restarts.</p>
 </section>
 <section id="how-your-music-reaches-hqplayer">
 <h2>How your music reaches HQPlayer</h2>
