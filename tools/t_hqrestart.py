@@ -318,6 +318,14 @@ finally:
 ok('gives up at 120' in loud, 'a total_timeout past the Bridge\'s wait is warned about')
 ok(quiet == '', 'and the default is not (%r)' % quiet[:60])
 
+# respawn_wait 0 is a CHOICE - "start it myself, do not wait for launchd" - and
+# round 9's blanket "must be positive" quietly overrode it with the default.
+c7 = conf(respawn_wait=0, port=70000, stop_timeout=0)
+ok(c7['respawn_wait'] == 0, 'respawn_wait 0 is kept (%r)' % (c7['respawn_wait'],))
+ok(c7['port'] == 8090, 'a port outside 1-65535 falls back (%r)' % (c7['port'],))
+ok(c7['stop_timeout'] == 20, 'but a zero stop_timeout does not - it would mean give up at once (%r)'
+   % (c7['stop_timeout'],))
+
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')

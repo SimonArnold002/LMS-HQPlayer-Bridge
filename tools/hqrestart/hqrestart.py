@@ -205,15 +205,20 @@ class Config:
                 log('config: "%s" must be text; reading %r as one' % (k, self.c[k]))
                 self.c[k] = str(self.c[k])
 
+        # `respawn_wait` 0 is a real choice - "do not give launchd a chance to
+        # relaunch it, start it myself" - so zero is only refused where it would
+        # mean "give up at once".
         for k in ('port', 'stop_timeout', 'respawn_wait', 'start_timeout', 'total_timeout'):
+            floor = 0 if k == 'respawn_wait' else 1
             try:
                 v = float(self.c[k])
-                if v <= 0:
+                if v < floor or (k == 'port' and v > 65535):
                     raise ValueError(v)
                 self.c[k] = int(v) if k == 'port' else v
             except (TypeError, ValueError):
-                log('config: "%s" must be a positive number; using %r'
-                    % (k, DEFAULTS[k]))
+                log('config: "%s" must be %s; using %r'
+                    % (k, 'a port between 1 and 65535' if k == 'port' else
+                          'a number of seconds (%s or more)' % floor, DEFAULTS[k]))
                 self.c[k] = DEFAULTS[k]
 
         if self.c['total_timeout'] > BRIDGE_WAIT - 10:
