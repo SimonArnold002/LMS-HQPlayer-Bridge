@@ -87,8 +87,8 @@ Every key is optional except `token`, which is generated on first run.
 
 | key | default | meaning |
 |---|---|---|
-| `port` / `listen` | `8090` / `0.0.0.0` | where it listens. Keep 8090 for the HQPlayer Bridge to find it |
-| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). Put your LMS server here, e.g. `["192.168.1.234"]` |
+| `port` / `listen` | `8090` / `::` | where it listens. `::` serves IPv6 AND IPv4 on one socket, falling back to `0.0.0.0` where IPv6 is off. Keep 8090 for the HQPlayer Bridge to find it |
+| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). Put your LMS server here, e.g. `["192.168.1.234"]`. IPv4 and IPv6 both work, and a v4 address written the ordinary way still matches a client arriving over the IPv6 socket |
 | `hostnames` | `[]` | host names, besides an IP address or `localhost`, that the tokenless route may be addressed by |
 | `mode` | `auto` | force `app` or `service` |
 | `service` | detected | pin the launchd label, systemd unit or Windows service name |

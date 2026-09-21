@@ -191,6 +191,24 @@ ok(c2['start_command'] == [EXE, '--flag'], 'a string start_command is split, not
 _json.dump({'token': 't', 'allow': ['10.0.0.1', '10.0.0.2']}, real_open(cfgp, 'w'))
 ok(hq.Config(cfgp)['allow'] == ['10.0.0.1', '10.0.0.2'], 'a list is left alone')
 
+print('== a port it cannot bind is reported once, not retried for ever')
+import socket as _socket
+held = _socket.socket(); held.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+held.bind(('127.0.0.1', 0)); held.listen(1)
+busy = held.getsockname()[1]
+d2 = tempfile.mkdtemp(); c_busy = os.path.join(d2, 'hqrestart.json')
+_json.dump({'token': 't', 'listen': '127.0.0.1', 'port': busy}, real_open(c_busy, 'w'))
+argv = sys.argv[:]
+sys.argv = ['hqrestart.py', c_busy]
+try:
+    hq.main(); ok(False, 'a taken port stops the helper')
+except SystemExit as e:
+    ok(e.code == 2, 'a taken port stops the helper with a plain message (exit %r)' % (e.code,))
+except Exception as e:
+    ok(False, 'a taken port raised %s instead' % type(e).__name__)
+finally:
+    sys.argv = argv; held.close()
+
 print('== HQPlayer running as ANOTHER user: LEFT RUNNING, and the message says why')
 # kill(pid, 0) asks without sending anything; os.kill is shared, so it is restored.
 real_kill = os.kill
@@ -253,6 +271,49 @@ ok(conf(start_command=[EXE, 7])['start_command'] == [EXE, '7'], 'start_command e
 # CONTROL: sane values are untouched.
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')
+
+print('== the endpoint itself, over a REAL socket (v4 and v6 on one dual-stack helper)')
+# Nothing above this point opens a socket, so a handler that had stopped being a
+# handler - do_POST lost to a bad edit, say - passed every test and answered 501.
+import threading, urllib.request, urllib.error
+d3 = tempfile.mkdtemp(); c3 = os.path.join(d3, 'hqrestart.json')
+_json.dump({'token': 'tok', 'listen': '::', 'port': 0, 'allow': ['127.0.0.1']}, real_open(c3, 'w'))
+hq.PLATFORM = sys.platform
+scfg = hq.Config(c3)
+hq.Handler.cfg = scfg
+hq.find_pid = lambda names: None            # nothing to restart: /restart answers, /ping is the point
+srv = hq.server_for('::', 0)
+port = srv.socket.getsockname()[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+def call(url, method='GET', headers=None, data=None):
+    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+try:
+    code, body = call('http://127.0.0.1:%d/ping' % port)
+    ok(code == 200 and 'hqrestart' in body, '/ping over IPv4 answers (%s)' % code)
+    code, _ = call('http://[::1]:%d/ping' % port)
+    ok(code == 200, '/ping over IPv6 answers on the same helper (%s)' % code)
+    # the v4 client arrives as ::ffff:127.0.0.1; `allow` names it the ordinary way
+    code, body = call('http://127.0.0.1:%d/restart' % port, 'POST',
+                      {'Content-Type': 'application/json'}, b'{}')
+    ok(code != 401, 'a v4 client in `allow` is trusted through the mapped form (%s)' % code)
+    ok(code != 501, 'and POST is still a method this handler knows (%s)' % code)
+    # CONTROL: an address NOT in allow gets nothing without the token
+    code, _ = call('http://[::1]:%d/restart' % port, 'POST',
+                   {'Content-Type': 'application/json'}, b'{}')
+    ok(code == 401, 'an address outside `allow` is refused (%s)' % code)
+    code, _ = call('http://[::1]:%d/status' % port, 'GET', {'Authorization': 'Bearer tok'})
+    ok(code == 200, 'and the token works over IPv6 (%s)' % code)
+    code, _ = call('http://127.0.0.1:%d/status' % port, 'GET', {'Authorization': 'Bearer wrong'})
+    ok(code == 401, 'a wrong token is refused (%s)' % code)
+finally:
+    srv.shutdown(); srv.server_close()
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)

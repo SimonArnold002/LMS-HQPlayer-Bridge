@@ -34,6 +34,7 @@ Host, which is what the Host rule refuses.
 Standard library only; Python 3.7+.
 """
 
+import errno
 import hmac
 import ipaddress
 import json
@@ -43,6 +44,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -66,7 +68,7 @@ SESSION_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
                'DBUS_SESSION_BUS_ADDRESS', 'HOME', 'LANG', 'LC_ALL', 'PULSE_SERVER')
 
 DEFAULTS = {
-    'listen':        '0.0.0.0',
+    'listen':        '::',    # dual-stack where IPv6 exists; falls back to 0.0.0.0
     'port':          8090,
     'token':         '',
     'allow':         [],      # addresses that need no token, e.g. the LMS server
@@ -81,6 +83,19 @@ DEFAULTS = {
     'start_timeout': 30,      # seconds for the new process to appear
     'total_timeout': 90,      # the whole restart; the HQPlayer Bridge waits a little longer
 }
+
+
+def same_addr(a, b):
+    """True when two addresses are the same host. A v4 client reaching a
+    dual-stack socket arrives as `::ffff:192.168.1.234`, which is NOT equal to
+    `192.168.1.234` as a string - so an `allow` list written the ordinary way
+    would never match one."""
+    try:
+        ia, ib = ipaddress.ip_address(a), ipaddress.ip_address(b)
+    except ValueError:
+        return a == b                               # not an address: compare as given
+    # ipv4_mapped exists on an IPv6Address only, so ask for it that way
+    return (getattr(ia, 'ipv4_mapped', None) or ia) == (getattr(ib, 'ipv4_mapped', None) or ib)
 
 
 def log(msg):
@@ -636,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
         if n:
             self.rfile.read(min(n, 65536))
         trusted = (self.command == 'POST'
-                   and self.client_address[0] in self.cfg['allow']
+                   and any(same_addr(self.client_address[0], a) for a in self.cfg['allow'])
                    and (self.headers.get('Content-Type') or '').split(';')[0].strip() == 'application/json'
                    and self.direct_host())
         if not (trusted or self.authorised(url)):
@@ -667,6 +682,30 @@ class Handler(BaseHTTPRequestHandler):
     do_POST = handle_any
 
 
+def server_for(listen, port):
+    """An HTTP server on `listen`. A v6 address (or `::`) gets a DUAL-STACK
+    socket - IPV6_V6ONLY off, so v4 clients are served too - because the default
+    http.server is AF_INET only and would not answer an IPv6 network at all."""
+    family = socket.AF_INET
+    try:
+        family = socket.AF_INET6 if ipaddress.ip_address(listen).version == 6 else socket.AF_INET
+    except ValueError:
+        pass                                        # a name: let getaddrinfo decide below
+
+    class Server(ThreadingHTTPServer):
+        address_family = family
+
+        def server_bind(self):
+            if self.address_family == socket.AF_INET6:
+                try:                                 # Linux/Windows default it to ON
+                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                except OSError:
+                    pass
+            ThreadingHTTPServer.server_bind(self)
+
+    return Server((listen, port), Handler)
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'hqrestart.json')
     # Under pythonw (how install.ps1 runs it on Windows) there is no stderr at
@@ -677,9 +716,34 @@ def main():
                           'a', buffering=1, encoding='utf-8')
     cfg = Config(path)
     Handler.cfg = cfg
-    srv = ThreadingHTTPServer((cfg['listen'], int(cfg['port'])), Handler)
+    # A port already taken (both the per-user AND the system install, say) or a
+    # listen address this machine does not have used to raise a TRACEBACK here,
+    # and KeepAlive / Restart=always then retried it for ever. Say it once.
+    listen = cfg['listen']
+    try:
+        srv = server_for(listen, int(cfg['port']))
+    except OSError as e:
+        # A machine with IPv6 switched off cannot bind `::` at all, and that is
+        # the DEFAULT here - fall back rather than refusing to run.
+        if listen == DEFAULTS['listen']:
+            log('no IPv6 here (%s) - listening on 0.0.0.0 instead' % e)
+            try:
+                listen = '0.0.0.0'
+                srv = server_for(listen, int(cfg['port']))
+            except OSError as e2:
+                e = e2
+            else:
+                e = None
+        if e is not None:
+            if getattr(e, 'errno', None) == errno.EADDRINUSE:
+                why = ('Another copy is probably already running - a per-user AND a system '
+                       'install both listen here. Uninstall one, or set "port" in %s.' % path)
+            else:
+                why = 'Set "listen" in %s to an address this machine has.' % path
+            log('cannot listen on %s:%s (%s). %s' % (listen, cfg['port'], e, why))
+            raise SystemExit(2)
     log('hqrestart listening on %s:%s (%s), watching %s'
-        % (cfg['listen'], cfg['port'], PLATFORM, ', '.join(cfg.names())))
+        % (listen, cfg['port'], PLATFORM, ', '.join(cfg.names())))
     srv.serve_forever()
 
 
