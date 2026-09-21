@@ -374,6 +374,22 @@ ok('must be' not in logged(), 'and nothing is logged as corrected')
 c5 = conf(allow=['10.0.0.1'], stop_timeout=5, port=9099)
 ok(c5['allow'] == ['10.0.0.1'] and c5['stop_timeout'] == 5 and c5['port'] == 9099, 'sane values are left alone')
 
+print('== `user_service` is read for what it SAYS, not for being non-empty')
+# bool("false") is True: a quoted false restarted with `systemctl --user`.
+for raw, want in (('false', False), ('False', False), ('no', False), ('0', False), (0, False),
+                  ('true', True), ('yes', True), (1, True), (True, True), (False, False),
+                  (None, None), ('', None), ('auto', None)):
+    got = conf(user_service=raw)['user_service']
+    ok(got is want, 'user_service %r reads as %r (%r)' % (raw, want, got))
+logged(); got = conf(user_service='maybe')['user_service']
+ok(got is None and 'user_service' in logged(), 'nonsense means DETECT, and says so (%r)' % (got,))
+logged(); conf(user_service='false')
+ok('user_service' not in logged(), 'a word it understands is not complained about')
+# and at the layer that acts on it: the unit is restarted WITHOUT --user
+setup('linux', linux_proc(EXE, '/'))
+how = hq.detect_linux(100, conf(service='hqplayerd.service', mode='service', user_service='false'))
+ok(how['mode'] == 'service' and how['user'] is False, 'a quoted false restarts the SYSTEM unit (%r)' % (how,))
+
 print('== the endpoint itself, over a REAL socket (v4 and v6 on one dual-stack helper)')
 # Nothing above this point opens a socket, so a handler that had stopped being a
 # handler - do_POST lost to a bad edit, say - passed every test and answered 501.

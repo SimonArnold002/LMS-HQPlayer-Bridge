@@ -214,6 +214,28 @@ class Config:
             mode = 'auto'
         self.c['mode'] = mode
 
+        # `user_service` is used as a TRUTH value, and bool("false") is True: a
+        # quoted "false" would restart with `systemctl --user`. Spellings are read
+        # for what they say; anything else means "detect", the default.
+        us = self.c['user_service']
+        if isinstance(us, str):
+            word = us.strip().lower()
+            if word in ('true', 'yes', 'on', '1'):
+                us = True
+            elif word in ('false', 'no', 'off', '0'):
+                us = False
+            else:
+                if word not in ('', 'auto', 'detect'):
+                    log('config: "user_service" must be true or false; detecting it instead (was %r)' % (us,))
+                us = None
+        elif us is not None and not isinstance(us, bool):
+            if us in (0, 1):
+                us = bool(us)
+            else:
+                log('config: "user_service" must be true or false; detecting it instead (was %r)' % (us,))
+                us = None
+        self.c['user_service'] = us
+
         # The auth path does token.encode(), and the listen address is handed to
         # the socket: a number in either raises rather than being compared or bound.
         for k in ('token', 'listen', 'service'):
