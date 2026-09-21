@@ -21,6 +21,10 @@ started, and restarts it the same way:
 It can also start HQPlayer when it is not running: from `service` or `start_command` if the config
 pins one, otherwise from the last launch it saw.
 
+**Only the macOS app row has been run for real.** Every other cell in that table - macOS as a
+service, and all of Linux and Windows - is written and covered by automated tests, but has not
+been run on a real machine yet. See [Tested](#tested).
+
 ## Install
 
 Install it the same way HQPlayer runs. For a system service the webhook needs root / SYSTEM. For
@@ -52,6 +56,24 @@ sudo ./install.sh --system --uninstall    # macOS/Linux, system service
 This stops the helper and removes it from startup. The config folder is left in place; delete
 it if you won't reinstall. On Windows, also remove the firewall rule from an admin PowerShell:
 `Remove-NetFirewallRule -DisplayName hqrestart`.
+
+## What it looks like on the machine
+
+It runs as Python, so on macOS and Windows it mostly shows up under Python's name rather than
+its own:
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| started by | a LaunchAgent, `com.hqrestart.webhook` (a LaunchDaemon with `--system`) | a systemd unit, `hqrestart.service` (user, or system with `--system`) | a scheduled task, `hqrestart` (as SYSTEM with `-System`) |
+| where to see it | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a system install) | Task Scheduler → Task Scheduler Library → **hqrestart** |
+| the process | **Python** in Activity Monitor | `python3 …/hqrestart.py` | **pythonw.exe** in Task Manager → Details |
+
+macOS shows a "Background Items Added" notice when it is installed. Switching the item off
+in *Allow in the Background* stops the helper; use `--uninstall` instead. On Windows the
+installer also adds an inbound firewall rule named **hqrestart**.
+
+Only the macOS column has been checked on a real machine. The Linux and Windows columns are
+what the installers set up; neither has been run on a real Linux or Windows machine yet.
 
 ## From LMS (HQPlayer Bridge)
 

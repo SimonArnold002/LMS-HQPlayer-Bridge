@@ -69,6 +69,8 @@ sudo systemctl restart lyrionmusicserver
 
 **What it is.** `hqrestart` is one Python script (standard library only) in [`tools/hqrestart/`](tools/hqrestart/) of this repository. It is **not part of the plugin**, and playback works exactly the same without it. It listens on port **8090**. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS, Linux or Windows. It never restarts anything by itself.
 
+**Only tested on macOS so far.** It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and all of Linux and Windows, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried.
+
 **Using it.** Once the helper is running, **Apps → HQPlayer Bridge** shows a **Restart *name*** row under HQPlayer Live View. Tap it, then **Restart *name* now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.
 
 ### Install the helper
@@ -104,6 +106,10 @@ The plugin sends no token, so a restart is only accepted from an address in `all
 | config (service) | `/Library/Application Support/hqrestart/` | `/etc/hqrestart/` | `%ProgramData%\hqrestart\` |
 | log | `~/Library/Logs/hqrestart.log` (`/Library/Logs/` for a service) | `journalctl --user -u hqrestart` (no `--user` for a service) | `hqrestart.log` in the config folder |
 | runs as | a LaunchAgent (LaunchDaemon for a service) | a systemd unit | a scheduled task |
+| listed in | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a service) | Task Scheduler → Task Scheduler Library → **hqrestart** |
+| process | **Python** in Activity Monitor | `python3 …/hqrestart.py` in `ps` or `top` | **pythonw.exe** in Task Manager → Details |
+
+**It doesn't appear under its own name everywhere.** macOS names the background item after the Python it runs, so it shows as *python3*, not *hqrestart*, and macOS tells you with a "Background Items Added" notice when you install it. If you switch that item off, the helper stops and the Restart row goes with it; use the uninstaller rather than the switch. On Windows the installer also adds a firewall rule called **hqrestart**. The macOS column was checked on a real Mac; the Linux and Windows columns describe what the installers set up, and have not been seen on a real machine.
 
 - **Windows:** if PowerShell refuses to run the script, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Opening the helper's port (8090 unless you change `port`) in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
 - **Linux, app mode:** the helper runs only while you're logged in, unless you run `sudo loginctl enable-linger <your user>` (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
