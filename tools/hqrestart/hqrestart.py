@@ -68,6 +68,7 @@ SESSION_ENV = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
                'DBUS_SESSION_BUS_ADDRESS', 'HOME', 'LANG', 'LC_ALL', 'PULSE_SERVER')
 
 KILL_WAIT = 3       # seconds for a forced kill to take before the restart gives up
+EXPLAIN_EVERY = 60  # seconds between repeats of one address's 'not in allow' line
 
 DEFAULTS = {
     'listen':        '::',    # dual-stack where IPv6 exists; falls back to 0.0.0.0
@@ -751,6 +752,7 @@ def restart(cfg):
 class Handler(BaseHTTPRequestHandler):
     cfg = None
     lock = threading.Lock()
+    SAID = {}           # address -> when it was last told why it was refused
     server_version = 'hqrestart/1'
     timeout = 30        # a client that connects and sends nothing must not hold a thread
 
@@ -793,6 +795,48 @@ class Handler(BaseHTTPRequestHandler):
             got = (parse_qs(url.query).get('token') or [''])[0]
         return hmac.compare_digest(got.encode(), self.cfg['token'].encode())
 
+    # A 401 on its own tells the one person who can fix this nothing at all.
+    # The Bridge holds no token, so its Restart row works ONLY when the Lyrion
+    # server's address is in `allow` - and the address that would fix it is
+    # sitting right here in the refused request. Write it down.
+    #
+    # Only for a request that LOOKS like the Bridge (a JSON POST). A bare GET
+    # with a wrong token is a bookmark typo or a scanner, and neither wants
+    # this advice. Throttled per address so a scanner cannot fill the log.
+    def explain_refusal(self):
+        if self.command != 'POST':
+            return
+        if (self.headers.get('Content-Type') or '').split(';')[0].strip() != 'application/json':
+            return
+
+        who = self.client_address[0]
+        now = time.time()
+        if now - self.SAID.get(who, 0) < EXPLAIN_EVERY:
+            return
+        # Bounded: one entry per address would otherwise grow for ever on a
+        # host that anything scans. An entry older than the throttle has
+        # nothing left to suppress, so it is simply dropped.
+        for addr in [a for a, t in self.SAID.items() if now - t >= EXPLAIN_EVERY]:
+            del self.SAID[addr]
+        self.SAID[who] = now
+
+        if any(same_addr(who, a) for a in self.cfg['allow']):
+            # In the list, so it was the Host header that failed - the other
+            # half of the tokenless rule, and a much less obvious one.
+            if not self.direct_host():
+                log('refused a restart from %s: it IS in "allow", but the request was '
+                    'addressed to %r instead of this machine\'s IP address. Add that name '
+                    'to "hostnames" in the config if it is yours.'
+                    % (who, self.headers.get('Host') or ''))
+            return
+
+        # Name the installer this machine actually has - telling a Windows user
+        # to run install.sh is worse than saying nothing.
+        how = ('.\\install.ps1 -Allow %s' if PLATFORM == 'win32' else './install.sh --allow %s') % who
+        log('refused a restart from %s: that address is not in "allow". If %s is your '
+            'Lyrion server, run  %s  on this machine (add %s if HQPlayer runs as a service).'
+            % (who, who, how, '-System' if PLATFORM == 'win32' else '--system'))
+
     def handle_any(self):
         url = urlparse(self.path)
         if url.path == '/ping':
@@ -808,6 +852,7 @@ class Handler(BaseHTTPRequestHandler):
                    and (self.headers.get('Content-Type') or '').split(';')[0].strip() == 'application/json'
                    and self.direct_host())
         if not (trusted or self.authorised(url)):
+            self.explain_refusal()
             return self.reply(401, {'ok': False, 'error': 'bad or missing token'})
         if url.path == '/status':
             pid = find_pid(self.cfg.names())
@@ -859,7 +904,67 @@ def server_for(listen, port):
     return Server((listen, port), Handler)
 
 
+def set_allow(path, raw=None):
+    """Read or write the config's `allow` list, for the installers to call.
+
+    It lives here, not in install.sh and install.ps1, because it is ONE rule -
+    an address the tokenless restart trusts - and three copies of a validator
+    drift. The installers shell out to this.
+
+    `raw` None reads; otherwise it is a comma/space separated list of IP
+    addresses. Returns the list written. Raises ValueError, naming the offending
+    address, rather than writing a file the helper would then have to correct at
+    load: an installer can say which address was wrong while the user is still
+    sitting there.
+
+    A config that does not PARSE is never rewritten - the token is in that file,
+    and silently replacing it would break every bookmark.
+    """
+    data = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            try:
+                data = json.load(f)
+            except ValueError as e:
+                raise ValueError('%s does not parse as JSON (%s)' % (path, e))
+        if not isinstance(data, dict):
+            data = {}
+
+    if raw is None:
+        got = data.get('allow') or []
+        return [str(a) for a in got] if isinstance(got, list) else []
+
+    addrs = []
+    for part in raw.replace(',', ' ').split():
+        try:
+            ipaddress.ip_address(part)
+        except ValueError:
+            raise ValueError('not an IP address: %s' % part)
+        if part not in addrs:
+            addrs.append(part)
+
+    data['allow'] = addrs
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    try:
+        os.chmod(path, 0o600)                        # it holds the token
+    except OSError:
+        pass
+    return addrs
+
+
 def main():
+    # `--allow <config> [addresses]` is the installers' entry point, not a way
+    # to run the helper: it reads or writes one key and exits.
+    if len(sys.argv) > 2 and sys.argv[1] == '--allow':
+        try:
+            got = set_allow(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+        except (ValueError, OSError) as e:
+            sys.stderr.write('  %s\n' % e)
+            return 1
+        print(' '.join(got))
+        return 0
+
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'hqrestart.json')
     # Under pythonw (how install.ps1 runs it on Windows) there is no stderr at
     # all: the first log line - and http.server's own error output - would
@@ -904,4 +1009,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())     # --allow reports a bad address with exit 1

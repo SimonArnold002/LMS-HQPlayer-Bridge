@@ -191,12 +191,12 @@ sudo systemctl restart lyrionmusicserver</code></pre>
 <tr><td>an app, or a Linux user service</td><td><code>./install.sh</code></td><td><code>.\install.ps1</code></td></tr>
 <tr><td>a system service</td><td><code>sudo ./install.sh --system</code></td><td><code>.\install.ps1 -System</code> (as administrator)</td></tr>
 </tbody></table>
-<p>The helper starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, <code>hqrestart.json</code>.</p>
-<p><strong>Step 3.</strong> Open <code>hqrestart.json</code> and add your <strong>LMS server's IP address</strong> to <code>allow</code>, leaving the generated <code>token</code> as it is:</p>
-<pre><code>{ "token": "...", "allow": ["192.168.1.234"] }</code></pre>
-<p>The plugin sends no token, so a restart is only accepted from an address in <code>allow</code>. Without this step the row appears but the restart is refused.</p>
-<p><strong>Step 4.</strong> Run the same installer again to load the change. Reinstalling keeps your config.</p>
-<p><strong>Step 5.</strong> Check it from the LMS machine: <code>curl http://&lt;hqplayer-ip&gt;:8090/ping</code> should answer with <code>"service": "hqrestart"</code>. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.</p>
+<p><strong>Step 3.</strong> It asks for your <strong>LMS server's IP address</strong>:</p>
+<pre><code>Lyrion server IP address (press return to skip):</code></pre>
+<p>Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with <code>./install.sh --allow 192.168.1.234</code> (<code>-Allow</code> on Windows); pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.</p>
+<p>It must be an IP address rather than a name, because it is matched against the address the request arrives from.</p>
+<p>The helper then starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, <code>hqrestart.json</code>, the access token, and whether LMS is allowed to restart HQPlayer.</p>
+<p><strong>Step 4.</strong> Check it from the LMS machine: <code>curl http://&lt;hqplayer-ip&gt;:8090/ping</code> should answer with <code>"service": "hqrestart"</code>. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.</p>
 <table>
 <thead><tr>
 <th></th>

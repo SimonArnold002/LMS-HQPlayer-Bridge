@@ -86,19 +86,19 @@ On the **HQPlayer machine**, with **Python 3.7 or later**:
 | an app, or a Linux user service | `./install.sh` | `.\install.ps1` |
 | a system service | `sudo ./install.sh --system` | `.\install.ps1 -System` (as administrator) |
 
-The helper starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, `hqrestart.json`.
+**Step 3.** It asks for your **LMS server's IP address**:
 
-**Step 3.** Open `hqrestart.json` and add your **LMS server's IP address** to `allow`, leaving the generated `token` as it is:
-
-```json
-{ "token": "...", "allow": ["192.168.1.234"] }
+```
+Lyrion server IP address (press return to skip):
 ```
 
-The plugin sends no token, so a restart is only accepted from an address in `allow`. Without this step the row appears but the restart is refused.
+Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with `./install.sh --allow 192.168.1.234` (`-Allow` on Windows); pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.
 
-**Step 4.** Run the same installer again to load the change. Reinstalling keeps your config.
+It must be an IP address rather than a name, because it is matched against the address the request arrives from.
 
-**Step 5.** Check it from the LMS machine: `curl http://<hqplayer-ip>:8090/ping` should answer with `"service": "hqrestart"`. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.
+The helper then starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, `hqrestart.json`, the access token, and whether LMS is allowed to restart HQPlayer.
+
+**Step 4.** Check it from the LMS machine: `curl http://<hqplayer-ip>:8090/ping` should answer with `"service": "hqrestart"`. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.
 
 | | macOS | Linux | Windows |
 |---|---|---|---|

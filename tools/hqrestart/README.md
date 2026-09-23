@@ -38,11 +38,31 @@ sudo ./install.sh --system    # macOS/Linux, HQPlayer is a system service
 .\install.ps1 -System         # Windows, HQPlayer is a service (admin PowerShell)
 ```
 
-The installer prints the token. It is stored in `hqrestart.json` next to the installed script.
+**It asks for your Lyrion server's address**, because that is what makes the Bridge's Restart
+row work - the Bridge has no token to send, so this machine has to trust Lyrion by address:
 
-For the HQPlayer Bridge's Restart row to work, add the LMS server's IP address to `allow` in
-that file (e.g. `"allow": ["192.168.1.234"]`), then run the installer again. Reinstalling
-keeps the config.
+```
+The HQPlayer Bridge plugin adds a Restart HQPlayer row to Lyrion (LMS).
+For it to work, this machine has to trust your Lyrion server's address.
+
+Lyrion server IP address (press return to skip):
+```
+
+Press return to skip it if you only want the token and a bookmark. To answer without being
+asked - or to change it later - pass it on the command line and re-run the installer, which
+keeps the rest of the config:
+
+```
+./install.sh --allow 192.168.1.234
+.\install.ps1 -Allow 192.168.1.234
+```
+
+It must be an **IP address**, not a host name: it is matched against the address the request
+arrives from. Several may be given, comma-separated. Re-running the installer and pressing
+return at the prompt keeps whatever is already set, so picking up a new version never drops it.
+
+The installer prints the token, the config path, and whether Lyrion may press Restart. It is
+all stored in `hqrestart.json` next to the installed script.
 
 ## Uninstall
 
@@ -112,7 +132,7 @@ Every key is optional except `token`, which is generated on first run.
 | key | default | meaning |
 |---|---|---|
 | `port` / `listen` | `8090` / `::` | where it listens. `::` serves IPv6 AND IPv4 on one socket, falling back to `0.0.0.0` where IPv6 is off. Keep 8090 for the HQPlayer Bridge to find it |
-| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). Put your LMS server here, e.g. `["192.168.1.234"]`. IPv4 and IPv6 both work, and a v4 address written the ordinary way still matches a client arriving over the IPv6 socket |
+| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). **Set by the installer** - it asks, or takes `--allow` / `-Allow`. Your Lyrion server, e.g. `["192.168.1.234"]`. IPv4 and IPv6 both work, and a v4 address written the ordinary way still matches a client arriving over the IPv6 socket |
 | `hostnames` | `[]` | host names, besides an IP address or `localhost`, that the tokenless route may be addressed by |
 | `mode` | `auto` | force `app` or `service` |
 | `service` | detected | pin the launchd label, systemd unit or Windows service name |

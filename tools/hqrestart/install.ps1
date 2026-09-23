@@ -6,8 +6,12 @@
 #                              as SYSTEM at boot (run this from an admin PowerShell)
 #   .\install.ps1 -Uninstall   (add -System for the system one)
 #
+#   -Allow <ip>                the Lyrion (LMS) server that may press Restart
+#                              without a token. Asked for interactively when it
+#                              is not given. Several may be listed, comma-separated.
+#
 # Needs Python 3.7+ on PATH (python.org installer, "Add to PATH").
-param([switch]$System, [switch]$Uninstall)
+param([switch]$System, [switch]$Uninstall, [string]$Allow)
 $ErrorActionPreference = 'Stop'
 
 $task = 'hqrestart'
@@ -37,6 +41,65 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Copy-Item (Join-Path $PSScriptRoot 'hqrestart.py') (Join-Path $dir 'hqrestart.py') -Force
 $cfg = Join-Path $dir 'hqrestart.json'
 
+# ---------------------------------------------------------------------------
+# `allow` - the ONLY way the HQPlayer Bridge's Restart row can work: the Bridge
+# holds no token, so the helper has to trust the Lyrion server by address. It
+# used to be a hand edit of the JSON, which meant a user installed the helper,
+# tapped Restart and got a refusal with nothing to tell them why. It is asked
+# for here instead, and written BEFORE the task starts - the helper reads its
+# config once, at startup.
+#
+# Reading and writing that key is done by the HELPER itself (`--allow`), not
+# reimplemented here: one rule, one validator, and install.sh calls the same
+# one. It also rejects a half-written address like "192.168.1", which .NET's
+# IPAddress.Parse would silently turn into 192.0.0.1 on Windows PowerShell.
+# ---------------------------------------------------------------------------
+$pyForCfg = if ($pyc) { $pyc } else { $py }
+$helper = Join-Path $dir 'hqrestart.py'
+
+# Both are wrapped: $ErrorActionPreference is 'Stop' for the whole script, and a
+# native command that writes to stderr can surface as a terminating error in some
+# hosts. Asking about `allow` must never be able to abort an otherwise good
+# install - the worst case here is that it stays unset and the closing line says so.
+function Get-Allow {
+    try {
+        $out = & $pyForCfg $helper --allow $cfg 2>$null
+        if ($LASTEXITCODE -ne 0) { return '' }
+        return ("$out").Trim()
+    } catch { return '' }
+}
+function Set-Allow([string]$value) {
+    try {
+        $out = & $pyForCfg $helper --allow $cfg $value
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return ("$out").Trim()
+    } catch { return $null }
+}
+
+$current = Get-Allow
+if ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
+    $written = Set-Allow $Allow
+    if ($null -eq $written) { Write-Warning "-Allow $Allow was not accepted; leaving it unset." }
+    else { $current = $written }
+} elseif (-not $PSBoundParameters.ContainsKey('Allow')) {
+    ''
+    'The HQPlayer Bridge plugin adds a Restart HQPlayer row to Lyrion (LMS).'
+    'For it to work, this machine has to trust your Lyrion server address.'
+    ''
+    while ($true) {
+        if ($current) { $prompt = "Lyrion server IP address [$current]" }
+        else          { $prompt = 'Lyrion server IP address (press return to skip)' }
+        # Read-Host THROWS under -NonInteractive, and by here the scheduled task
+        # has already been unregistered - so an unguarded prompt would leave a
+        # provisioning run with no helper at all. install.sh guards with [ -t 0 ].
+        try { $answer = (Read-Host $prompt) } catch { '  (not interactive - skipping)'; break }
+        if (-not $answer) { break }
+        $written = Set-Allow $answer
+        if ($null -ne $written) { $current = $written; break }
+        '  try again, or press return to leave it unset.'
+    }
+    ''
+}
 $action   = New-ScheduledTaskAction -Execute $py -Argument "`"$dir\hqrestart.py`" `"$cfg`"" -WorkingDirectory $dir
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
@@ -52,10 +115,16 @@ Start-ScheduledTask -TaskName $task
 
 # The port the helper actually listens on: a config that sets one must open THAT
 # port, or the rule is for 8090 and LMS still cannot reach it, with no warning.
-# The config is written on the first start, so wait for it here.
-for ($i = 0; $i -lt 20 -and -not (Test-Path $cfg); $i++) { Start-Sleep -Milliseconds 500 }
+#
+# Wait for THE TOKEN, not for the file. The file now exists before the helper
+# ever runs whenever `allow` was answered above, so a Test-Path wait returned
+# at once and printed an empty token with a broken curl line beside it.
 $conf = $null
-try { $conf = Get-Content $cfg -Raw -ErrorAction Stop | ConvertFrom-Json } catch { }
+for ($i = 0; $i -lt 20; $i++) {
+    try { $conf = Get-Content $cfg -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $conf = $null }
+    if ($conf -and $conf.token) { break }
+    Start-Sleep -Milliseconds 500
+}
 $port = if ($conf -and $conf.port) { [int]$conf.port } else { 8090 }
 if (-not (Get-NetFirewallRule -DisplayName 'hqrestart' -ErrorAction SilentlyContinue)) {
     # only once: a re-install must not stack duplicate rules
@@ -77,6 +146,13 @@ $token = if ($conf) { $conf.token } else { $null }
 
 "installed. config: $cfg"
 "log:     $(Join-Path $dir 'hqrestart.log')"
+if ($current) {
+    "Lyrion:  $current can press Restart HQPlayer without a token"
+} else {
+    "Lyrion:  not set - the Bridge's Restart row will be refused."
+    if ($System) { "         run: .\install.ps1 -System -Allow <your Lyrion server IP>" }
+    else          { "         run: .\install.ps1 -Allow <your Lyrion server IP>" }
+}
 if ($token) {
     "token:   $token"
     "test:    curl -H `"Authorization: Bearer $token`" http://$($env:COMPUTERNAME):$port/status"

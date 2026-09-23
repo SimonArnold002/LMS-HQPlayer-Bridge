@@ -8,6 +8,10 @@
 #                           systemd system unit): the webhook runs as root
 #   ./install.sh --uninstall   (sudo ... --system --uninstall for the system one)
 #
+#   --allow <ip>            the Lyrion (LMS) server that may press Restart
+#                           without a token. Asked for interactively when it is
+#                           not given. Several may be listed, comma-separated.
+#
 # The script and its config are copied to a fixed place, so the repo checkout
 # can move. The token is printed at the end; it lives in hqrestart.json.
 set -e
@@ -23,19 +27,48 @@ import sys
 sys.exit(0 if sys.version_info >= (3, 7) else 1)
 PYEOF
 
-SYSTEM=0; UNINSTALL=0
-for a in "$@"; do
-  case "$a" in
-    --system) SYSTEM=1 ;;
+SYSTEM=0; UNINSTALL=0; ALLOW=''; ALLOW_GIVEN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --system)    SYSTEM=1 ;;
     --uninstall) UNINSTALL=1 ;;
-    *) echo "unknown option: $a" >&2; exit 2 ;;
+    --allow)     shift; [ $# -gt 0 ] || { echo "--allow needs an address" >&2; exit 2; }
+                 ALLOW="$1"; ALLOW_GIVEN=1 ;;
+    --allow=*)   ALLOW="${1#--allow=}"; ALLOW_GIVEN=1 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 if [ $SYSTEM = 1 ] && [ "$(id -u)" != 0 ]; then echo "--system needs sudo" >&2; exit 1; fi
+
+# ---------------------------------------------------------------------------
+# `allow` - read, validate and write it.
+#
+# This is the ONLY way the HQPlayer Bridge's Restart row can work: the Bridge
+# has no token to send, so the helper has to trust the Lyrion server by
+# address. It used to be a hand edit of the JSON, which meant a user installed
+# the helper, tapped Restart, and got a refusal with nothing to tell them why.
+# It is asked for here instead.
+# ---------------------------------------------------------------------------
+# Reading and writing that key is done by the helper itself (`--allow`), not
+# reimplemented here: one rule, one validator, and install.ps1 calls the same
+# one. It refuses a host name - `allow` is matched against the address a request
+# arrives from - and never rewrites a config that does not parse, because the
+# token lives in that file.
+read_allow() {
+  "$PY" "$SRC" --allow "$1" 2>/dev/null || true
+}
+
+write_allow() {
+  "$PY" "$SRC" --allow "$1" "$2"
+}
 
 OS="$(uname -s)"
 LABEL=com.hqrestart.webhook
 
+# Where everything lives, decided before anything is installed so the config
+# can be written BEFORE the helper first starts - it reads the file once, at
+# startup, so a config written afterwards would not take effect until a restart.
 if [ "$OS" = Darwin ]; then
   if [ $SYSTEM = 1 ]; then
     DIR="/Library/Application Support/hqrestart"
@@ -48,12 +81,72 @@ if [ "$OS" = Darwin ]; then
     DOMAIN="gui/$(id -u)"
     LOGF="$HOME/Library/Logs/hqrestart.log"
   fi
+elif [ "$OS" = Linux ]; then
+  if [ $SYSTEM = 1 ]; then
+    DIR=/etc/hqrestart
+    UNIT=/etc/systemd/system/hqrestart.service
+    SC="systemctl"; WANTED=multi-user.target
+  else
+    DIR="$HOME/.config/hqrestart"
+    UNIT="$HOME/.config/systemd/user/hqrestart.service"
+    SC="systemctl --user"; WANTED=default.target
+  fi
+else
+  echo "unsupported OS $OS - on Windows use install.ps1" >&2; exit 1
+fi
+
+CONF="$DIR/hqrestart.json"
+
+# Stop the running copy first, on both platforms, so the file it is holding can
+# be replaced and so an uninstall leaves nothing behind.
+if [ "$OS" = Darwin ]; then
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   if [ $UNINSTALL = 1 ]; then
     rm -f "$PLIST"; echo "removed $PLIST (config left in $DIR)"; exit 0
   fi
-  mkdir -p "$DIR" "$(dirname "$PLIST")"
-  cp "$SRC" "$DIR/hqrestart.py"
+else
+  $SC disable --now hqrestart.service 2>/dev/null || true
+  if [ $UNINSTALL = 1 ]; then
+    rm -f "$UNIT"; $SC daemon-reload; echo "removed $UNIT (config left in $DIR)"; exit 0
+  fi
+fi
+
+mkdir -p "$DIR"
+cp "$SRC" "$DIR/hqrestart.py"
+
+CURRENT="$(read_allow "$CONF")"
+
+# Ask, unless --allow said so already or there is no one to ask (piped input,
+# a provisioning script). Blank keeps whatever is there, so re-running the
+# installer to pick up a new helper version never silently drops the setting.
+if [ $ALLOW_GIVEN = 0 ] && [ -t 0 ]; then
+  echo ""
+  echo "The HQPlayer Bridge plugin adds a Restart HQPlayer row to Lyrion (LMS)."
+  echo "For it to work, this machine has to trust your Lyrion server's address."
+  echo ""
+  while true; do
+    if [ -n "$CURRENT" ]; then
+      printf "Lyrion server IP address [%s]: " "$CURRENT"
+    else
+      printf "Lyrion server IP address (press return to skip): "
+    fi
+    ANSWER=''
+    read -r ANSWER || ANSWER=''
+    [ -n "$ANSWER" ] || break
+    if write_allow "$CONF" "$ANSWER" >/dev/null; then
+      CURRENT="$(read_allow "$CONF")"
+      break
+    fi
+    echo "  try again, or press return to leave it unset."
+  done
+  echo ""
+elif [ $ALLOW_GIVEN = 1 ] && [ -n "$ALLOW" ]; then
+  write_allow "$CONF" "$ALLOW" >/dev/null || exit 1
+  CURRENT="$(read_allow "$CONF")"
+fi
+
+if [ "$OS" = Darwin ]; then
+  mkdir -p "$(dirname "$PLIST")"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -74,22 +167,8 @@ if [ "$OS" = Darwin ]; then
 </plist>
 EOF
   launchctl bootstrap "$DOMAIN" "$PLIST"
-elif [ "$OS" = Linux ]; then
-  if [ $SYSTEM = 1 ]; then
-    DIR=/etc/hqrestart
-    UNIT=/etc/systemd/system/hqrestart.service
-    SC="systemctl"; WANTED=multi-user.target
-  else
-    DIR="$HOME/.config/hqrestart"
-    UNIT="$HOME/.config/systemd/user/hqrestart.service"
-    SC="systemctl --user"; WANTED=default.target
-  fi
-  $SC disable --now hqrestart.service 2>/dev/null || true
-  if [ $UNINSTALL = 1 ]; then
-    rm -f "$UNIT"; $SC daemon-reload; echo "removed $UNIT (config left in $DIR)"; exit 0
-  fi
-  mkdir -p "$DIR" "$(dirname "$UNIT")"
-  cp "$SRC" "$DIR/hqrestart.py"
+else
+  mkdir -p "$(dirname "$UNIT")"
   cat > "$UNIT" <<EOF
 [Unit]
 Description=hqrestart - webhook that restarts HQPlayer
@@ -114,14 +193,44 @@ EOF
   $SC daemon-reload
   $SC enable --now hqrestart.service
   [ $SYSTEM = 1 ] || echo "note: for it to run while you are logged out: sudo loginctl enable-linger $(id -un)"
-else
-  echo "unsupported OS $OS - on Windows use install.ps1" >&2; exit 1
 fi
 
-# The token is generated on first start.
-i=0; while [ ! -s "$DIR/hqrestart.json" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
-TOKEN="$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['token'])" "$DIR/hqrestart.json" 2>/dev/null || true)"
-PORT="$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1])).get('port',8090))" "$DIR/hqrestart.json" 2>/dev/null || echo 8090)"
-echo "installed. config: $DIR/hqrestart.json"
-echo "token:   $TOKEN"
-echo "test:    curl -H 'Authorization: Bearer $TOKEN' http://$(hostname):$PORT/status"
+# The token is generated on the helper's FIRST START, so wait for THE TOKEN -
+# not for the file, which now exists already whenever `allow` was answered
+# above. Waiting on the file printed an empty token and a broken curl line.
+read_key() {
+  "$PY" -c "import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], sys.argv[3]))
+except Exception:
+    print(sys.argv[3])" "$CONF" "$1" "$2" 2>/dev/null || echo "$2"
+}
+
+i=0
+while [ $i -lt 20 ]; do
+  TOKEN="$(read_key token '')"
+  [ -n "$TOKEN" ] && break
+  sleep 0.5; i=$((i+1))
+done
+PORT="$(read_key port 8090)"
+
+# `--allow` has to be given the same way the helper was installed, or it writes
+# a config in the other location that this install never reads.
+SAME="$0"
+[ $SYSTEM = 1 ] && SAME="sudo $0 --system"
+
+echo "installed. config: $CONF"
+if [ -n "$TOKEN" ]; then
+  echo "token:   $TOKEN"
+else
+  echo "token:   not written yet - it is generated on the first start."
+  echo "         look in $CONF, or in the log, and check python3 is 3.7 or newer."
+fi
+if [ -n "$CURRENT" ]; then
+  echo "Lyrion:  $CURRENT can press Restart HQPlayer without a token"
+else
+  echo "Lyrion:  not set - the Bridge's Restart row will be refused."
+  echo "         run: $SAME --allow <your Lyrion server IP>"
+fi
+[ -n "$TOKEN" ] && echo "test:    curl -H 'Authorization: Bearer $TOKEN' http://$(hostname):$PORT/status"
+exit 0

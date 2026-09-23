@@ -569,15 +569,158 @@ try:
     ok(code != 401, 'a v4 client in `allow` is trusted through the mapped form (%s)' % code)
     ok(code != 501, 'and POST is still a method this handler knows (%s)' % code)
     # CONTROL: an address NOT in allow gets nothing without the token
+    logged()                                       # drain the request lines so far
     code, _ = call('http://[::1]:%d/restart' % port, 'POST',
                    {'Content-Type': 'application/json'}, b'{}')
     ok(code == 401, 'an address outside `allow` is refused (%s)' % code)
+
+    # A 401 alone tells the one person who can fix this nothing. The refused
+    # request CARRIES the address that would fix it, so the log must name it.
+    said = logged()
+    ok('not in "allow"' in said, 'and the log says WHY it was refused')
+    ok('--allow ::1' in said, 'naming the command that would fix it')
+
+    # CONTROL: a GET with a bad token is a bookmark typo or a scanner; it must
+    # not be told to add itself to `allow`.
+    logged()
+    code, _ = call('http://[::1]:%d/status' % port, 'GET', {'Authorization': 'Bearer wrong'})
+    ok('allow' not in logged(), 'a bad token on a GET gets no such advice (%s)' % code)
+
+    # CONTROL: one line per address per EXPLAIN_EVERY, so a scanner cannot fill
+    # the log with advice.
+    logged()
+    for _ in range(3):
+        call('http://[::1]:%d/restart' % port, 'POST',
+             {'Content-Type': 'application/json'}, b'{}')
+    ok(logged().count('not in "allow"') == 0, 'and it is not repeated for the same address')
+
+    # The advice must name the installer THIS machine has. Telling a Windows
+    # user to run install.sh is worse than saying nothing.
+    def advice(platform):
+        was = hq.PLATFORM
+        hq.PLATFORM = platform
+        hq.Handler.SAID.clear()                    # the throttle, not the subject here
+        try:
+            logged()
+            call('http://[::1]:%d/restart' % port, 'POST',
+                 {'Content-Type': 'application/json'}, b'{}')
+            return logged()
+        finally:
+            hq.PLATFORM = was
+
+    ok(lambda: './install.sh --allow' in advice('linux'), 'on Linux it names install.sh')
+    ok(lambda: 'install.ps1 -Allow' in advice('win32'), 'on Windows it names install.ps1')
+    ok(lambda: '--system' in advice('darwin') and '-System' in advice('win32'),
+       'and both say to add the service flag if HQPlayer runs as one')
+
+    # The throttle bounds the LOG. Nothing bounded the MAP, so one entry per
+    # distinct address accumulated for ever on a host anything scans.
+    def pruned():
+        hq.Handler.SAID.clear()
+        for i in range(50):                        # 50 addresses that have gone quiet
+            hq.Handler.SAID['10.0.0.%d' % i] = 0   # epoch: far older than EXPLAIN_EVERY
+        call('http://[::1]:%d/restart' % port, 'POST',
+             {'Content-Type': 'application/json'}, b'{}')
+        return hq.Handler.SAID
+
+    ok(lambda: len(pruned()) == 1, 'addresses that have gone quiet are dropped from the map')
+    ok(lambda: '10.0.0.0' not in hq.Handler.SAID, 'so it cannot grow without bound')
     code, _ = call('http://[::1]:%d/status' % port, 'GET', {'Authorization': 'Bearer tok'})
     ok(code == 200, 'and the token works over IPv6 (%s)' % code)
     code, _ = call('http://127.0.0.1:%d/status' % port, 'GET', {'Authorization': 'Bearer wrong'})
     ok(code == 401, 'a wrong token is refused (%s)' % code)
 finally:
     srv.shutdown(); srv.server_close()
+
+# ---------------------------------------------------------------------------
+# `allow`, as the installers set it. One validator, called by install.sh and
+# install.ps1 alike - three copies of this rule would drift.
+# ---------------------------------------------------------------------------
+print('== the installers\' --allow, which is the only way a user sets this')
+CONF = os.path.join(tmp, 'allow.json')
+
+# Every check is a CALLABLE, so a build without set_allow FAILS here rather
+# than killing the run - a control run that dies reports nothing at all.
+ok(lambda: hq.set_allow(CONF) == [], 'a config that does not exist yet reads as no addresses')
+ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'], 'one address is written')
+ok(lambda: hq.set_allow(CONF) == ['192.168.1.234'], 'and reads back')
+
+# The token is generated on the helper's FIRST START, which is after the
+# installer has written allow - so writing it must never lose the rest.
+def wrote(key, want):
+    json.dump({'token': 'keepme', 'port': 9999, 'allow': ['10.0.0.1']}, open(CONF, 'w'))
+    hq.set_allow(CONF, '192.168.1.234, 10.0.0.5 10.0.0.5')
+    return json.load(open(CONF)).get(key) == want
+
+ok(lambda: wrote('token', 'keepme'), 'an existing token SURVIVES the write')
+ok(lambda: wrote('port', 9999), 'and so does every other key')
+ok(lambda: wrote('allow', ['192.168.1.234', '10.0.0.5']),
+   'commas and spaces both separate, and a repeat is dropped')
+
+# `allow` is matched against the address a request ARRIVES FROM, so a name can
+# never match. Refusing it while the user is still at the prompt beats logging
+# it at the next start, which is where round 20 left it.
+def refuses(raw):
+    try:
+        hq.set_allow(CONF, raw); return False
+    except ValueError:
+        return True
+
+ok(lambda: refuses('nuc.local'), 'a host name is refused, not written')
+ok(lambda: refuses('192.168.1'), 'and so is a half-written address .NET would read as 192.0.0.1')
+ok(lambda: refuses('192.168.1.234 nuc.local'), 'one bad entry refuses the whole list')
+ok(lambda: json.load(open(CONF)).get('allow') == ['192.168.1.234', '10.0.0.5'],
+   'and a refusal leaves the previous value alone')
+
+# The token lives in this file. A config a user has broken with a stray comma
+# must never be rewritten from under them.
+open(CONF, 'w').write('{"token": "keepme",}')
+ok(lambda: refuses('192.168.1.234'), 'a config that does not PARSE is refused')
+ok(lambda: open(CONF).read() == '{"token": "keepme",}', 'and is left exactly as it was')
+
+# ---------------------------------------------------------------------------
+# The installer's closing report. `allow` is now written BEFORE the helper ever
+# starts, so the file EXISTS with no token in it - and both installers used to
+# treat "the file is there" as "the token has been generated".
+# ---------------------------------------------------------------------------
+print('== install.sh reports the token honestly, now that the file predates it')
+INST = os.path.join(_here, 'hqrestart', 'install.sh')
+src = open(INST).read()
+body = src[src.index('# The token is generated'):]
+
+def report(conf_json, system=0, current='192.168.1.234'):
+    """Run the REAL tail of install.sh against a config we control."""
+    c = os.path.join(tmp, 'report.json')
+    open(c, 'w').write(conf_json)
+    sh = os.path.join(tmp, 'tail.sh')
+    open(sh, 'w').write('set -e\nPY=python3\nCONF=%s\nSYSTEM=%d\nCURRENT=%s\n%s'
+                        % (c, system, current or "''", body))
+    # REAL_POPEN, not subprocess.run: the suite stubs Popen on that same module
+    # object, so run() would hand this the recording stub.
+    pr = REAL_POPEN(['sh', sh], stdout=hq.subprocess.PIPE, stderr=hq.subprocess.STDOUT,
+                    universal_newlines=True)
+    out, _ = pr.communicate(timeout=60)
+    return out
+
+# THE BUG: allow answered at the prompt, helper not yet started.
+no_token = report('{"allow": ["192.168.1.234"]}')
+ok('token:   not written yet' in no_token, 'a config without a token says so')
+ok('Bearer \'' not in no_token and 'Bearer "' not in no_token,
+   'and prints no curl line with an empty Bearer in it')
+
+# CONTROL: once the helper HAS written it, the token and the test line appear.
+ready = report('{"token": "abc123", "port": 8091, "allow": ["192.168.1.234"]}')
+ok('token:   abc123' in ready, 'a config WITH a token prints it')
+ok('Bearer abc123' in ready and ':8091/status' in ready,
+   'and the curl line carries the token and the configured port')
+
+# `--allow` must be given the way the helper was installed, or it writes a
+# config in the other location that this install never reads.
+sys_hint = report('{"token": "abc123"}', system=1, current='')
+ok('sudo' in sys_hint and '--system --allow' in sys_hint,
+   'a system install tells you to re-run it with sudo and --system')
+user_hint = report('{"token": "abc123"}', system=0, current='')
+ok('sudo' not in user_hint, 'and a user install does not')
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)

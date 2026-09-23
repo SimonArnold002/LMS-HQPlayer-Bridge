@@ -2359,10 +2359,12 @@ one; corrected the same day, with the reason in the code.)
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (863 assertions) and the helper's Python suite
-(119), checks `install.sh` parses, parses every piece of the helper's PowerShell
-with `pwsh` (18; skipped without it), and sweeps called-vs-defined subs. Counts
-as of review round 25; they move every round, and the run prints them.
+tree, runs the five Perl suites (864 assertions) plus the live page EXECUTED
+under osascript (15, run from `t_live.pl` and skipped out loud without it) and
+the helper's Python suite (146), checks `install.sh` parses,
+parses every piece of the helper's PowerShell with `pwsh` (18; skipped without
+it), and sweeps called-vs-defined subs. Counts as of 2026-09-23; they move every
+round, and the run prints them.
 
 | file | covers |
 |---|---|
@@ -2373,7 +2375,7 @@ as of review round 25; they move every round, and the run prints them.
 | `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
 | `t_powershell.py` | every piece of PowerShell the helper ships - `install.ps1` and each command `hqrestart.py` BUILDS, fed a quote in a path and a service name - PARSED by `pwsh` (PARSE ONLY: macOS pwsh has no CIM/`Restart-Service`), plus a refusal of PowerShell-7-only syntax (Windows ships 5.1). Skips, saying so, without `pwsh` |
-| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS/Windows), config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket |
+| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS/Windows), config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log) |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
 one, so hash-slot mistakes fail here rather than on the server.
@@ -5223,6 +5225,83 @@ button reached through `parentNode`); it is now permanent.
 **Trap met while writing it:** the idle panel HIDES its title in CSS rather than clearing the
 text, so asserting on `np-title` read a stale string from the previous instance. The test asks
 which CARD is marked instead - the thing a user actually sees.
+
+## HELPER 2026-09-23: `allow` is asked for at install time, not hand-edited
+
+**Zip UNCHANGED at 1.0.15** - the helper is not in it, so nothing is rebuilt and no version
+moves. `tools/hqrestart/` only.
+
+**Simon: "this needs to be simpler cant ask users to edit files, needs to be inputted when
+installing."** He is right, and the gap was worse than awkward. `allow` is the ONLY thing that
+makes the Bridge's Restart row work - the Bridge holds no token, so the helper has to trust
+Lyrion by address - and **the installers never mentioned it**. They printed the token and a
+`curl` line and stopped. So the shipped experience was: install the helper, see the Restart row
+appear in LMS, tap it, get a 401, and find the explanation only part-way down a README. Every
+round from 6 to 25 hardened what happens when a restart goes wrong; nobody had checked whether
+a user could turn it on at all.
+
+**Now the installer asks**, before the service starts (the helper reads its config once, at
+startup, so a config written afterwards would not take effect until a restart):
+
+```
+The HQPlayer Bridge plugin adds a Restart HQPlayer row to Lyrion (LMS).
+For it to work, this machine has to trust your Lyrion server's address.
+
+Lyrion server IP address (press return to skip):
+```
+
+`--allow <ip>` / `-Allow <ip>` answers it without the prompt, for a re-run or a provisioning
+script, and the prompt is skipped entirely when stdin is not a terminal so a piped install
+cannot hang. **Blank KEEPS whatever is already set** - re-running the installer to pick up a new
+helper version must never silently drop it - and the closing line now states the outcome either
+way (`Lyrion:  192.168.1.234 can press Restart HQPlayer without a token`, or `not set - the
+Bridge's Restart row will be refused` plus the command that fixes it).
+
+**THE VALIDATION LIVES IN THE HELPER, NOT IN THE INSTALLERS.** `hqrestart.py --allow <config>
+[addresses]` reads or writes that one key and exits; `install.sh` and `install.ps1` both shell
+out to it. The first cut had the rule written three times - a Python heredoc in the shell
+script, a second copy embedded in the PowerShell, and `_coerce` at load - which is the shape
+this repo keeps paying for. One carrier, one validator.
+
+It refuses rather than writes, naming the address, so an installer can say which entry was
+wrong **while the user is still sitting there**:
+
+* **a host name is refused.** `allow` is matched against the address a request ARRIVES FROM, so
+  a name can never match. Round 20 logged this at the next start, where nobody reads it.
+* **`192.168.1` is refused.** .NET's `IPAddress.Parse` silently turns that into **192.0.0.1** on
+  Windows PowerShell - which is why the PowerShell path calls Python instead of `[ipaddress]`.
+* **a config that does not PARSE is never rewritten.** The token is in that file; replacing it
+  would break every bookmark for a stray comma.
+
+**And a refusal now says what would fix it.** `explain_refusal` logs, once per address per
+`EXPLAIN_EVERY` (60s), `refused a restart from <ip>: that address is not in "allow". If <ip> is
+your Lyrion server, run install.sh --allow <ip> on this machine.` Only for a request that LOOKS
+like the Bridge (a JSON POST) - a GET with a wrong token is a bookmark typo or a scanner, and
+neither wants that advice. The in-`allow`-but-wrong-`Host` case (round 4's DNS-rebinding guard)
+gets its own line, because it is the far less obvious half.
+
+**Tested:** 16 assertions added to `t_hqrestart.py`, **13 FAIL against HEAD** (27 and 146 after round 26 below). The
+refusal lines are asserted against the REAL SOCKET the suite already stands up, not by grepping
+the source. Controls: a bad token on a GET gets no such advice, and the advice is not repeated
+for the same address. **The prompt itself was driven over a real pty** (`pty.fork`, not `script`,
+which does not feed a heredoc through): a good address, a bad one re-asking then accepted, a
+re-install pressing return (file left byte-identical, token intact), and a re-install changing
+it. Non-interactive stdin does not prompt and does not abort under `set -e`.
+
+**The harness trap, again.** The new checks were first written as direct calls, so the control
+run against HEAD **died on the first `AttributeError` and reported nothing** - the exact thing
+`ok()` takes a callable to prevent, and the reason it does. A control run that dies is not a
+control run. Every check in that section is a lambda now.
+
+**Windows remains harness-only for behaviour.** `install.ps1` parses under `pwsh` and uses no
+PowerShell-7-only syntax (both asserted), and it now calls the same validator, but nothing here
+has run it on Windows.
+
+**REVIEW ROUND 26 (2026-09-23, /code-review over the uncommitted helper change), 6 findings, all VERIFIED then FIXED. Four of them are ONE mistake, and it is the mistake this change made possible.** Writing `allow` at install time means **the config file now exists BEFORE the helper has ever run** - and both installers still used the file's EXISTENCE as the proxy for "the token has been generated". (1) `install.sh`'s `while [ ! -s "$CONF" ]` returned at once, so a first install printed `token:` with nothing after it and `curl -H 'Authorization: Bearer '` - reproduced exactly. It now waits for the TOKEN, and says plainly when there is not one yet instead of printing an empty line and a broken command. (2) `install.ps1` had the same wait on `Test-Path $cfg` with the same result, so **every good first install ended on the "has not written its config yet / check Python is on PATH" warning**. (3) The "not set" hint printed `$0 --allow <ip>` with no `--system`/`sudo`: following it on a system install writes a config in the OTHER location, which that helper never reads, and starts a second helper that dies on EADDRINUSE. Both installers now echo back the way they were invoked. (4) `install.ps1` had no non-interactive guard where `install.sh` has `[ -t 0 ]` - and **`Read-Host` THROWS under `-NonInteractive`** (measured), *after* line 21 has already unregistered the scheduled task, so a provisioning run would be left with no helper at all. Now caught, and it says it is skipping. (5) The refusal advice hard-coded `install.sh --allow`, telling a Windows user to run a script they do not have; it reads `PLATFORM` now and names the service flag too. (6) `Handler.SAID` was never pruned - the throttle bounds the LOG, as its comment said, but nothing bounded the MAP, so one entry per distinct address accumulated for ever on a host anything scans. Entries older than the throttle have nothing left to suppress and are dropped.
+
+11 assertions added (146 total). **Controls run both ways:** against a helper with only findings 5 and 6 reverted, 5 FAIL; against the `install.sh` tail exactly as the reviewer read it, both installer assertions FAIL (`token:   ` empty, `Bearer '` present). The installer assertions RUN THE REAL TAIL of `install.sh` in a subshell against a config the test controls, rather than grepping it - and they use `REAL_POPEN`, because the suite stubs `Popen` on that same module object and `subprocess.run` would otherwise be handed the recording stub. The PowerShell prompt was driven under `pwsh -NonInteractive` (skips, exit 0) and with a piped answer (takes it).
+
+**The general shape, and it is the third time in this file:** a change that makes a file exist EARLIER breaks every reader that used the file's existence to mean something else. The four readers here were all written when the config could only appear one way.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 
