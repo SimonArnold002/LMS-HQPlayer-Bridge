@@ -170,6 +170,8 @@ Shaper             TPDF
 Processing speed   30.3x realtime
 ```
 
+**With more than one HQPlayer,** a row of names appears above the panel and you tap the one you want to see and control. **Auto**, the default, follows whichever instance is playing. Your choice is remembered in that browser, and a dot marks any instance that is playing but not currently shown. Every instance's signal path is listed below either way.
+
 HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.
 
 **The Apps entry** behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's **settings** — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport **id**, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.

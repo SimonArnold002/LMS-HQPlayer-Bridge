@@ -2370,6 +2370,7 @@ as of review round 25; they move every round, and the run prints them.
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper) |
+| `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
 | `t_powershell.py` | every piece of PowerShell the helper ships - `install.ps1` and each command `hqrestart.py` BUILDS, fed a quote in a path and a service name - PARSED by `pwsh` (PARSE ONLY: macOS pwsh has no CIM/`Restart-Service`), plus a refusal of PowerShell-7-only syntax (Windows ships 5.1). Skips, saying so, without `pwsh` |
 | `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS/Windows), config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket |
@@ -5184,6 +5185,44 @@ The Apps feed gains a **Restart *name*** row per HQPlayer whose host runs `tools
 **REVIEW ROUND 24 (2026-09-21, /code-review over the 25 unpushed commits), 2 findings, both VERIFIED then FIXED, helper only.** (1) **Nothing checked the forced kill WORKED, so a restart could start a SECOND HQPlayer.** `stop_app` sent `taskkill /F` / SIGKILL, slept 1s and returned, and `restart()` then started a new copy regardless. Windows reaches it outright: `taskkill /F` answers Access denied for an elevated HQPlayer, and the owner check does not refuse an owner it cannot read. Windows had a second route: `alive()` read a FAILED `tasklist` (rc 127, empty output since round 20) as "gone". POSIX reaches it only via a process stuck in the kernel. Two copies both want port 4321. Now `stop_app` polls for up to `KILL_WAIT` (3s) after the kill and, if the process is still there, raises "HQPlayer (pid N) would not stop, so it was left running rather than started a second time"; a failed `tasklist` reads as ALIVE. `may_signal`'s comment ("taskkill reports its own failure") was the defect in prose - nothing read that report - and now says where it is checked. (2) **Pinning `service` switched off the user/system detection:** `detect_linux` only read the cgroup inside `if not unit:`, so a pinned user unit with `user_service` unset got a system `systemctl restart` ("Unit not found" every time; fails closed). The cgroup is now read regardless, and `/user@` decides `user` whenever `user_service` is unset; an explicit `user_service` still wins. The not-running path (`pinned_how`) has no process to read, so the README row now says to set `user_service` for a user unit. 8 assertions (119 Python), incl. controls (a stop that worked returns; an explicit `user_service` wins); 4 FAIL against round 23. `REAL_STOP_APP` pinned in the suite: `setup()` stubs `stop_app` and never restores it - the round-8 leak class again, caught before it bit this time.
 
 **REVIEW ROUND 25 (2026-09-21, /code-review over the uncommitted round-24 changes): NO FINDINGS.** Cleared, so the next round need not re-derive them: the `KILL_WAIT` (3s) poll only runs after a FAILED kill and still fits inside the 10s between the `total_timeout` warning (110s) and `BRIDGE_WAIT` (120s); a failed `tasklist` reading ALIVE sends the polite-stop loop to `stop_timeout`, the forced kill, and the same refusal - never a second copy; an empty or unreadable cgroup with a pinned unit behaves as before (system). **Considered and NOT a finding:** `kill(pid, 0)` reports a ZOMBIE that is not the helper's own child as alive, so an HQPlayer whose parent never reaps it would now be refused after SIGKILL where it was restarted before. No launcher that does this was named - launchd, systemd and shells all reap - so re-raise only with a real one.
+
+**PARKED 2026-09-21, Simon: "lets leave it" - a Restart button on the Live View page, and the question it raised.** Scoped, not built: a `hqplayerbridge restart <bridge id>` command sharing `_restartNow`'s POST, a `restartable` flag on the `signalpath` poll, a confirm-then-restart button on the card (addressed by id, so no positional problem). **The design point, VERIFIED in LMS 9.1 source:** `Slim/Web/HTTP.pm` `processURL` turns `?p0=..&p1=..` query params on any web page into `executeRequest`, gated only by `csrfProtectionLevel` (default 0), so an LMS command is reachable by a plain GET from any page on the LAN; LMS sends CORS headers only for `corsAllowedHosts` (default empty), so a per-page nonce from `signalpath` would stop that. **UNVERIFIED, raised by the same reading:** the existing Apps row may be reachable the same way - `hqplayerbridge items ... item_id:<restart row>.0` via a GET - with LMS then sending the JSON POST from its own (allowed) address, which the round-1 JSON-POST rule does not stop. Not measured (a probe of the harmless confirm level would settle it). It is the same class as every LMS command with CSRF off. Parked with the button; re-raise with a measurement.
+
+## 1.0.15 (2026-09-22, built 00:10 on 09-23): the live page drives ONE instance - now you can choose which
+
+**Reported by a user running THREE instances** (Simon, 2026-09-22): the page showed one of
+them and the other two could only be watched in the cards below. The cause is one rule:
+`pick()` took the first bridge that was PLAYING, else the first with a player at all, and
+nothing could change that.
+
+A chooser now sits above the panel, drawn only when more than one instance HAS A PLAYER (one
+is not a choice). `SEL` is a **playerid**, or null for **AUTO** - the original rule, still the
+default, so a one-instance user sees no change at all. It is kept in `localStorage`
+(`hqplive::player`), wrapped both ways because the accessor THROWS in some privacy modes.
+A chip click switches the panel IMMEDIATELY off the last payload (`LAST`) rather than at the
+next poll - a second of the old instance's track under a chip that has already moved reads as
+a control that did not take. A selected instance that leaves discovery FALLS BACK to auto and
+is selected again if it returns; `SEL` is kept, not cleared. The selected instance's card is
+marked (`.card.sel`), and a chip carries a dot while its instance is playing, so the one you
+are not watching can still be seen to be busy. One listener on the row, not one per chip -
+the row is rewritten whenever it changes and a per-chip listener would go with it.
+Server side UNCHANGED: `signalpath` already sends `name`, `playerid` and the `np_*` fields.
+
+**THE PAGE IS NOW EXECUTED IN THE SUITE, not just grepped** (`tools/t_live_page.js`, run from
+`t_live.pl`): a DOM shim plus JavaScriptCore via `osascript`, because there is no node on this
+Mac; SKIPPED out loud where there is no osascript. 15 assertions drive the real page - the
+chooser appearing only above one instance, Auto following the playing one, a chip switching
+the panel at once, the choice surviving a poll, a chosen instance going away and coming back,
+and back to Auto. **Control: rendered against HEAD's `Live.pm` it throws** (no `#pick`), which
+the runner reports as a failure with its message rather than crashing with no tally, so
+t_live.pl sees 0 passed / 1 failed. **The harness deliberately auto-vivifies NOTHING**:
+`getElementById` answers only ids the served markup carries (`learn()`), so a typo'd id is a
+null, not a silent pass. Earlier ad-hoc runs of this kind found a real defect (0.2.69's mute
+button reached through `parentNode`); it is now permanent.
+
+**Trap met while writing it:** the idle panel HIDES its title in CSS rather than clearing the
+text, so asserting on `np-title` read a stale string from the previous instance. The test asks
+which CARD is marked instead - the thing a user actually sees.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 

@@ -116,6 +116,8 @@ sub _page {
         voldn      => cstring( $c, 'PLUGIN_HQPLAYER_CTL_VOLDN' ),
         volup      => cstring( $c, 'PLUGIN_HQPLAYER_CTL_VOLUP' ),
         waiting    => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_WAITING' ),
+        auto       => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_AUTO' ),
+        controls   => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_CONTROLS' ),
     );
 
     $_ = _esc($_) for values %L;
@@ -256,6 +258,26 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
 .k { color: var(--dim); flex: 0 0 clamp(120px, 12vw, 168px); }
 .v { flex: 1 1 auto; word-break: break-word; }
 .name { font-weight: 600; font-size: 1.08em; margin-bottom: 6px; }
+
+/* WHICH HQPLAYER THE PANEL BELOW IS DRIVING. Drawn only when more than one
+   instance has a player - one instance has nothing to choose between, and a
+   single chip reading its own name is noise. The chips wrap, so three long
+   names do not push the row off a phone. */
+.pick { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.pick.hidden { display: none; }
+.pick .lbl { color: var(--dim); font-size: 0.86em; }
+.chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: 14px;
+        background: var(--card); color: var(--fg); font: inherit; font-size: 0.92em;
+        cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip.on { border-color: var(--accent); color: var(--accent); }
+/* A dot on the chip of an instance that is PLAYING, so the one you are not
+   watching can still be seen to be busy. */
+.chip .pdot { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+              background: var(--ok); margin-left: 6px; vertical-align: middle; }
+/* The selected instance's own card, so the panel and the card below agree. */
+.card.sel { border-color: var(--accent); }
 .ok { color: var(--ok); } .bad { color: var(--bad); }
 .foot { color: var(--dim); font-size: 0.86em; display: flex; gap: 10px; align-items: center; }
 .top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
@@ -419,6 +441,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
   <button id="back" type="button">$L{back}</button>
 </div>
 
+<div id="pick" class="pick hidden"></div>
 <div id="np" class="hidden"></div>
 <div id="cards"><div class="card"><div class="v">$L{waiting}</div></div></div>
 
@@ -451,7 +474,9 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         volume:     "$L{volume}",
         voldn:      "$L{voldn}",
         volup:      "$L{volup}",
-        waiting:    "$L{waiting}"
+        waiting:    "$L{waiting}",
+        auto:       "$L{auto}",
+        controls:   "$L{controls}"
     };
     var cards = document.getElementById('cards');
     var npEl  = document.getElementById('np');
@@ -534,6 +559,30 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     // ---------------------------------------------------------------------
     var el   = null;   // the panel's elements, once built
     var CUR  = null;   // the bridge the controls are addressed to
+
+    // WHICH INSTANCE THE PANEL DRIVES, when there is more than one.
+    //
+    // Until 1.0.15 there was no choice: pick() took the first bridge that was
+    // playing, so with three instances the other two could only be watched in
+    // the cards below - reported by a user running three. SEL is a playerid,
+    // or null for AUTO, which is that original behaviour and stays the default.
+    //
+    // It is kept in localStorage: a per-viewer convenience, NOT state the
+    // server owns. Both directions are wrapped - the accessor THROWS in some
+    // privacy modes, and a page that cannot remember a choice must still work.
+    var SELKEY = 'hqplive::player';
+    var SEL    = null;
+    var LAST   = [];   // the newest loop, so a chip can switch without waiting for the next poll
+
+    try { SEL = window.localStorage.getItem(SELKEY) || null; } catch (e) { SEL = null; }
+
+    function remember(id) {
+        SEL = id || null;
+        try {
+            if (SEL) { window.localStorage.setItem(SELKEY, SEL); }
+            else     { window.localStorage.removeItem(SELKEY); }
+        } catch (e) { /* private mode: the choice lasts this page load */ }
+    }
 
     // MATERIAL'S EMBLEM TABLE, FETCHED RATHER THAN COPIED.
     //
@@ -757,17 +806,83 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         cmd(['mixer', 'volume', (dir > 0 ? '+' : '-') + VOLSTEP]);
     }
 
-    // WHO THE CONTROLS TALK TO. The playing bridge if there is one, otherwise
-    // the first bridge that has a player at all - which is what keeps the
-    // volume reachable while the queue is stopped.
+    // WHO THE CONTROLS TALK TO. A chosen instance if it is still here, else
+    // AUTO: the playing bridge if there is one, otherwise the first bridge that
+    // has a player at all - which is what keeps the volume reachable while the
+    // queue is stopped.
+    //
+    // A CHOICE THAT IS NO LONGER THERE FALLS BACK, IT DOES NOT BLANK THE PAGE.
+    // An instance can leave discovery (switched off, moved, renamed), and a
+    // panel showing nothing would look like the page had broken. SEL is kept
+    // rather than cleared, so the same instance coming back is selected again.
     function pick(loop) {
         var i, idle = null;
+        if (SEL) {
+            for (i = 0; i < loop.length; i++) {
+                if (loop[i].playerid === SEL) { return loop[i]; }
+            }
+        }
         for (i = 0; i < loop.length; i++) {
             if (loop[i].np_title && loop[i].playerid) { return loop[i]; }
             if (!idle && loop[i].playerid) { idle = loop[i]; }
         }
         return idle;
     }
+
+    // THE CHOOSER. Rebuilt only when it would differ, for the same reason the
+    // cards are: an innerHTML rewrite once a second drops focus and any
+    // selection inside it.
+    var pickEl   = document.getElementById('pick');
+    var lastPick = null;
+
+    function renderPick(loop) {
+        var i, b, html = '', n = 0;
+
+        for (i = 0; i < loop.length; i++) { if (loop[i].playerid) { n++; } }
+
+        // One instance is not a choice, and no instance has nothing to choose.
+        if (n < 2) {
+            if (lastPick !== '') { lastPick = ''; pickEl.innerHTML = ''; pickEl.className = 'pick hidden'; }
+            return;
+        }
+
+        html += '<span class="lbl">' + esc(L.controls) + '</span>';
+        html += '<button type="button" class="chip' + (SEL ? '' : ' on') +
+                '" data-id="">' + esc(L.auto) + '</button>';
+        for (i = 0; i < loop.length; i++) {
+            b = loop[i];
+            if (!b.playerid) { continue; }
+            html += '<button type="button" class="chip' +
+                    (SEL === b.playerid ? ' on' : '') + '" data-id="' + esc(b.playerid) + '">' +
+                    esc(b.name || b.id || '') +
+                    (b.np_state === 'playing' ? '<span class="pdot"></span>' : '') +
+                    '</button>';
+        }
+
+        if (html !== lastPick) {
+            lastPick = html;
+            pickEl.innerHTML = html;
+            pickEl.className = 'pick';
+        }
+    }
+
+    // ONE LISTENER ON THE ROW, not one per chip: the row is rewritten whenever
+    // it changes, and a listener bound to a chip would go with it.
+    pickEl.addEventListener('click', function (ev) {
+        var t = ev.target;
+        while (t && t !== pickEl && !(t.className && String(t.className).indexOf('chip') >= 0)) {
+            t = t.parentNode;
+        }
+        if (!t || t === pickEl) { return; }
+
+        remember(t.getAttribute('data-id'));
+        // Switch NOW rather than at the next poll: a second of the old
+        // instance's track under a chip that has already moved reads as a
+        // control that did not take.
+        update(pick(LAST));
+        renderPick(LAST);
+        render(LAST);
+    });
 
     // A COMMAND MUST NOT BE UNDONE BY THE NEXT POLL. The server takes a moment
     // to apply a volume change, so a reply that is already in flight still
@@ -914,7 +1029,8 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             for (var i = 0; i < loop.length; i++) {
                 var b = loop[i];
                 var connected = b.connected && b.connected.indexOf('-') > 0;
-                html += '<div class="card">';
+                html += '<div class="card' +
+                        ((CUR && b.playerid && b.playerid === CUR.playerid) ? ' sel' : '') + '">';
                 html += '<div class="name">' + esc(b.name || b.id || '') + '</div>';
                 html += row(L.status,     b.connected, connected ? 'ok' : 'bad');
                 html += row(L.source,     b.source);
@@ -1017,7 +1133,11 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
                 // Nothing is wrong there: the poll answered, and the answer is
                 // that the player has not turned up yet. Say exactly that.
                 var loop = r.bridges_loop || [];
+                LAST = loop;
+                // update() FIRST: it sets CUR, and render() marks that bridge's
+                // card as the selected one.
                 update(pick(loop));
+                renderPick(loop);
                 render(loop);
                 done(true);
             } catch (e) {

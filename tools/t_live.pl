@@ -739,5 +739,42 @@ print "-- nowPlayingFor: the resolution the server does --\n";
     $Slim::Control::Request::ERROR = 0;
 }
 
+# ---------------------------------------------------------------------------
+# THE PAGE, EXECUTED - not grepped.
+#
+# Everything above asserts against the served bytes, which can say a function
+# is there and nothing about what it DOES. `t_live_page.js` runs this very page
+# under a DOM shim and drives it: three instances, choosing one, a choice that
+# goes away and comes back. A logic defect fails here instead of arriving as a
+# screenshot.
+#
+# JavaScriptCore via osascript, because there is no node on this Mac - so it is
+# SKIPPED, out loud, anywhere without it rather than failing the run.
+print "\n-- the page, executed against a three-instance payload --\n";
+{
+    my $osa = `which osascript 2>/dev/null`; chomp $osa;
+
+    if ( !$osa ) {
+        print "  skip no osascript here - the page is only source-checked\n";
+    }
+    else {
+        my $page = ( $ENV{TMPDIR} || '/tmp' ) . "/hqp_live_page_$$.html";
+        open my $fh, '>', $page or die $!;
+        print $fh $SENT;
+        close $fh;
+
+        my @out = `$osa -l JavaScript t_live_page.js '$page' 2>&1`;
+        unlink $page;
+
+        print @out;
+        my ($p, $f) = ( join('', @out) =~ /(\d+) passed, (\d+) failed/ );
+        # A run that says nothing is a FAILURE, not a pass: that is how a
+        # harness that crashed on line one reports 0 failures.
+        ok( scalar( defined $p && $p > 0 && defined $f && $f == 0 ),
+            defined $f ? "the executed page: $p passed, $f failed"
+                       : 'the executed page reported nothing' );
+    }
+}
+
 printf "\n%d passed, %d failed\n", $pass, $fail;
 exit($fail ? 1 : 0);

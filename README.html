@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause, seek, set its volume and see its artwork from Material or any control point, while HQPlayer does the upsampling, filtering and modulation exactly as it always has.</p>
   <div class="badges">
-    <span class="badge accent">v1.0.14</span>
+    <span class="badge accent">v1.0.15</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -268,6 +268,7 @@ Output format      96000 Hz / 24 bit PCM
 Filter             poly-sinc-gauss-long
 Shaper             TPDF
 Processing speed   30.3x realtime</code></pre>
+<p><strong>With more than one HQPlayer,</strong> a row of names appears above the panel and you tap the one you want to see and control. <strong>Auto</strong>, the default, follows whichever instance is playing. Your choice is remembered in that browser, and a dot marks any instance that is playing but not currently shown. Every instance's signal path is listed below either way.</p>
 <p>HQPlayer reports the filter <em>really</em> in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.</p>
 <p><strong>The Apps entry</strong> behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's <strong>settings</strong> — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport <strong>id</strong>, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.</p>
 </section>
