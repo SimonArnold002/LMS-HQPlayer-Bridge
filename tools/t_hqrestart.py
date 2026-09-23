@@ -722,5 +722,88 @@ ok('sudo' in sys_hint and '--system --allow' in sys_hint,
 user_hint = report('{"token": "abc123"}', system=0, current='')
 ok('sudo' not in user_hint, 'and a user install does not')
 
+# ---------------------------------------------------------------------------
+# ThreadingHTTPServer runs each request on its own thread, and explain_refusal
+# prunes a SHARED map. Unlocked, a prune racing an insert raised "dictionary
+# changed size during iteration" (or a KeyError from two threads dropping the
+# same entry), so the refused request lost its 401. Measured against 5775983:
+# ~6,000 RuntimeErrors in one run of this. Driven on the REAL method.
+# ---------------------------------------------------------------------------
+print('== the refusal throttle is safe under concurrent requests')
+import contextlib, threading as _th
+
+def race():
+    lock = getattr(hq.Handler, 'SAID_LOCK', None)
+    class Fake:
+        command = 'POST'
+        SAID = hq.Handler.SAID
+        SAID_LOCK = lock
+        cfg = {'allow': []}
+        def __init__(self, ip):
+            self.client_address = (ip, 0)
+            self.headers = {'Content-Type': 'application/json'}
+        def direct_host(self):
+            return True
+    Fake.explain_refusal = hq.Handler.explain_refusal
+    errors = []
+    def worker(n):
+        for i in range(300):
+            # a stale entry to prune, seeded the way the server would: locked
+            with (lock or contextlib.nullcontext()):
+                hq.Handler.SAID['10.9.%d.%d' % (n, i % 250)] = 0
+            try:
+                Fake('10.%d.%d.%d' % (n, i // 250, i % 250)).explain_refusal()
+            except Exception as e:
+                errors.append(type(e).__name__)
+    was = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)                 # preempt often, as load would
+    try:
+        ts = [_th.Thread(target=worker, args=(n,)) for n in range(12)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+    finally:
+        sys.setswitchinterval(was)
+        hq.Handler.SAID.clear()
+    logged()
+    return errors
+
+ok(lambda: race() == [], 'twelve threads refusing at once raise nothing')
+
+# ---------------------------------------------------------------------------
+# A bad --allow on a RE-install. The running helper is stopped before the
+# address is checked, so `exit 1` there left it DOWN over a typo.
+# ---------------------------------------------------------------------------
+print('== a bad --allow does not leave the helper stopped')
+src = open(INST).read()
+fns = src[src.index('read_allow() {'):src.index('OS="$(uname -s)"')]
+blk = src[src.index('CURRENT="$(read_allow "$CONF")"'):]
+blk = blk[:blk.index('\nfi\n') + 4]
+
+def reinstall(allow):
+    c = os.path.join(tmp, 'reinstall.json')
+    open(c, 'w').write('{"token": "keepme", "allow": ["192.168.1.234"]}')
+    sh = os.path.join(tmp, 'reinstall.sh')
+    open(sh, 'w').write('set -e\nPY=python3\nSRC=%s\nCONF=%s\nUNINSTALL=0\nALLOW_GIVEN=1\nALLOW=%s\n%s%s\n'
+                        'echo "REACHED THE START, current=[$CURRENT]"\n'
+                        % (os.path.join(_here, 'hqrestart', 'hqrestart.py'), c, allow, fns, blk))
+    pr = REAL_POPEN(['sh', sh], stdin=hq.subprocess.DEVNULL, stdout=hq.subprocess.PIPE,
+                    stderr=hq.subprocess.STDOUT, universal_newlines=True)
+    out, _ = pr.communicate(timeout=60)
+    return pr.returncode, out, json.load(open(c))
+
+rc, out, conf = reinstall('192.168.1')
+# The fragment has to be given every variable the real script sets before it,
+# or it hits a shell error that lands in captured output nobody reads.
+ok('operator expected' not in out and 'not found' not in out,
+   'the fragment runs without a shell error')
+ok(rc == 0 and 'REACHED THE START' in out,
+   'a typo carries on to the start rather than exiting with the helper down (rc %s)' % rc)
+ok('not accepted' in out, 'and says the address was not accepted')
+ok(conf.get('allow') == ['192.168.1.234'] and conf.get('token') == 'keepme',
+   'and the previous address and the token both stand')
+
+# CONTROL: a good address on the same path is still written.
+rc, out, conf = reinstall('10.0.0.7')
+ok(rc == 0 and conf.get('allow') == ['10.0.0.7'], 'a good address is still written')
+
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)

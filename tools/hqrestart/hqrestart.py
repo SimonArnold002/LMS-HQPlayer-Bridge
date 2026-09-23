@@ -31,6 +31,14 @@ Host, which is what the Host rule refuses.
     POST /restart   {"ok", "old_pid", "new_pid", "mode", "how", "seconds"}
     GET  /restart   same, WITH the token, so a browser bookmark or phone shortcut works
 
+Run:
+    python3 hqrestart.py [config.json]      serve (the installers set this up)
+    python3 hqrestart.py --allow CONFIG     print the `allow` list
+    python3 hqrestart.py --allow CONFIG ADDRS
+                                            validate and write it, keeping every
+                                            other key; exits 1 naming a bad one.
+                                            install.sh and install.ps1 call this.
+
 Standard library only; Python 3.7+.
 """
 
@@ -753,6 +761,7 @@ class Handler(BaseHTTPRequestHandler):
     cfg = None
     lock = threading.Lock()
     SAID = {}           # address -> when it was last told why it was refused
+    SAID_LOCK = threading.Lock()   # requests run on their own threads
     server_version = 'hqrestart/1'
     timeout = 30        # a client that connects and sends nothing must not hold a thread
 
@@ -811,14 +820,19 @@ class Handler(BaseHTTPRequestHandler):
 
         who = self.client_address[0]
         now = time.time()
-        if now - self.SAID.get(who, 0) < EXPLAIN_EVERY:
-            return
-        # Bounded: one entry per address would otherwise grow for ever on a
-        # host that anything scans. An entry older than the throttle has
-        # nothing left to suppress, so it is simply dropped.
-        for addr in [a for a, t in self.SAID.items() if now - t >= EXPLAIN_EVERY]:
-            del self.SAID[addr]
-        self.SAID[who] = now
+        # Under the lock: ThreadingHTTPServer runs each request on its own
+        # thread, and pruning the map while another request inserts into it
+        # raised "dictionary changed size during iteration" (or a KeyError from
+        # two threads dropping the same entry) - so a refusal lost its 401.
+        with self.SAID_LOCK:
+            if now - self.SAID.get(who, 0) < EXPLAIN_EVERY:
+                return
+            # Bounded: one entry per address would otherwise grow for ever on a
+            # host that anything scans. An entry older than the throttle has
+            # nothing left to suppress, so it is simply dropped.
+            for addr in [a for a, t in self.SAID.items() if now - t >= EXPLAIN_EVERY]:
+                del self.SAID[addr]
+            self.SAID[who] = now
 
         if any(same_addr(who, a) for a in self.cfg['allow']):
             # In the list, so it was the Host header that failed - the other

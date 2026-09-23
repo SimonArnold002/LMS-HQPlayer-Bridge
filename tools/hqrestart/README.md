@@ -97,10 +97,22 @@ what the installers set up; neither has been run on a real Linux or Windows mach
 
 ## From LMS (HQPlayer Bridge)
 
-The Bridge needs no settings. When its control link to an HQPlayer comes up, it calls
-`http://<that HQPlayer>:8090/ping`, which needs no token. If that answers, the HQPlayer gets a
-**Restart *name*** row in the Bridge's Apps list, under HQPlayer Live View. The restart itself only works if the LMS
-server's address is in `allow`: the Bridge has no token to send.
+The Bridge needs no settings. It calls `http://<that HQPlayer>:8090/ping`, which needs no
+token, when its control link to an HQPlayer comes up, and again when you open its Apps list
+(at most once a minute per HQPlayer, so a helper installed later shows up on the next open). If
+that answers, the HQPlayer gets a **Restart *name*** row in the Bridge's Apps list, under
+HQPlayer Live View.
+
+The restart itself only works if the LMS server's address is in `allow` - the Bridge has no
+token to send - which is what the installer asks for. If it isn't, the row says
+**Restart failed: bad or missing token**, and the helper's log names the address it refused
+and the exact command that fixes it:
+
+```
+refused a restart from 192.168.1.234: that address is not in "allow". If 192.168.1.234 is your
+Lyrion server, run  ./install.sh --allow 192.168.1.234  on this machine (add --system if
+HQPlayer runs as a service).
+```
 
 **Why only a JSON POST gets in without the token.** Anything that can make the LMS
 server fetch a URL would otherwise restart HQPlayer as a GET. LMS's own image proxy fetches
@@ -194,3 +206,9 @@ Eversolo NAA reconnected. The same again from the HQPlayer Bridge's Restart row 
 playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux, Windows.
 Linux and Windows are covered by a test suite that fakes the OS, and every piece of PowerShell
 is checked to parse with `pwsh` - but neither has run on a real Linux or Windows machine.
+
+**The installers** are run end to end by the test suite with the service managers replaced by
+stubs: a fresh install, a typo in `--allow`, Ctrl-C at the prompt, no Python, a non-interactive
+run and an uninstall, each checked to leave the existing helper running where it should. **The
+install-time address prompt (2026-09-23) has not yet been run on a real install** - the helper
+installed on the test Mac predates it.

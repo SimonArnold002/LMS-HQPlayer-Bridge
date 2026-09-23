@@ -18,8 +18,17 @@ $task = 'hqrestart'
 if ($System) { $dir = Join-Path $env:ProgramData 'hqrestart' }
 else         { $dir = Join-Path $env:LOCALAPPDATA 'hqrestart' }
 
-Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
-if ($Uninstall) { "removed task $task (config left in $dir)"; return }
+$cfg = Join-Path $dir 'hqrestart.json'
+
+if ($Uninstall) {
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    "removed task $task (config left in $dir)"; return
+}
+
+# ASK FIRST, stop second. Everything that can throw or wait on the user - the
+# Python checks and the prompt below - runs while the existing task is still
+# registered. Unregistering first left NO helper at all for anyone who pressed
+# Ctrl-C at the prompt, or whose Python turned out missing or too old.
 
 $pyw = (Get-Command pythonw.exe -ErrorAction SilentlyContinue).Source
 $pyc = (Get-Command python.exe  -ErrorAction SilentlyContinue).Source
@@ -38,8 +47,6 @@ if ($ver -match '^(\d+)\.(\d+)' -and [version]"$($Matches[1]).$($Matches[2])" -l
 $py = if ($pyw) { $pyw } else { $pyc }
 
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'hqrestart.py') (Join-Path $dir 'hqrestart.py') -Force
-$cfg = Join-Path $dir 'hqrestart.json'
 
 # ---------------------------------------------------------------------------
 # `allow` - the ONLY way the HQPlayer Bridge's Restart row can work: the Bridge
@@ -55,7 +62,7 @@ $cfg = Join-Path $dir 'hqrestart.json'
 # IPAddress.Parse would silently turn into 192.0.0.1 on Windows PowerShell.
 # ---------------------------------------------------------------------------
 $pyForCfg = if ($pyc) { $pyc } else { $py }
-$helper = Join-Path $dir 'hqrestart.py'
+$helper = Join-Path $PSScriptRoot 'hqrestart.py'   # not yet copied into $dir at this point
 
 # Both are wrapped: $ErrorActionPreference is 'Stop' for the whole script, and a
 # native command that writes to stderr can surface as a terminating error in some
@@ -79,7 +86,7 @@ function Set-Allow([string]$value) {
 $current = Get-Allow
 if ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
     $written = Set-Allow $Allow
-    if ($null -eq $written) { Write-Warning "-Allow $Allow was not accepted; leaving it unset." }
+    if ($null -eq $written) { Write-Warning "-Allow $Allow was not accepted; leaving it as it was." }
     else { $current = $written }
 } elseif (-not $PSBoundParameters.ContainsKey('Allow')) {
     ''
@@ -89,9 +96,8 @@ if ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
     while ($true) {
         if ($current) { $prompt = "Lyrion server IP address [$current]" }
         else          { $prompt = 'Lyrion server IP address (press return to skip)' }
-        # Read-Host THROWS under -NonInteractive, and by here the scheduled task
-        # has already been unregistered - so an unguarded prompt would leave a
-        # provisioning run with no helper at all. install.sh guards with [ -t 0 ].
+        # Read-Host THROWS under -NonInteractive; a provisioning run must carry
+        # on without an answer, not abort. install.sh guards with [ -t 0 ].
         try { $answer = (Read-Host $prompt) } catch { '  (not interactive - skipping)'; break }
         if (-not $answer) { break }
         $written = Set-Allow $answer
@@ -100,6 +106,9 @@ if ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
     }
     ''
 }
+Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+Copy-Item (Join-Path $PSScriptRoot 'hqrestart.py') (Join-Path $dir 'hqrestart.py') -Force
+
 $action   = New-ScheduledTaskAction -Execute $py -Argument "`"$dir\hqrestart.py`" `"$cfg`"" -WorkingDirectory $dir
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)

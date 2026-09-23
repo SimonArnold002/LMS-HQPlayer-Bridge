@@ -13,7 +13,9 @@
 #                           not given. Several may be listed, comma-separated.
 #
 # The script and its config are copied to a fixed place, so the repo checkout
-# can move. The token is printed at the end; it lives in hqrestart.json.
+# can move. Everything that asks or can refuse runs BEFORE the old helper is
+# stopped, so Ctrl-C or a typo leaves it running. The token is printed at the
+# end once the helper's first start has written it; it lives in hqrestart.json.
 set -e
 
 SRC="$(cd "$(dirname "$0")" && pwd)/hqrestart.py"
@@ -97,29 +99,21 @@ fi
 
 CONF="$DIR/hqrestart.json"
 
-# Stop the running copy first, on both platforms, so the file it is holding can
-# be replaced and so an uninstall leaves nothing behind.
-if [ "$OS" = Darwin ]; then
-  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-  if [ $UNINSTALL = 1 ]; then
-    rm -f "$PLIST"; echo "removed $PLIST (config left in $DIR)"; exit 0
-  fi
-else
-  $SC disable --now hqrestart.service 2>/dev/null || true
-  if [ $UNINSTALL = 1 ]; then
-    rm -f "$UNIT"; $SC daemon-reload; echo "removed $UNIT (config left in $DIR)"; exit 0
-  fi
-fi
-
-mkdir -p "$DIR"
-cp "$SRC" "$DIR/hqrestart.py"
-
+# ASK FIRST, stop second. Everything that waits on the user, or can be
+# refused, happens while the running helper is still up: a prompt sitting
+# between the stop and the start left the helper DOWN for anyone who pressed
+# Ctrl-C or walked away from it. Writing the config while the old helper runs
+# is safe - it reads the file once, at its own startup, and the new one starts
+# after this is written.
+[ $UNINSTALL = 1 ] || mkdir -p "$DIR"
 CURRENT="$(read_allow "$CONF")"
 
 # Ask, unless --allow said so already or there is no one to ask (piped input,
 # a provisioning script). Blank keeps whatever is there, so re-running the
 # installer to pick up a new helper version never silently drops the setting.
-if [ $ALLOW_GIVEN = 0 ] && [ -t 0 ]; then
+if [ $UNINSTALL = 1 ]; then
+  :                                   # nothing to ask on the way out
+elif [ $ALLOW_GIVEN = 0 ] && [ -t 0 ]; then
   echo ""
   echo "The HQPlayer Bridge plugin adds a Restart HQPlayer row to Lyrion (LMS)."
   echo "For it to work, this machine has to trust your Lyrion server's address."
@@ -141,9 +135,33 @@ if [ $ALLOW_GIVEN = 0 ] && [ -t 0 ]; then
   done
   echo ""
 elif [ $ALLOW_GIVEN = 1 ] && [ -n "$ALLOW" ]; then
-  write_allow "$CONF" "$ALLOW" >/dev/null || exit 1
+  # Warn and carry on: a typo must not block an upgrade. A refused address
+  # changes nothing in the config, so the previous value stands and the
+  # closing line reports it. install.ps1 does the same.
+  if ! write_allow "$CONF" "$ALLOW" >/dev/null; then
+    echo "warning: --allow $ALLOW was not accepted; leaving it as it was." >&2
+  fi
   CURRENT="$(read_allow "$CONF")"
 fi
+
+# NOW stop the running copy - only after everything above has been asked and
+# checked - so its file can be replaced, and so an uninstall leaves nothing
+# behind. Nothing below this waits on the user.
+if [ "$OS" = Darwin ]; then
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  if [ $UNINSTALL = 1 ]; then
+    rm -f "$PLIST"; echo "removed $PLIST (config left in $DIR)"; exit 0
+  fi
+else
+  $SC disable --now hqrestart.service 2>/dev/null || true
+  if [ $UNINSTALL = 1 ]; then
+    rm -f "$UNIT"; $SC daemon-reload; echo "removed $UNIT (config left in $DIR)"; exit 0
+  fi
+fi
+
+mkdir -p "$DIR"
+cp "$SRC" "$DIR/hqrestart.py"
+
 
 if [ "$OS" = Darwin ]; then
   mkdir -p "$(dirname "$PLIST")"
