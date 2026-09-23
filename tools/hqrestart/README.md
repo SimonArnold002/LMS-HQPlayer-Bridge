@@ -175,6 +175,10 @@ up with "would not stop, so it was left running" rather than starting a second c
 its log to `hqrestart.log` next to its config. Opening the firewall port needs an admin
 PowerShell. Without it the installer warns you, and LMS may not be able to reach the helper.
 
+Setting your Lyrion server's address needs `python.exe` on PATH as well. If only `pythonw.exe`
+is there, the installer can't read or write `allow`: it warns you, leaves the setting as it is,
+and you add your Lyrion server to `"allow"` in `hqrestart.json` by hand, then re-run the installer.
+
 ## Linux notes
 
 Under systemd, a process the helper starts would otherwise stay in the helper's own cgroup.

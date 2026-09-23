@@ -223,11 +223,11 @@ function Get-NetFirewallRule { 'rule' }
 function New-NetFirewallRule { }
 '''
 
-def ps_env(with_python=True):
+def ps_env(with_python=True, exes=('python.exe', 'pythonw.exe')):
     local = tempfile.mkdtemp()
     stubs = tempfile.mkdtemp()
     if with_python:
-        for exe in ('python.exe', 'pythonw.exe'):
+        for exe in exes:
             p = os.path.join(stubs, exe)
             open(p, 'w').write('#!/bin/sh\nexec "%s" "$@"\n' % PY)
             os.chmod(p, 0o755)
@@ -275,6 +275,34 @@ else:
     rc, out = run_ps(ps, [], env, noninteractive=True, local=local)
     ok(rc == 0 and 'not interactive' in out and START in out,
        'under -NonInteractive the prompt is skipped and the install completes (rc %s)' % rc)
+
+    # pythonw.exe alone: it has no console, so `--allow` through it answers
+    # nowhere. The installer must leave `allow` alone and SAY so - not write
+    # blind, and not report a hand-edited value it never read as "not set".
+    # (The stub pythonw here DOES print, so a write through it would land -
+    # which is what makes the untouched config the evidence.)
+    env, local = ps_env(exes=('pythonw.exe',))
+    seed = {'token': 'keepme', 'allow': ['192.168.1.234']}
+    rc, out = run_ps(ps, ['-Allow', '10.0.0.9'], env, seed=seed, local=local)
+    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
+    ok(rc == 0 and START in out, 'pythonw.exe only: the install still completes (rc %s)' % rc)
+    ok('No python.exe on PATH' in out, 'and warns that the address cannot be set here')
+    ok(lambda: json.load(open(c)).get('allow') == ['192.168.1.234'],
+       'and leaves the existing allow list untouched')
+    ok('not checked' in out and 'not set' not in out,
+       'and the summary says unchecked, not unset')
+
+    env, local = ps_env(exes=('pythonw.exe',))
+    rc, out = run_ps(ps, [], env, noninteractive=False, local=local)
+    ok(rc == 0 and 'Lyrion server IP address' not in out and START in out,
+       'pythonw.exe only, interactive: no prompt it could not act on (rc %s)' % rc)
+
+    # control: python.exe present, the same call DOES write
+    env, local = ps_env()
+    rc, out = run_ps(ps, ['-Allow', '10.0.0.9'], env, seed=dict(seed), local=local)
+    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
+    ok(lambda: json.load(open(c)).get('allow') == ['10.0.0.9'] and 'No python.exe' not in out,
+       'control: with python.exe the same -Allow is written, with no warning')
 
     # The Python checks THROW. Before this change they ran after the unregister,
     # so a missing Python left no helper at all.

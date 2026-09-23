@@ -61,7 +61,12 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 # one. It also rejects a half-written address like "192.168.1", which .NET's
 # IPAddress.Parse would silently turn into 192.0.0.1 on Windows PowerShell.
 # ---------------------------------------------------------------------------
-$pyForCfg = if ($pyc) { $pyc } else { $py }
+# python.exe ONLY. pythonw.exe has no console, so the `--allow` answer and its
+# refusal text go nowhere, and a failed write looked the same as no answer. With
+# no python.exe the key is left alone and the user is told how to set it by hand.
+$pyForCfg = $pyc
+$noCfgPy = "No python.exe on PATH (only pythonw.exe), so the Lyrion address cannot be set here. " +
+           "Add it by hand: `"allow`": [`"<your Lyrion server IP>`"] in $cfg, then re-run this installer."
 $helper = Join-Path $PSScriptRoot 'hqrestart.py'   # not yet copied into $dir at this point
 
 # Both are wrapped: $ErrorActionPreference is 'Stop' for the whole script, and a
@@ -69,6 +74,7 @@ $helper = Join-Path $PSScriptRoot 'hqrestart.py'   # not yet copied into $dir at
 # hosts. Asking about `allow` must never be able to abort an otherwise good
 # install - the worst case here is that it stays unset and the closing line says so.
 function Get-Allow {
+    if (-not $pyForCfg) { return '' }
     try {
         $out = & $pyForCfg $helper --allow $cfg 2>$null
         if ($LASTEXITCODE -ne 0) { return '' }
@@ -84,7 +90,9 @@ function Set-Allow([string]$value) {
 }
 
 $current = Get-Allow
-if ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
+if (-not $pyForCfg) {
+    Write-Warning $noCfgPy
+} elseif ($PSBoundParameters.ContainsKey('Allow') -and $Allow) {
     $written = Set-Allow $Allow
     if ($null -eq $written) { Write-Warning "-Allow $Allow was not accepted; leaving it as it was." }
     else { $current = $written }
@@ -155,7 +163,10 @@ $token = if ($conf) { $conf.token } else { $null }
 
 "installed. config: $cfg"
 "log:     $(Join-Path $dir 'hqrestart.log')"
-if ($current) {
+if (-not $pyForCfg) {
+    # Unread, not unset: a hand edit made earlier may well be there.
+    "Lyrion:  not checked (no python.exe) - `"allow`" in $cfg must name your Lyrion server"
+} elseif ($current) {
     "Lyrion:  $current can press Restart HQPlayer without a token"
 } else {
     "Lyrion:  not set - the Bridge's Restart row will be refused."
