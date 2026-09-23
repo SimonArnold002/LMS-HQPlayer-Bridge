@@ -77,8 +77,8 @@ print "-- identity: stale addresses --\n";
 my $now = time();
 
 my $ghosted = $ids->([
-    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
-    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now },
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900, round => 1 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now,       round => 2 },
 ]);
 
 is($ghosted->{'10.0.0.7'}->{id}, $solo->{'10.0.0.5'}->{id},
@@ -91,28 +91,46 @@ ok(($ghosted->{'10.0.0.7'}->{name} || '') !~ /10\.0\.0\./,
 # CONTROL: the gate must not merge two instances that are both answering -
 # that is the case the address-qualifying branch exists for.
 my $both = $ids->([
-    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now },
-    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now - 1 },
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now,     round => 5 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now - 1, round => 5 },
 ]);
 
 ok($both->{'10.0.0.5'}->{id} ne $both->{'10.0.0.7'}->{id},
    'two instances BOTH answering are still two players');
 
+# The clock is not the test, the ROUND is: two replies from the same round a
+# few seconds apart are both live, and an address one round old - however few
+# seconds that is - is not.
+my $sameRound = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now,     round => 9 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now - 3, round => 9 },
+]);
+ok($sameRound->{'10.0.0.5'}->{id} ne $sameRound->{'10.0.0.7'}->{id},
+   'two replies in the SAME round are two instances, however far apart the clock says');
+my $oneRoundOld = $ids->([
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 7, round => 8 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now,     round => 9 },
+]);
+is($oneRoundOld->{'10.0.0.7'}->{id}, $solo->{'10.0.0.5'}->{id},
+   'an address only ONE round (~7s) old is left behind - the plain id moves on');
+ok(!exists $oneRoundOld->{'10.0.0.5'},
+   'and it gets no player - the 1.0.8 split cannot come back at the new pace');
+
 # CONTROL: INSTANCE_TTL's grace is untouched.  A lone instance that has gone
 # quiet - a daemon restart - keeps its id, and its player is held rather than
 # rebuilt.
 my $blip = $ids->([
-    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900, round => 1 },
 ]);
 
 is($blip->{'10.0.0.5'}->{id}, $solo->{'10.0.0.5'}->{id},
    'a lone instance gone quiet keeps its id - the TTL grace still holds it');
 
 # A PARTIAL list is mid-round, so the instances that have not answered yet
-# still carry the previous round's lastSeen and would all read as stale.
+# still carry the previous round's number and would all read as stale.
 my $mid = $ids->([
-    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900 },
-    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now },
+    { ip => '10.0.0.5', name => 'HQPlayerEmbedded', lastSeen => $now - 900, round => 1 },
+    { ip => '10.0.0.7', name => 'HQPlayerEmbedded', lastSeen => $now,       round => 2 },
 ], 1);
 
 ok(!keys %$mid,
@@ -137,8 +155,8 @@ my $PN    = 'HQPlayerEmbedded';
 my ( $q5, $q7, $pl ) = ( $idFor->("$PN\@10.0.0.5"), $idFor->("$PN\@10.0.0.7"), $idFor->($PN) );
 
 my $pairQuiet = $ids->([
-    { ip => '10.0.0.5', name => $PN, lastSeen => $now },
-    { ip => '10.0.0.7', name => $PN, lastSeen => $now - 12 },
+    { ip => '10.0.0.5', name => $PN, lastSeen => $now,      round => 7 },
+    { ip => '10.0.0.7', name => $PN, lastSeen => $now - 12, round => 6 },
 ], undef, { $q5 => 1, $q7 => 1 });
 
 is($pairQuiet->{'10.0.0.5'}->{id}, $q5,
@@ -149,8 +167,8 @@ is($pairQuiet->{'10.0.0.7'}->{id}, $q7,
 # CONTROL: with only the PLAIN player running it is a DHCP move, and the fix for
 # that must still fire - otherwise "never collapse" would pass the two above.
 my $moveUp = $ids->([
-    { ip => '10.0.0.5', name => $PN, lastSeen => $now - 900 },
-    { ip => '10.0.0.9', name => $PN, lastSeen => $now },
+    { ip => '10.0.0.5', name => $PN, lastSeen => $now - 900, round => 1 },
+    { ip => '10.0.0.9', name => $PN, lastSeen => $now,       round => 2 },
 ], undef, { $pl => 1 });
 
 is($moveUp->{'10.0.0.9'}->{id}, $pl,
@@ -178,12 +196,12 @@ ok(!exists $moveUp->{'10.0.0.5'},
 
     %$reg = ();
     my $t = $now;
-    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t },
-            { ip => '10.0.0.7', name => $PN, lastSeen => $t } ]);
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t, round => 1 },
+            { ip => '10.0.0.7', name => $PN, lastSeen => $t, round => 1 } ]);
     @ev = ();
-    $t += 11.9;                                  # .7 restarting: misses one round
-    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t },
-            { ip => '10.0.0.7', name => $PN, lastSeen => $t - 11.9 } ]);
+    $t += 7;                                     # .7 restarting: misses one round
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t,     round => 2 },
+            { ip => '10.0.0.7', name => $PN, lastSeen => $t - 7, round => 1 } ]);
     is(join(', ', @ev) || 'nothing', 'nothing',
        'a pair member missing ONE round creates and tears down nothing');
     is(join(', ', sort keys %$reg), join(', ', sort ($q5, $q7)),
@@ -191,17 +209,63 @@ ok(!exists $moveUp->{'10.0.0.5'},
 
     %$reg = ();
     $t = $now;
-    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t } ]);
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t, round => 1 } ]);
     @ev = ();
-    $t += 11.9;                                  # DHCP move: .5 left for .9
-    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t - 11.9 },
-            { ip => '10.0.0.9', name => $PN, lastSeen => $t } ]);
+    # DHCP move: .5 left for .9. At Lyrion's 5s pace the address left behind is
+    # only ONE ROUND - about 7 seconds - old when the new one answers. That is
+    # the case the old 10-second allowance would have read as a second live
+    # instance, splitting one daemon into two players (the 1.0.8 bug).
+    $t += 7;
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $t - 7, round => 1 },
+            { ip => '10.0.0.9', name => $PN, lastSeen => $t,     round => 2 } ]);
     is(join(', ', @ev), "teardown $pl, create $pl",
        'a DHCP move is ONE reconnect of the same plain-id player, nothing else');
     is($reg->{$pl} && $reg->{$pl}->{instance}->{ip}, '10.0.0.9',
        'and that player now follows the new address');
+
+    # Lyrion forgets only a DISCONNECTED player. A player whose control link
+    # is up is kept when discovery stops hearing it...
+    %$reg = ();
+    $reg->{$pl} = { instance => { ip => '10.0.0.5', name => $PN }, name => 'HQ',
+                    control => LinkCtl->new(1) };
+    @ev = ();
+    $on->([]);
+    is(join(', ', @ev) || 'nothing', 'nothing',
+       'a CONNECTED player is not removed when discovery stops hearing it');
+
+    # ...and removed once the link is down.
+    $reg->{$pl}->{control} = LinkCtl->new(0);
+    $on->([]);
+    is(join(', ', @ev), "teardown $pl",
+       'a DISCONNECTED player that discovery stopped hearing is removed');
+
+    # A pair shrinking to one re-keys the survivor onto the plain id. Its old
+    # address-qualified player is connected, but its address now belongs to
+    # the new id: keeping it too would put TWO players on one HQPlayer. The
+    # switched-off member keeps its player until its own link drops.
+    %$reg = ();
+    $reg->{$q5} = { instance => { ip => '10.0.0.5', name => $PN }, name => 'HQ .5',
+                    control => LinkCtl->new(1) };
+    $reg->{$q7} = { instance => { ip => '10.0.0.7', name => $PN }, name => 'HQ .7',
+                    control => LinkCtl->new(1) };
+    @ev = ();
+    $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $now, round => 9 } ]);
+    is(join(', ', sort @ev), join(', ', sort ("create $pl", "teardown $q5")),
+       'a re-keyed survivor is replaced, not duplicated');
+    ok(exists $reg->{$q7}, 'and the quiet member is kept while its link is up');
+    is(scalar(grep { ( $_->{instance} || {} )->{ip} eq '10.0.0.5' } values %$reg), 1,
+       'exactly ONE player on the surviving address');
     %$reg = ();
 }
+
+{
+    package LinkCtl;
+    sub new { my ( $c, $up ) = @_; bless { up => $up }, $c }
+    sub connected { $_[0]->{up} }
+}
+
+is(Plugins::HQPlayerBridge::Discovery::INSTANCE_TTL(), 300,
+   "an instance is forgotten after Lyrion's 300s (\$forget_disconnected_time)");
 
 # ---------------------------------------------------------------------------
 # Version.  It used to be a hand-maintained constant, which sat at 0.2.3 while
@@ -257,8 +321,8 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
     }
 
-    is(join(',', @waits), '2,4,8,10,10,10,10',
-       'with nothing found it retries fast and doubles, capped at COLD_PERIOD');
+    is(join(',', @waits), '5,5,5,5,5,5,5',
+       'with nothing found it looks every 5s - Lyrion\'s own heartbeat');
 
     # ...and once an instance answers it settles down. Seed %found the way a
     # real round does, by handing _reply an actual datagram on loopback.
@@ -278,17 +342,21 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         my $t0 = Time::HiRes::time();
         Plugins::HQPlayerBridge::Discovery::_roundDone();
         my $t = Slim::Utils::Timers::_timers()->[0];
-        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '60',
-           'with no way to ask about the link it settles to the steady-state period');
+        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '5',
+           'and with an instance known it STILL looks every 5s - it never goes quiet');
     }
 
     Plugins::HQPlayerBridge::Discovery->stop;
     Slim::Utils::Timers::_reset();
 }
 
-print "-- discovery: how hard to probe is decided by the CONTROL LINK --\n";
+print "-- discovery: every 5s, whatever is known or connected --\n";
 {
-    # The point of the whole exercise: an instance that is connected needs no
+    # Until 2026-09-23 the period WAS decided by the control link: ten minutes
+    # once every known instance was connected. That hid a second HQPlayer
+    # switched on meanwhile for up to ten minutes. The rest of this comment is
+    # the original reasoning, kept because the predicate below is still passed
+    # to prove it no longer matters: an instance that is connected needs no
     # finding, and one that is not - powered off, asleep, moved - has to be
     # found again quickly.  Simon's HQPlayer sat unused for a week; the probe a
     # minute it collected in that time bought nothing, and when the endpoint
@@ -330,14 +398,17 @@ print "-- discovery: how hard to probe is decided by the CONTROL LINK --\n";
         is($seen eq 'partial' ? 1 : 0, 1,
            'and it is flagged partial, so the caller must not remove anyone on it');
 
+        # THE BUG THIS REPLACES: with every known instance connected it went
+        # quiet for TEN MINUTES, so a SECOND HQPlayer switched on meanwhile
+        # waited up to ten minutes to appear (measured 2026-09-23, twice).
         $up = 1;
-        is($wait->(), '600', 'every instance connected - go quiet for IDLE_PERIOD');
+        is($wait->(), '5', 'every known instance connected - it still looks every 5s');
 
         $up = 0;
-        is($wait->(), '10', 'a link that is down puts it straight back on COLD_PERIOD');
+        is($wait->(), '5', 'a link that is down - the same 5s');
 
         $up = 1;
-        is($wait->(), '600', 'and it goes quiet again once the link is back');
+        is($wait->(), '5', 'and nothing about the links ever changes the period');
     }
 
     Plugins::HQPlayerBridge::Discovery->stop;
@@ -839,6 +910,69 @@ print "-- the restart row --\n";
     is($page->{items}[0]{name}, 'PLUGIN_HQPLAYER_RESTART_GONE', 'and the page says why');
 
     %$reg = (); %$rs = ();
+}
+
+print "-- discovery: every reply is stamped with the round it answered --\n";
+{
+    # _liveOf tells an address the daemon has LEFT from one still answering by
+    # the round number, and every fixture above supplies that number by hand.
+    # So this proves the REAL reply path stamps it: if it ever stopped, every
+    # address would read as live and a DHCP move would split one daemon into
+    # two players again - with every fixture above still passing.
+    require Plugins::HQPlayerBridge::Discovery;
+    no warnings 'redefine';
+    local *Plugins::HQPlayerBridge::Discovery::_round = sub { };
+    Slim::Utils::Timers::_reset();
+    Plugins::HQPlayerBridge::Discovery->start( sub { } );
+
+    my $rx = IO::Socket::INET->new( Proto => 'udp', LocalAddr => '127.0.0.1', LocalPort => 0 );
+    my $tx = $rx && IO::Socket::INET->new( Proto => 'udp', PeerAddr => '127.0.0.1', PeerPort => $rx->sockport );
+    my $answer = sub {
+        $tx->send('<discover name="HQPlayerEmbedded" result="OK" version="x">hqplayer</discover>');
+        select( undef, undef, undef, 0.1 );
+        Plugins::HQPlayerBridge::Discovery::_reply($rx);
+        return { map { $_->{ip} => $_->{round} } @{ Plugins::HQPlayerBridge::Discovery::instances() } };
+    };
+    if ($tx) {
+        my $r1 = $answer->()->{'127.0.0.1'};
+        ok( defined $r1, 'a reply carries the round it answered (' . ( $r1 // 'undef' ) . ')' );
+        my $again = $answer->()->{'127.0.0.1'};
+        is( $again // 'undef', $r1 // 'undef', 'a second reply in the SAME round carries the same number' );
+        Plugins::HQPlayerBridge::Discovery::_roundDone();
+        my $r2 = $answer->()->{'127.0.0.1'};
+        ok( defined $r1 && defined $r2 && $r2 > $r1,
+            'a reply in the NEXT round carries a later one (' . ( $r1 // '?' ) . ' -> ' . ( $r2 // '?' ) . ')' );
+    }
+    Plugins::HQPlayerBridge::Discovery->stop;
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- a same-named pair is reported once, not every round --\n";
+{
+    # Discovery runs every 5s now, and a same-named pair is a steady state -
+    # HQPlayer Embedded names every instance "HQPlayerEmbedded". A WARN per
+    # round would be ~500 lines an hour for as long as both are up.
+    my @warned;
+    no warnings 'redefine';
+    local *Slim::Utils::Log::Obj::warn = sub { push @warned, $_[1] };
+    my $ids  = \&Plugins::HQPlayerBridge::Plugin::_idsFor;
+    my $pair = sub { [ map { { ip => $_, name => 'PairTest', round => 3 } } @_ ] };
+
+    $ids->( $pair->('10.1.0.5', '10.1.0.7') ) for 1 .. 5;
+    is( scalar @warned, 1, 'five complete rounds of the same pair warn ONCE' );
+
+    $ids->( $pair->('10.1.0.5', '10.1.0.9') );
+    is( scalar @warned, 2, 'and again when the pair\'s addresses change' );
+
+    $ids->( $pair->('10.1.0.5') );                       # down to one: not a pair
+    $ids->( $pair->('10.1.0.5', '10.1.0.9') );           # and back
+    is( scalar @warned, 3, 'and again when a pair that went away comes back' );
+
+    # CONTROL: a partial (mid-round) list never warns - it defers the group.
+    @warned = ();
+    %{ Plugins::HQPlayerBridge::Plugin::bridges() } = ();
+    $ids->( $pair->('10.2.0.5', '10.2.0.7'), 1 );
+    is( scalar @warned, 0, 'a partial list says nothing' );
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;

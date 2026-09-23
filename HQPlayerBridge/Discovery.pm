@@ -32,7 +32,7 @@ my $log = logger('plugin.hqplayerbridge');
 
 use constant MCAST_ADDR   => '239.192.0.199';
 use constant MCAST_PORT   => 4321;
-use constant INSTANCE_TTL => 15 * 60;   # see the note above
+use constant INSTANCE_TTL => 5 * 60;    # see the note below ROUND_PERIOD
 
 use constant PROBE_XML    => '<?xml version="1.0" encoding="UTF-8"?><discover>hqplayer</discover>';
 use constant LISTEN_TIME  => 1.5;   # seconds to collect replies after the last probe
@@ -46,18 +46,18 @@ use constant LISTEN_TIME  => 1.5;   # seconds to collect replies after the last 
 use constant PROBE_BURST  => 3;
 use constant PROBE_GAP    => 0.2;
 
-# The three round periods.  Which one applies is decided in _schedule.
+# How long to wait between rounds: Lyrion's own heartbeat. Slimproto.pm checks
+# its players every `$check_all_clients_time = 5` seconds, and this looks for
+# HQPlayers at the same pace, WHATEVER is already known or connected.
 #
-#   COLD_PERIOD  nothing is known, or something known is not connected.  This
-#                is the "is it back yet?" state, and it wants to be quick.
-#   ROUND_PERIOD everything known is connected - but see IDLE_PERIOD.  Kept
-#                for the case where the link state cannot be established.
-#   IDLE_PERIOD  everything known is connected.  There is nothing to find, so
-#                stop asking: the control link is the liveness signal, and it
-#                notices a loss long before a discovery round would.
-use constant COLD_PERIOD  => 10;
-use constant ROUND_PERIOD => 60;
-use constant IDLE_PERIOD  => 10 * 60;
+# There used to be three periods, and the slowest - ten minutes, once every
+# known instance was connected - assumed nothing new could turn up while
+# everything known was up. With a SECOND HQPlayer that is exactly wrong: one
+# switched on while the other is connected waited up to ten minutes to appear
+# (measured 2026-09-23: 8+ minutes, twice). HQPlayer never announces itself,
+# so looking is the only way a new one is ever found, and it costs three ~80
+# byte datagrams a round.
+use constant ROUND_PERIOD => 5;
 
 # How long an instance may stay silent before we give up on it and let its
 # player be removed.
@@ -70,37 +70,27 @@ use constant IDLE_PERIOD  => 10 * 60;
 # player down over a blip, losing its playlist, prefs and sync group, and then
 # recreate it moments later.  Better to keep the player and let the control link
 # reconnect - which is exactly what it did.
-
-# Retry interval used while NOTHING has been found yet, doubling up to
-# ROUND_PERIOD.
 #
-# The steady-state period is deliberately slow, but it used to apply to the
-# cold start too, and that is a different problem: with an empty instance list
-# there is no player at all, so a single lost probe costs a full minute of the
-# plugin looking broken.  One multicast datagram is easy to lose - the probe
-# went out at 09:48:49 while hqplayerd happened to be restarting, and the
-# player did not appear until 09:49:49.
-#
-# So: probe hard until something answers, then settle down.  A silent round
-# does not matter once an instance is known, because INSTANCE_TTL keeps the
-# player alive across it.
-use constant FIRST_BACKOFF => 2;
+# Five minutes is Lyrion's own figure: Slimproto.pm forgets a player that has
+# been disconnected for `$forget_disconnected_time = 300` seconds. And like
+# Lyrion, only a DISCONNECTED one: a player whose control link is still up is
+# never removed over discovery alone (Plugin::_onInstances), because the link
+# is the proof of life - its watchdog drops a silent peer within ~40s. So a
+# switched-off host's player goes ~5 minutes after it went quiet; it was 15.
 
 my $sock;         # live only for the duration of a round
-my %found;        # ip => { ip, name, version, lastSeen }
+my %found;        # ip => { ip, name, version, lastSeen, round }
 my $onChange;     # caller's callback
-my $linkUp;       # caller's per-ip "is the control link up?" predicate
 my $running = 0;
-my $backoff = 0;  # current cold-start retry interval, 0 once something answers
 my $burst   = 0;  # probes left to send in the current round
+my $roundNo = 1;  # which round a reply answered - see `round` in _reply;
+                  # moves on as each round ENDS, in _roundDone
 
 sub start {
-    my ( $class, $cb, $up ) = @_;
+    my ( $class, $cb ) = @_;
 
     $onChange = $cb;
-    $linkUp   = $up;
     $running  = 1;
-    $backoff  = 0;
 
     _round();
 
@@ -109,7 +99,6 @@ sub start {
 
 sub stop {
     $running = 0;
-    $backoff = 0;
     $burst   = 0;
     Slim::Utils::Timers::killTimers( undef, \&_round );
     Slim::Utils::Timers::killTimers( undef, \&_probe );
@@ -232,11 +221,18 @@ sub _reply {
 
     my $isNew = !exists $found{$ip};
 
+    # `round` says WHICH ROUND this reply answered. It is how the caller tells
+    # an address the daemon has left from one that is still answering: two
+    # replies in the same round are both live, whatever the clock says. A
+    # timestamp cannot say that on its own - how stale a left-behind address
+    # looks depends on the period between rounds, and the caller's allowance
+    # for it silently broke when that period changed.
     $found{$ip} = {
         ip       => $ip,
         name     => $name,
         version  => $version,
         lastSeen => time(),
+        round    => $roundNo,
     };
 
     return unless $isNew;
@@ -251,8 +247,6 @@ sub _reply {
     # player - killing its playlist and sync group - simply because it had not
     # answered yet in this round.
     main::INFOLOG && $log->is_info && $log->info("discovery: found '$name' at $ip");
-
-    $backoff = 0;
 
     $onChange->( instances(), 1 ) if $onChange;
 
@@ -281,66 +275,22 @@ sub _roundDone {
 
     $onChange->( instances() ) if $onChange;
 
+    # Only now, after the complete list has been judged: every reply from here
+    # on belongs to the next round.
+    $roundNo++;
+
     _schedule();
 
     return;
 }
 
-# True when every instance we know about has a control link that is up.
-#
-# This is the whole basis for going quiet, so it is deliberately pessimistic:
-# no predicate, no instances, or one instance the caller cannot vouch for all
-# answer false, and false only ever means "keep looking".
-sub _settled {
-    return 0 unless $linkUp;
-    return 0 unless scalar keys %found;
-
-    for my $ip ( keys %found ) {
-        return 0 unless $linkUp->($ip);
-    }
-
-    return 1;
-}
-
+# The next round, ROUND_PERIOD after this one ends - always. See ROUND_PERIOD
+# for why nothing about what is already known or connected changes it.
 sub _schedule {
     return unless $running;
 
-    my $wait;
-
-    if ( !scalar keys %found ) {
-        # Nothing at all.  Climb the ladder, but cap it at COLD_PERIOD rather
-        # than ROUND_PERIOD: an HQPlayer that has just been switched on should
-        # be picked up in seconds, and the old 60s cap is exactly what made a
-        # cold start take a measured 63s.
-        $backoff = $backoff ? $backoff * 2 : FIRST_BACKOFF;
-        $backoff = COLD_PERIOD if $backoff > COLD_PERIOD;
-        $wait    = $backoff;
-
-        main::DEBUGLOG && $log->is_debug && $log->debug(
-            "discovery: nothing found yet, retrying in ${wait}s" );
-    }
-    elsif ( _settled() ) {
-        # Everything known is connected.  Nothing a probe could tell us that
-        # the control link will not tell us sooner, so stop filling HQPlayer's
-        # log with a discovery request a minute.
-        #
-        # This is safe BECAUSE it is gated on the link: an instance that goes
-        # away - powered off, moved by DHCP, or its host asleep - drops the
-        # link, which puts us straight back on COLD_PERIOD below.  So a later
-        # power-on is still found in seconds, not in IDLE_PERIOD.
-        $backoff = 0;
-        $wait    = IDLE_PERIOD;
-    }
-    else {
-        # Known, but not connected.  Same "is it back yet?" state as an empty
-        # list, so probe at the same rate - the address may have changed, and
-        # a reply is what proves it.
-        $backoff = 0;
-        $wait    = $linkUp ? COLD_PERIOD : ROUND_PERIOD;
-    }
-
     Slim::Utils::Timers::killTimers( undef, \&_round );
-    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + $wait, \&_round );
+    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + ROUND_PERIOD, \&_round );
 
     return;
 }

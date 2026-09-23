@@ -69,7 +69,7 @@ sudo systemctl restart lyrionmusicserver
 
 **What it is.** `hqrestart` is one Python script (standard library only) in [`tools/hqrestart/`](tools/hqrestart/) of this repository. It is **not part of the plugin**, and playback works exactly the same without it. It listens on port **8090**. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS, Linux or Windows. It never restarts anything by itself.
 
-**Only tested on macOS so far.** It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and all of Linux and Windows, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried.
+**Only tested on macOS so far.** It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and all of Linux and Windows, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried. The installer's question for your LMS server's address is new and is covered by those tests, but has not yet been run on a real install either.
 
 **Using it.** Once the helper is running, **Apps → HQPlayer Bridge** shows a **Restart *name*** row under HQPlayer Live View. Tap it, then **Restart *name* now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.
 
@@ -95,6 +95,8 @@ Lyrion server IP address (press return to skip):
 Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with `./install.sh --allow 192.168.1.234` (`-Allow` on Windows); pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.
 
 It must be an IP address rather than a name, because it is matched against the address the request arrives from.
+
+If a restart later says **Restart failed: bad or missing token**, the address LMS called from isn't in the list. The helper's log (below) names that address and the exact command to add it.
 
 The helper then starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, `hqrestart.json`, the access token, and whether LMS is allowed to restart HQPlayer.
 
@@ -180,7 +182,7 @@ HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x f
 
 ## Known limitations
 
-- **The player shows as present even when HQPlayer isn't reachable.** A discovered instance that is currently off is a normal state; tying the player's presence to the control link would churn prefs and sync groups every time it went away.
+- **A switched-off HQPlayer's player stays listed for about 5 minutes.** That is Lyrion's own grace for a player that disconnects, so a restart or a network blip doesn't cost you the player's playlist and sync group. A player whose HQPlayer is still connected is never removed. The Bridge looks for HQPlayers every 5 seconds, Lyrion's own pace, so one you switch on appears within seconds.
 - **A silent output-format mismatch is HQPlayer's to report.** If its output format is something your endpoint can't accept, it reports itself as playing and answers every command while rendering nothing. That can't be detected over the control API — the evidence is in HQPlayer's own log (`NAA output requested format not available!`). If a track looks like it's playing but you hear nothing, check the output format there first.
 - **A sample-rate change between tracks is audible**, on every route. HQPlayer needs a couple of seconds to retune its output.
 - **Radio track names are right when the stream starts, then stop updating.** HQPlayer's control API can't change the metadata on an item already playing, and re-sending it would restart the stream. LMS itself keeps up to date as usual.

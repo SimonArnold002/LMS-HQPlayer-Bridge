@@ -2373,9 +2373,9 @@ sub _stopPolling {
 #
 # It used to start at a track load and stop at a stop, so an IDLE player - the
 # state a switched-off endpoint leaves you in for days - had no watchdog and no
-# command in flight, and nothing could ever notice.  Discovery now decides how
-# hard to probe from exactly this link state, so a zombie "connected" would
-# keep it quiet while the instance was long gone.
+# command in flight, and nothing could ever notice: the player went on reading
+# "Connected" in the Apps list and the live view long after the instance was
+# gone, and never reconnected.
 #
 # It never becomes a busy poll: it only sends when NOTHING has arrived for
 # STATUS_WATCHDOG seconds, so on a playing instance - which pushes ~1/s - it

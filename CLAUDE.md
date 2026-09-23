@@ -64,6 +64,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | the licence `fingerprint` as a stable machine identity | **WRONG, MEASURED** 2026-09-20 — it is INTERFACE-derived, DO NOT RE-PROPOSE | `the fingerprint is not a machine identity` |
 | renaming an instance making a NEW player and stranding its settings (`_idFor`, the discovery name) | **KNOWN, UNFIXED** 2026-09-20 — the name is a user-editable field, not a product string | `the discovery name is a SETTING` |
 | NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
+| `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance | `Lyrion's 5-second heartbeat` |
 | `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `cstring INTERPOLATES` |
 | `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `the error callback really is THREE args` |
 
@@ -171,7 +172,7 @@ then plays it.
 | `HQPlayerBridge/Stream.pm` | Tier 4: the plugin's own audio endpoint, serving LMS's transcoded stream. Its paths carry no query string, but that is a convention, NOT the constraint the ledger disproves at the top of this file |
 | `HQPlayerBridge/Live.pm` | The standalone live page - a raw handler owning the WHOLE document |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
-| `tools/hqrestart/` | The OPTIONAL restart helper (`hqrestart.py`, `install.sh`, `install.ps1`, its own README). Runs on the HQPlayer host; NOT in the zip. See `## 1.0.10-1.0.13` |
+| `tools/hqrestart/` | The OPTIONAL restart helper (`hqrestart.py`, `install.sh`, `install.ps1`, its own README). Runs on the HQPlayer host; NOT in the zip. Build history: `## 1.0.10-1.0.13`; the install-time `allow` prompt, `hqrestart.py --allow` and rounds 26-27: `## HELPER 2026-09-23` |
 
 ## Branches and releasing
 
@@ -2191,6 +2192,8 @@ into the player id.
 * **LMS does not notice at once.** The daemon answered `ManCave` at 22:42:38;
   the player flipped at 22:46:27. That is the discovery cadence, up to
   `IDLE_PERIOD` (10 min) when the control link is up. Not a UI refresh problem.
+  (Since 2026-09-23 discovery runs every 5s - see `Lyrion's 5-second heartbeat`
+  - so this lag is now seconds.)
 * **FIELD FAILURE, and this is what started the whole investigation.** A user on
   HQPlayer Desktop 5 lost every setting on his player. macOS had appended its
   duplicate-name suffix to his hostname - `Michaels-Mac-mini.local` became
@@ -2230,11 +2233,14 @@ against the arithmetic. The user's settings went with the plain id.
 
 **The fix is `_liveOf`:** the count that decides "duplicated" is of instances
 STILL ANSWERING, judged relative to the newest reply in the group rather than
-against a fixed age (discovery's period is 10s, 60s or 10 MINUTES depending on
-state, so any fixed threshold buries a healthy instance). One live address takes
+against a fixed age. **Since 2026-09-23 "the same round" is literal:** each
+reply carries the discovery ROUND it answered, and only members from the newest
+round are live. It used to be a 10-second allowance (`ADDR_SLACK`), which worked
+only while rounds were more than 10s apart and would have brought this split back
+the moment discovery moved to 5s - see `Lyrion's 5-second heartbeat`. One live address takes
 the plain name-derived id and the corpses get none. A PARTIAL list defers the
 whole group, because mid-round the instances that have not answered yet still
-carry the previous round's `lastSeen` and would all read as stale. No timing at
+carry the previous round's number and would all read as stale. No round at
 all means everything counts as live, which is what the fixtures build.
 
 Pinned by six assertions in `t_plugin.pl` under "identity: stale addresses",
@@ -2361,7 +2367,7 @@ one; corrected the same day, with the reason in the code.)
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
 tree, runs the five Perl suites (864 assertions) plus the live page EXECUTED
 under osascript (15, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (146), checks `install.sh` parses,
+the helper's Python suite (152) and the installers run end to end (24), checks `install.sh` parses,
 parses every piece of the helper's PowerShell with `pwsh` (18; skipped without
 it), and sweeps called-vs-defined subs. Counts as of 2026-09-23; they move every
 round, and the run prints them.
@@ -2375,6 +2381,7 @@ round, and the run prints them.
 | `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
 | `t_powershell.py` | every piece of PowerShell the helper ships - `install.ps1` and each command `hqrestart.py` BUILDS, fed a quote in a path and a service name - PARSED by `pwsh` (PARSE ONLY: macOS pwsh has no CIM/`Restart-Service`), plus a refusal of PowerShell-7-only syntax (Windows ships 5.1). Skips, saying so, without `pwsh` |
+| `t_installers.py` | both installers RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt, no Python and `-NonInteractive` all leave the old helper running. Refuses to run unless the stub `launchctl` wins on PATH |
 | `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS/Windows), config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log) |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
@@ -3048,27 +3055,72 @@ Verified 2026-08-28: this sequence run five times in rapid succession over a
 playing track swapped cleanly every time, correct metadata each time, daemon
 alive throughout.
 
-### Discovery: the CONTROL LINK decides how hard to probe
+### Discovery: Lyrion's 5-second heartbeat, whatever is connected (2026-09-23)
 
-**The period is chosen from link state, not from whether anything is in
-`%found`.** `_schedule` picks one of three:
+**One rule: a round every `ROUND_PERIOD` = 5 seconds, always** - Lyrion's own
+`$check_all_clients_time = 5` in `Slim/Networking/Slimproto.pm` (read from
+`public/9.1`), at Simon's call: *"follow lms then its what we are using"*.
 
-| state | period | why |
-|---|---|---|
-| nothing known | ladder **2, 4, 8, 10 s** (`COLD_PERIOD` cap) | there is no player at all; be quick |
-| known, a link **down** | `COLD_PERIOD` (10 s) | "is it back yet?" — the address may have moved too |
-| known, every link **up** | `IDLE_PERIOD` (10 min) | nothing a probe could say that the link will not say sooner |
+**It REPLACES a three-period scheme that was wrong for more than one HQPlayer.**
+The period used to be chosen from link state - a 2/4/8/10s ladder with nothing
+known, 10s with a link down, and **10 MINUTES (`IDLE_PERIOD`) once every known
+instance was connected**, on the argument that a probe could then say nothing
+the link would not say sooner. True of instances ALREADY KNOWN; false of one not
+yet known. **Reported by Simon, measured twice 2026-09-23:** with the Mac mini
+connected, HQPlayer on the MacBook (forgotten after a day away) took 8+ minutes
+to appear; with both off and LMS restarted, whichever started FIRST appeared in
+seconds and the SECOND waited for the next ten-minute round (22:19:28 -> 22:27:46).
+The release (1.0.2) behaves identically - the real `_schedule` from `main` and
+from `dev` were run side by side and gave 2s / 600s / 10s in the same three
+states. It only ever bites with two or more instances, which is why it hid.
+**HQPlayer never announces itself** (unlike UPnP renderers, which is why the UPnP
+bridge can afford a 30s search), so looking is the only way a new one is found.
+Cost: three ~80-byte datagrams a round plus one unicast per known instance.
 
-**Why this is safe, and it is the whole design:** an instance that goes away —
-powered off, asleep, moved by DHCP — drops its control link, which puts
-discovery straight back on `COLD_PERIOD`. So the quiet period can never delay
-finding it again. That in turn depends on the link state being *true*, which is
-why `_statusWatchdog` now runs for as long as the link does — see below.
+`_settled`, `COLD_PERIOD`, `IDLE_PERIOD`, `FIRST_BACKOFF`, the backoff ladder and
+`Plugin::_linkUpFor` are DELETED.
 
-`Plugin::_linkUpFor` is the predicate, passed to `Discovery->start` as a second
-argument. It is deliberately pessimistic: no predicate, no instances, or an
-instance with no bridge yet all answer false, and false only ever means "keep
-looking".
+**Lyrion's forget time too (Simon: "follow lyrions wait times as long as they
+wont break anything").** `INSTANCE_TTL` is 300s, Slimproto.pm's
+`$forget_disconnected_time`, was 900. And like Lyrion it forgets only a
+DISCONNECTED player: the removal pass in `_onInstances` skips a bridge whose
+control link is up, since the link is the proof of life (the status watchdog
+drops a silent peer in ~40s). **Knock-on caught before it shipped:** a pair
+shrinking to one re-keys the survivor onto the plain id, and a bare "connected"
+guard kept its old address-qualified player too - two players and two control
+links on one HQPlayer. The guard therefore does not apply when the bridge's
+address went to another id this round. Pinned in `t_plugin.pl` (connected
+kept, disconnected removed, re-keyed survivor replaced not duplicated, TTL is
+300); each fails against a mutated copy (no guard: 4, guard without the address
+check: 2, TTL 900: 1). **Lyrion's 15s player drop is deliberately NOT copied:**
+the link's ~40s is STATUS_WATCHDOG 10 + REPLY_TIMEOUT 30, and the reply window
+has to cover HQPlayer fetching a track before it answers `PlaylistAdd` - a 15s
+drop would cut a slow-origin load mid-fetch.
+
+**Two knock-on effects the faster pace would have caused, both fixed in the same
+change and both pinned by tests that FAIL against the previous commit:**
+
+* **The DHCP split would have come back.** `_liveOf` told an address the daemon
+  has LEFT from a live one by a 10-second allowance (`ADDR_SLACK`); at 5s rounds
+  a left-behind address is only ~7s old one round later, so it would have read
+  as live and one daemon would have become two players - the 1.0.8 bug. Replies
+  now carry the ROUND they answered (`round`, stamped in `_reply`, advanced in
+  `_roundDone`), and only the newest round is live. Independent of the period.
+* **A same-named pair would WARN every ~7s for ever.** `_idsFor` logged "N
+  instances answer to 'X'" on every complete round - every 10 minutes before,
+  ~500 an hour now, and HQPlayer Embedded names every instance
+  `HQPlayerEmbedded`. It now warns once per change of the pair's addresses
+  (`%splitWarned`, cleared when the name is no longer a pair and on shutdown).
+
+Checked and fine: the INFO lines per round (`no HQPlayer instances answered`,
+`only X is still answering - keeping the plain id`) are off by default; a
+round-number counter is monotonic across stop/start and only ever compared
+within one table; the control link's own liveness (`STATUS_WATCHDOG` +
+`REPLY_TIMEOUT`, ~40s) is NOT tied to Lyrion's 15s - `PlaylistAdd` makes HQPlayer
+fetch the media before replying, which can legitimately take longer.
+
+**The same ten-minute idle gap is in LMS-Platin-Bridge** (`PlatinBridge/Discovery.pm`,
+`IDLE_PERIOD => 10 * 60`), unchanged there.
 
 **Each round sends `PROBE_BURST` (3) probes `PROBE_GAP` (0.2 s) apart, plus a
 unicast probe to every address already in `%found`.** One datagram per round was
@@ -3139,9 +3191,8 @@ It used to be started at a track load and stopped at a stop, so an **idle**
 player — the state a switched-off endpoint leaves you in for days — had no
 watchdog and no command in flight, and nothing could ever notice. It is now
 armed in `Plugin::_onLinkState` on the way up and stopped on the way down;
-`stop()` and `_endOfStream` no longer touch it. Discovery reads exactly this
-link state to decide how hard to probe, so a zombie "connected" would have kept
-it quiet while the instance was long gone.
+`stop()` and `_endOfStream` no longer touch it. (Until 2026-09-23 discovery also
+read this link state to decide how often to probe; it no longer does.)
 
 It never becomes a busy poll: it sends only when nothing has arrived for
 `STATUS_WATCHDOG` seconds, so against a playing instance — which pushes ~1/s —
@@ -5303,6 +5354,28 @@ has run it on Windows.
 
 **The general shape, and it is the third time in this file:** a change that makes a file exist EARLIER breaks every reader that used the file's existence to mean something else. The four readers here were all written when the config could only appear one way.
 
+**REVIEW ROUND 27 (2026-09-23, /code-review over 5775983), 2 findings, both VERIFIED then FIXED - and both are in code round 26 or its parent wrote.** (1) **A bad `--allow` on a RE-install left the helper stopped.** `install.sh` stops the running helper (`launchctl bootout` / `systemctl disable --now`, lines ~103/108) BEFORE it checks the address, and the `--allow` branch then did `|| exit 1` - so `./install.sh --allow 192.168.1` on a working install exited with the helper down: disabled until the next correct run on Linux, gone until the next login on macOS. The interactive prompt could not reach it (it loops until valid or blank); only the flag. It now warns and carries on, as `install.ps1` already did: a refused address changes nothing in the config, so the PREVIOUS value stands and the closing line reports it. (2) **The round-26 `SAID` prune raced.** `ThreadingHTTPServer` runs each request on its own thread, and the prune iterated the shared map while another request inserted into it - `dictionary changed size during iteration`, or a `KeyError` from two threads dropping the same stale entry - so that refusal lost its 401 and logged a traceback. `SAID_LOCK` now covers the check, the prune and the write. **Measured, not argued:** 12 threads through the REAL `explain_refusal` with the switch interval at 1us gave **6,196 RuntimeError + 8 KeyError against 5775983 and none against the fix, three runs out of three.** 5 assertions added (151 total); both new tests FAIL against the committed code - the race one through the suite, the reinstall one by running the committed `install.sh` block in the scratchpad (the repo copy untouched).
+
+**A harness trap met doing it, worth keeping:** the first stress harness seeded its stale entries into `SAID` from the worker threads WITHOUT the lock - which the real server never does, since only `explain_refusal` writes that map - so the FIXED code still showed ~30 RuntimeErrors a run. The harness was racing itself. A concurrency test must write shared state only the way production does, or it measures its own bug.
+
+**THE CARRIER AUDIT AFTER ROUND 27 (2026-09-23), Simon: "you need to be more careful and check all carriers and points of the code you're touching. Every fix seems to generate more bugs."** Rounds 26 and 27 each found a bug the PREVIOUS fix had introduced, so every step and every reader the change touches was walked, asking at each "what if the user stops here, or this fails here". **It found the bug round 27 missed:** round 27 stopped a typo in `--allow` from exiting between the stop and the start, but the INTERACTIVE PROMPT sat in that same window - Ctrl-C at it, or walking away from it, left the helper down. The old installer had nothing interactive between stop and start; the reorder in 5775983 put it there. **install.ps1 had the same window twice:** its prompt, and its Python checks, which `throw` after `Unregister-ScheduledTask` had already run (that half is older than this change - a missing or too-old Python always left no task - but it is the same window). **Fix: ASK FIRST, STOP SECOND.** Both installers now do everything that can wait on the user or refuse - the Python checks, the prompt, `--allow` - while the old helper is still up, and only then stop, copy and start. Writing the config while the old helper runs is safe: it reads the file once, at its own startup. `install.ps1` handles `-Uninstall` first (it needs no Python) and validates with the helper beside the script (`$PSScriptRoot`), as `install.sh` uses `$SRC`, since the installed copy is not written until after the unregister. Also: a refused `-Allow` said "leaving it unset" when the previous value is KEPT.
+
+**Checked and fine, so the next round need not re-derive them:** `main()` returns 0/1 only on the `--allow` path, and the suite's `main()` call passes two argv entries so never reaches it; `same_addr` catches its own ValueError, and `explain_refusal` only calls it after the trust check already has, on the same inputs - no new raise; `read_key` on a config that does not parse prints the default; `set_allow`'s non-atomic write has no concurrent reader now that it happens before the new helper starts. **NOT fixed, raised with Simon instead:** the 401 BODY the Bridge shows in the Apps feed still says "bad or missing token" for the commonest refusal (an address not in `allow`) - the log was updated, the carrier the user actually SEES was not. **Not reachable in practice:** an install.ps1 PATH with `pythonw.exe` but no `python.exe` (the python.org installer and the Store alias both ship the pair).
+
+**`tools/t_installers.py` (new, in `run_checks.sh`) RUNS both real installers end to end** instead of extracting fragments: `launchctl`/`systemctl` are stubs on PATH, and the ScheduledTask/firewall cmdlets are stub FUNCTIONS (a function outranks a cmdlet), each logging its call so ORDER can be read off the output; on start each stub writes a token the way the helper's first start does. HOME / LOCALAPPDATA are temp dirs. The prompt is driven over a real pty, Ctrl-C included. 24 assertions; **7 FAIL against 5775983**, one per bug above. **SAFETY, and it is load-bearing:** a real `launchctl bootout gui/<uid>/com.hqrestart.webhook` would stop the helper INSTALLED on this Mac, so the file first proves the stub is what `launchctl` resolves to and runs nothing otherwise; the installed helper's pid was checked before and after every run (53463 throughout). **One more harness trap:** round 27's fragment test pasted a slice of install.sh without the `UNINSTALL` variable the slice now reads; the shell error went into captured output nobody read, and the test still passed. It sets it now, and asserts no shell error.
+
+## 1.0.16 (2026-09-23): discovery at Lyrion's pace, and Lyrion's forget time
+
+Plugin: `Discovery.pm`, `Plugin.pm`, one comment in `Player.pm`. Full account in
+`### Discovery: Lyrion's 5-second heartbeat`. In short: one round every 5s
+whatever is connected (a second HQPlayer used to wait up to 10 min); name-group
+liveness by discovery ROUND, not a 10s allowance; a same-named pair warns once
+per change; `INSTANCE_TTL` 300s (was 900); a player whose control link is up is
+never removed over discovery alone, unless its address was re-keyed to another
+id that round. `t_plugin.pl` 153. Also carries the helper's round-27 fixes, the
+installer reorder (ask first, stop second) and `t_installers.py` - the helper
+is not in the zip. **Built, not yet installed or verified live.**
+
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 
 No code change. The plugin description (`strings.txt`, and `repo.xml`'s `<desc>`) said "no external helper", which the optional `hqrestart` helper made untrue; it now says "no helper in the playback path". The same pass moved the helper's history out of a ledger table cell into the section above, and added `tools/hqrestart/` to Layout, `t_hqrestart.py` to Testing, and the helper's unrun paths to Still unverified. Suites unchanged: 863 Perl + 79 Python.
@@ -5454,6 +5527,14 @@ which is a diagnostic that did not exist when this class of bug was last chased.
   end to end (1.0.13, 2026-09-21). Unrun live: every FAILURE path (refusals,
   "left running", a stop that times out), macOS service mode, Linux, Windows.
   Those are harness-only (`t_hqrestart.py`).
+* **1.0.16's discovery timing is unverified live**: a second HQPlayer
+  appearing within ~5s while the first is connected, and a switched-off one's
+  player going ~5 min after it went quiet. Offline-tested only.
+* **The install-time `allow` prompt (2026-09-23) has never run on a real
+  install.** Both installers are RUN end to end offline (`t_installers.py`, the
+  service managers stubbed), but the helper installed on the Mac predates the
+  prompt, and the Mac mini has no helper yet. Installing it there is the first
+  live run.
 
 ### OPEN: BBC Sounds ("iPlayer") streams sound choppy
 

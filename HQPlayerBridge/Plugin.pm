@@ -69,6 +69,7 @@ my $log = Slim::Utils::Log->addLogCategory({
 
 # id => { instance => {...}, control => $ctl, client => $client }
 my %bridges;
+my %splitWarned;  # name => the addresses last reported as a same-named pair
 
 # ip => 1 once that host's restart helper answered; never shrinks in a run.
 # See _probeRestart.
@@ -117,7 +118,7 @@ sub initPlugin {
     Slim::Control::Request::addDispatch(
         [ 'hqplayerbridge', 'signalpath' ], [ 0, 1, 0, \&_signalPathQuery ] );
 
-    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances, \&_linkUpFor );
+    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances );
 
     return;
 }
@@ -192,6 +193,7 @@ sub postinitPlugin {
 
 sub shutdownPlugin {
     Plugins::HQPlayerBridge::Discovery->stop;
+    %splitWarned = ();
 
     for my $id ( keys %bridges ) {
         _teardown($id);
@@ -813,21 +815,6 @@ sub _fmtFormat {
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
 # ---------------------------------------------------------------------------
-# Discovery asks this before it decides how hard to keep probing: an instance
-# whose control link is up needs no finding.  An instance that has been
-# discovered but has no bridge yet is deliberately NOT settled - the player is
-# still being built.
-sub _linkUpFor {
-    my $ip = shift or return 0;
-
-    for my $b ( values %bridges ) {
-        next unless $b->{instance} && ( $b->{instance}->{ip} || '' ) eq $ip;
-        return $b->{control} && $b->{control}->connected ? 1 : 0;
-    }
-
-    return 0;
-}
-
 # $partial is set when discovery is announcing a reply mid-round, before the
 # rest of the instances have had their chance to answer.  Such a list is
 # additive only: see the removal pass at the end.
@@ -894,6 +881,21 @@ sub _onInstances {
 
     for my $id ( keys %bridges ) {
         next if $seen{$id};
+
+        # Lyrion forgets only a DISCONNECTED player, and so does this: a live
+        # control link outranks discovery going quiet (see INSTANCE_TTL). A
+        # dead peer loses its link to the status watchdog within ~40s, and is
+        # removed at the first complete round after that.
+        #
+        # NOT when its address went to ANOTHER id this round: that is the same
+        # daemon re-keyed (a pair shrinking to one takes the plain id), and
+        # keeping the old player too would leave two players, and two control
+        # links, on one HQPlayer.
+        my $b   = $bridges{$id};
+        my $ctl = $b->{control};
+        my $ip  = ( $b->{instance} || {} )->{ip};
+        next if $ctl && $ctl->connected && !( defined $ip && $ids->{$ip} );
+
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
         _teardown($id);
     }
@@ -926,20 +928,18 @@ sub _nameFor {
     return $name;
 }
 
-# How far apart two replies may be and still count as the same round.  Covers
-# the probe burst plus LISTEN_TIME in Discovery.pm, with room to spare.
-use constant ADDR_SLACK => 10;
-
-# Which members of a name group are STILL ANSWERING.
+# Which members of a name group are STILL ANSWERING: the ones that answered
+# the same discovery ROUND as the newest reply. Anything from an earlier round
+# is an address the daemon has left.
 #
-# Freshness is judged RELATIVE to the newest reply in the group, never against
-# a fixed age.  Discovery's period is 10s, 60s or 10 MINUTES depending on what
-# it already knows (see _schedule in Discovery.pm), so a perfectly healthy
-# instance can carry a lastSeen ten minutes old and any fixed threshold would
-# bury it.  Everything that answered alongside the newest reply is live;
-# anything materially older is an address the daemon has left.
+# It used to be judged by the clock - replies within ADDR_SLACK (10s) of the
+# newest counted as the same round. That only worked while rounds were MORE
+# than 10s apart; when discovery moved to Lyrion's 5s heartbeat, an address
+# left one round ago would have looked fresh, and a DHCP move would have split
+# one daemon into two players again - the 1.0.8 bug. Counting rounds says what
+# was meant directly, and does not care how far apart they are.
 #
-# NO TIMING AT ALL means every member counts as live.  That is the case the
+# NO ROUND AT ALL means every member counts as live.  That is the case the
 # suite's fixtures build, and it is the conservative answer: it keeps two
 # genuinely separate instances apart rather than silently merging them.
 sub _liveOf {
@@ -947,12 +947,12 @@ sub _liveOf {
 
     my ($newest) = sort { $b <=> $a }
                    grep { defined }
-                   map  { $_->{lastSeen} } @$group;
+                   map  { $_->{round} } @$group;
 
     return [@$group] unless defined $newest;
 
-    my @live = grep { !defined $_->{lastSeen}
-                      || $_->{lastSeen} >= $newest - ADDR_SLACK } @$group;
+    my @live = grep { !defined $_->{round}
+                      || $_->{round} == $newest } @$group;
 
     # Belt and braces: never hand back an empty group.
     return @live ? \@live : [@$group];
@@ -1018,7 +1018,7 @@ sub _isSplit {
 # a UNICAST probe on EVERY address it holds - and `_probe` unicasts to every
 # address already in %found.  So a remembered address refreshes its own
 # lastSeen for as long as its interface is up and never ages out; that split is
-# PERMANENT, not a fifteen-minute window.  Running HQPlayer on more than one
+# PERMANENT, not an INSTANCE_TTL window.  Running HQPlayer on more than one
 # active interface is DECLINED as scope (Simon, 2026-09-20; the vendor
 # documents single-interface operation), so collapsing it is not this gate's
 # job - and merging on the name alone would take two REAL instances with it.
@@ -1040,6 +1040,7 @@ sub _idsFor {
         my $group = $byName{$name};
 
         if ( @$group == 1 ) {
+            delete $splitWarned{$name};
             my $inst = $group->[0];
             $id{ $inst->{ip} } = {
                 id   => _idFor($name),
@@ -1049,7 +1050,7 @@ sub _idsFor {
         }
 
         # A PARTIAL list is mid-round: the instances that have not answered
-        # YET still carry the previous round's lastSeen, so every one of them
+        # YET still carry the previous round's number, so every one of them
         # would read as stale and a genuinely second instance would be demoted
         # to a corpse.  Defer the whole group - the complete round decides it
         # ~LISTEN_TIME later, and until then nothing is touched.
@@ -1062,8 +1063,8 @@ sub _idsFor {
         # the player's prefs, playlist and sync group hang off - and leave the
         # corpses without one.
         #
-        # BUT ONLY WHEN THE NAME IS NOT ALREADY AN ESTABLISHED PAIR.  lastSeen
-        # cannot tell "the same daemon at an address it has left" from "a
+        # BUT ONLY WHEN THE NAME IS NOT ALREADY AN ESTABLISHED PAIR.  Missing a
+        # round cannot tell "the same daemon at an address it has left" from "a
         # SECOND daemon that is briefly quiet" - hqplayerd restarts on any
         # configuration change and misses a round or more while it does.
         # Collapsing that re-keyed the instance that did NOT restart onto the
@@ -1074,6 +1075,7 @@ sub _idsFor {
         # holds ADDRESS-QUALIFIED ones.  A pair keeps today's behaviour, and
         # its quiet member sits out INSTANCE_TTL's grace untouched.
         if ( @$live == 1 && !_isSplit( $name, $group, $existing ) ) {
+            delete $splitWarned{$name};
             my $inst = $live->[0];
 
             main::INFOLOG && $log->is_info && $log->info(
@@ -1089,9 +1091,16 @@ sub _idsFor {
             next;
         }
 
-        $log->warn( scalar(@$group) . " instances answer to '$name' ("
-            . join( ', ', map { $_->{ip} } @$group )
-            . ') - identifying them by address instead' );
+        # Said once per CHANGE, not once per round: discovery now runs every
+        # 5s, and a same-named pair is a steady state - HQPlayer Embedded names
+        # every instance "HQPlayerEmbedded" - so saying it each round would put
+        # a warning in the log every few seconds for as long as both are up.
+        my $addrs = join( ', ', sort map { $_->{ip} } @$group );
+        if ( ( $splitWarned{$name} // '' ) ne $addrs ) {
+            $splitWarned{$name} = $addrs;
+            $log->warn( scalar(@$group) . " instances answer to '$name' ($addrs)"
+                . ' - identifying them by address instead' );
+        }
 
         for my $inst (@$group) {
             $id{ $inst->{ip} } = {
@@ -1201,8 +1210,7 @@ sub _onLinkState {
 
         # The status subscription is armed HERE, not at a track load.  It is
         # the plugin's only liveness signal for a peer that goes quiet without
-        # closing the socket, and discovery reads that link state to decide how
-        # hard to keep probing - see _statusWatchdog in Player.pm.
+        # closing the socket - see _statusWatchdog in Player.pm.
         $client->_startPolling;
 
         _probeRestart( ( $b->{instance} || {} )->{ip} );
