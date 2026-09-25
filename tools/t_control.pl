@@ -269,5 +269,82 @@ print "-- onState(0) says whether the dropped link had been PROVEN --\n";
     is(join(',', @got), '0,1', 'an unanswered accept reports 0, a replied link reports 1');
 }
 
+print "-- send on a DOWN link fails the command and does NOT connect --\n";
+{
+    # It used to connect at once, skipping the reconnect backoff for every
+    # command LMS sends a disconnected player, and from inside _dropLink when
+    # a link-down listener sent something. The reconnect is already scheduled;
+    # send must leave it to that.
+    my @connects;
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, 1 };
+    Slim::Utils::Timers::_reset();
+
+    my @got;
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->send( '<Stop/>', sub { push @got, [@_] } );
+    is(scalar @connects, 0, 'a command on a down link starts no connect');
+    is(scalar @{ $c->{queue} }, 0, 'and is not left queued for the next link');
+    is(scalar @got, 0, 'its failure is not reported inside send()');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar @got, 1, 'but on the next turn');
+    is(defined $got[0][0] ? 'success' : 'failed', 'failed', 'as a failure, the dropped-link contract');
+
+    # the case that mattered: a listener that sends as the link drops
+    @connects = ();
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T',
+        onState => sub { $_[0]->send('<Stop/>') if !$_[1] } );
+    $d->{connected} = 1;
+    $d->_dropLink('test');
+    is(scalar @connects, 0, 'a Stop sent from the link-down callback does not reconnect ahead of the backoff');
+    is(scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 1,
+       'the backoff reconnect is still the one scheduled');
+
+    # a link being closed for good: failed too, not left waiting for ever
+    @got = ();
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $e->{closing} = 1;
+    $e->send( '<Stop/>', sub { push @got, [@_] } );
+    Slim::Utils::Timers::_fireAll();
+    is(scalar @got, 1, 'a command on a closed link is failed, not left without a callback');
+
+    # CONTROL: a link still CONNECTING queues the command for when it is up
+    @connects = ();
+    my $f = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $f->{sock} = 'pending'; $f->{connecting} = 1;
+    $f->send('<Stop/>');
+    is(scalar @{ $f->{queue} }, 1, 'CONTROL: a connecting link still queues the command');
+    is(scalar @connects, 0, 'and starts no second connect');
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- reconnectNow: discovery heard it, so try now --\n";
+{
+    my @connects;
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, 1 };
+    Slim::Utils::Timers::_reset();
+
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->{backoff} = 60;
+    $c->_scheduleReconnect;                        # the backoff timer, as after a drop
+    $c->reconnectNow;
+    is(scalar @connects, 1, 'a down link connects now');
+    is(scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
+       'and the pending backoff retry is dropped, not left to connect again');
+    is($c->{backoff}, 60, 'the backoff is left where it was, so a failure waits as long as before');
+
+    @connects = ();
+    $c->{sock} = 'up';
+    $c->reconnectNow;
+    is(scalar @connects, 0, 'CONTROL: a link that is up is left alone');
+
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $d->{closing} = 1;
+    $d->reconnectNow;
+    is(scalar @connects, 0, 'and a link being closed is not reopened');
+    Slim::Utils::Timers::_reset();
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

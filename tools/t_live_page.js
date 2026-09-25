@@ -102,7 +102,7 @@ var pass = 0, fail = 0;
 function ok(c, n) { if (c) { pass++; print('  ok   ' + n); } else { fail++; print('  FAIL ' + n); } }
 
 function bridge(id, name, playing, title) {
-    return { id: id, name: name, playerid: 'pid:' + id, connected: 'Connected - 10.0.0.' + id + ':4321',
+    return { id: id, name: name, playerid: 'pid:' + id, connected: 'Connected - 10.0.0.' + id + ':4321', up: 1,
              source: '44100 Hz / 16 bit FLAC', output: '11289600 Hz / 1 bit SDM (DSD)',
              filter: 'poly-sinc-gauss-long', shaper: 'ASDM7EC-fast', speed: '3.3x realtime',
              np_title: title || undefined, np_artist: 'An Artist', np_album: 'An Album',
@@ -166,6 +166,14 @@ pickEl().fire('click', { target: { className: 'chip', getAttribute: function () 
                                    parentNode: pickEl() } });
 ok(!STORE.hasOwnProperty('hqplive::player'), 'the remembered choice is cleared');
 ok(titleTxt() === 'A Song', 'and the panel follows the playing instance again');
+
+print('== a disconnected instance is drawn as disconnected');
+var down = bridge(4, 'Down', false); down.connected = 'Not connected - 10.0.0.4:4321'; down.up = 0;
+answer([ bridge(2, 'ManCave', true, 'A Song'), down ]);
+ok(/<div class="v bad">Not connected - 10\.0\.0\.4:4321/.test(cardsHtml()),
+   'its status is marked bad - both strings contain a "-", the flag is what counts');
+ok(/<div class="v ok">Connected - 10\.0\.0\.2:4321/.test(cardsHtml()),
+   'CONTROL: the connected one is still marked ok');
 
 print('== one instance: no chooser at all');
 answer([ bridge(2, 'ManCave', true, 'A Song') ]);

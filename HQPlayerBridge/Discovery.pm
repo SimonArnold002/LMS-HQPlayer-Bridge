@@ -32,32 +32,40 @@ my $log = logger('plugin.hqplayerbridge');
 
 use constant MCAST_ADDR   => '239.192.0.199';
 use constant MCAST_PORT   => 4321;
-use constant INSTANCE_TTL => 5 * 60;    # see the note below ROUND_PERIOD
+use constant INSTANCE_TTL => 5 * 60;    # see the note below IDLE_PERIOD
 
 use constant PROBE_XML    => '<?xml version="1.0" encoding="UTF-8"?><discover>hqplayer</discover>';
 use constant LISTEN_TIME  => 1.5;   # seconds to collect replies after the last probe
 
-# One datagram per round was one point of failure.  MEASURED against a live
-# hqplayerd: of five rounds, it logged receiving only three - the probes at
-# 17:47:49 (it was restarting) and 17:50:54 (it was initialising its audio
-# engine) never arrived at all.  So each round now sends PROBE_BURST probes
-# PROBE_GAP apart, which costs three ~80 byte datagrams and removes the whole
-# class of "one lost packet, one wasted round".
-use constant PROBE_BURST  => 3;
-use constant PROBE_GAP    => 0.2;
-
-# How long to wait between rounds: Lyrion's own heartbeat. Slimproto.pm checks
-# its players every `$check_all_clients_time = 5` seconds, and this looks for
-# HQPlayers at the same pace, WHATEVER is already known or connected.
+# ONE probe a round: the multicast datagram, plus the same datagram straight
+# to every address already known (see _probe). hqplayerd writes a line to its
+# log for every probe it receives, so each one is noise in the user's log.
 #
-# There used to be three periods, and the slowest - ten minutes, once every
-# known instance was connected - assumed nothing new could turn up while
-# everything known was up. With a SECOND HQPlayer that is exactly wrong: one
-# switched on while the other is connected waited up to ten minutes to appear
-# (measured 2026-09-23: 8+ minutes, twice). HQPlayer never announces itself,
-# so looking is the only way a new one is ever found, and it costs three ~80
-# byte datagrams a round.
-use constant ROUND_PERIOD => 5;
+# Until 2026-09-25 a round sent a BURST of three, 0.2s apart, after two probes
+# were measured never arriving - one while hqplayerd was restarting, one while
+# it was starting its audio engine. The burst could not cover that: all three
+# land inside the same restart window (one was 27s long). What does cover it
+# is the next round, and while anything is missing that is at most
+# COLD_PERIOD away. With the burst at a 5s pace the Mac mini's log was 92%
+# discovery lines (measured 2026-09-25, ~54 a minute).
+
+# How long to wait between rounds. HQPlayer never announces itself, so looking
+# is the only way a NEW one is ever found - but an instance whose control link
+# is up needs no finding. So:
+#
+#   nothing found yet            FIRST_BACKOFF, doubling up to COLD_PERIOD
+#   a known one not connected    COLD_PERIOD - it may be back, or moved
+#   every known one connected    IDLE_PERIOD - only a NEW HQPlayer is left
+#                                to find, and it appears within this long
+#
+# "Connected" is the caller's answer (Plugin::_linkUpFor), the same one
+# Material shows. The idle period was ten minutes until 2026-09-23, which hid
+# a second HQPlayer switched on while the first was connected for up to ten
+# minutes; then a flat 5s, which filled HQPlayer's log. 15s, Simon's call
+# 2026-09-25.
+use constant FIRST_BACKOFF => 2;
+use constant COLD_PERIOD   => 10;
+use constant IDLE_PERIOD   => 15;
 
 # How long an instance may stay silent before we give up on it and let its
 # player be removed.
@@ -65,8 +73,8 @@ use constant ROUND_PERIOD => 5;
 # Deliberately generous.  Discovery only exists to FIND instances and to notice
 # an address change - the control link is the real liveness signal, and it
 # reconnects with backoff indefinitely.  HQPlayer restarts its server on
-# configuration changes and when its NAA comes and goes, and during that window
-# it answers neither UDP discovery nor TCP.  Expiring quickly would tear the LMS
+# configuration changes, and during that window it answers neither UDP
+# discovery nor TCP.  Expiring quickly would tear the LMS
 # player down over a blip, losing its playlist, prefs and sync group, and then
 # recreate it moments later.  Better to keep the player and let the control link
 # reconnect - which is exactly what it did.
@@ -81,16 +89,19 @@ use constant ROUND_PERIOD => 5;
 my $sock;         # live only for the duration of a round
 my %found;        # ip => { ip, name, version, lastSeen, round }
 my $onChange;     # caller's callback
+my $linkUp;       # caller's "is this address's control link connected?"
 my $running = 0;
-my $burst   = 0;  # probes left to send in the current round
+my $backoff = 0;  # the current wait while nothing has been found
 my $roundNo = 1;  # which round a reply answered - see `round` in _reply;
                   # moves on as each round ENDS, in _roundDone
 
 sub start {
-    my ( $class, $cb ) = @_;
+    my ( $class, $cb, $linkCb ) = @_;
 
     $onChange = $cb;
+    $linkUp   = $linkCb;
     $running  = 1;
+    $backoff  = 0;
 
     _round();
 
@@ -99,9 +110,8 @@ sub start {
 
 sub stop {
     $running = 0;
-    $burst   = 0;
+    $backoff = 0;
     Slim::Utils::Timers::killTimers( undef, \&_round );
-    Slim::Utils::Timers::killTimers( undef, \&_probe );
     Slim::Utils::Timers::killTimers( undef, \&_roundDone );
     _closeSocket();
     %found = ();
@@ -113,15 +123,18 @@ sub instances {
     return [ map { $found{$_} } sort keys %found ];
 }
 
+# The round being collected now. An instance whose `round` equals it answered
+# THIS round - the caller uses that to tell "just heard" from "remembered".
+sub round { $roundNo }
+
 # ---------------------------------------------------------------------------
 # One discovery round
 # ---------------------------------------------------------------------------
 sub _round {
     return unless $running;
 
-    # A round left half-sent - the plugin was stopped and restarted inside a
-    # burst - must not fire into the new round's socket.
-    Slim::Utils::Timers::killTimers( undef, \&_probe );
+    # A round left listening - the plugin was stopped and restarted inside
+    # it - must not close the new round's socket.
     Slim::Utils::Timers::killTimers( undef, \&_roundDone );
 
     _closeSocket();
@@ -145,31 +158,23 @@ sub _round {
 
     Slim::Networking::Select::addRead( $sock, \&_reply );
 
-    $burst = PROBE_BURST;
-
     _probe();
 
     return;
 }
 
-# One probe of the round's burst.
+# The round's one probe.
 sub _probe {
     return unless $running && $sock;
-
-    my $first = $burst == PROBE_BURST;
 
     my $dest = pack_sockaddr_in( MCAST_PORT, Socket::inet_aton( MCAST_ADDR ) );
 
     my $sent = send( $sock, PROBE_XML, 0, $dest );
 
     if ( !defined $sent ) {
-        # Only the first failure is worth a line and an abandoned round; a
-        # later one in the same burst has already been reported.
-        if ($first) {
-            $log->warn("discovery: multicast send failed: $! (is the network up?)");
-            _closeSocket();
-            return _schedule();
-        }
+        $log->warn("discovery: multicast send failed: $! (is the network up?)");
+        _closeSocket();
+        return _schedule();
     }
 
     # An instance we have already met does not need multicast at all, and
@@ -187,13 +192,8 @@ sub _probe {
               pack_sockaddr_in( MCAST_PORT, Socket::inet_aton($ip) ) );
     }
 
-    if ( --$burst > 0 ) {
-        Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + PROBE_GAP, \&_probe );
-        return;
-    }
-
     main::DEBUGLOG && $log->is_debug && $log->debug(
-        'discovery: ' . PROBE_BURST . ' probes sent, listening ' . LISTEN_TIME . 's' );
+        'discovery: probe sent, listening ' . LISTEN_TIME . 's' );
 
     Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + LISTEN_TIME, \&_roundDone );
 
@@ -284,13 +284,38 @@ sub _roundDone {
     return;
 }
 
-# The next round, ROUND_PERIOD after this one ends - always. See ROUND_PERIOD
-# for why nothing about what is already known or connected changes it.
+# Every known instance has a connected control link. Nothing known is not
+# settled, and neither is a caller that cannot say.
+sub _settled {
+    return 0 unless $linkUp && scalar keys %found;
+
+    for my $ip ( keys %found ) {
+        return 0 unless $linkUp->($ip);
+    }
+
+    return 1;
+}
+
+# The next round - see IDLE_PERIOD for the three waits.
 sub _schedule {
     return unless $running;
 
+    my $wait;
+
+    if ( !scalar keys %found ) {
+        $backoff = $backoff ? $backoff * 2 : FIRST_BACKOFF;
+        $backoff = COLD_PERIOD if $backoff > COLD_PERIOD;
+        $wait    = $backoff;
+    }
+    else {
+        $backoff = 0;
+        $wait    = _settled() ? IDLE_PERIOD : COLD_PERIOD;
+    }
+
+    main::DEBUGLOG && $log->is_debug && $log->debug("discovery: next round in ${wait}s");
+
     Slim::Utils::Timers::killTimers( undef, \&_round );
-    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + ROUND_PERIOD, \&_round );
+    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time() + $wait, \&_round );
 
     return;
 }

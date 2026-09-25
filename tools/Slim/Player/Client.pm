@@ -2,16 +2,22 @@ package Slim::Player::Client;
 use strict; use warnings;
 use base qw(Slim::Utils::Accessor);
 use Slim::Utils::Accessor;
+use Slim::Control::Request;   # the constructor notifies, as the real one does
 __PACKAGE__->mk_accessor('rw', qw(
     id macaddress paddr revision deviceid uuid tcpsock udpsock
     display controller name songElapsedSeconds streamingsocket
-    bufferReady readyToStream _tempVolume chunks
+    bufferReady readyToStream _tempVolume chunks disconnected
 ));
 # The tier 4 endpoint resolves a url token by scanning the client list, so the
 # stub has to have one.
 our @REGISTRY;
 
-sub new { my $class = shift; my $c = $class->SUPER::new; $c->id($_[0]); $c->chunks([]); push @REGISTRY, $c; return $c }
+# Faithful to Slim::Player::Client::new in the two ways the bridge depends on
+# (public/9.1 Client.pm ~307-315): `disconnected` starts at 0, and the
+# constructor ITSELF sends `client new`. A stub that sent nothing let a test
+# assert that the plugin was the only sender - it is not.
+sub new { my $class = shift; my $c = $class->SUPER::new; $c->id($_[0]); $c->chunks([]); $c->disconnected(0); push @REGISTRY, $c;
+          Slim::Control::Request::notifyFromArray( $c, [ 'client', 'new' ] ); return $c }
 sub init {}
 
 sub clients { return @REGISTRY }

@@ -300,13 +300,23 @@ sub connected {
 }
 
 # TRAP: BEFORE LMS 9.1, forgetClient DIES ON OUR tcpsock. It ends with
-# `slimproto_close($client->tcpsock()) if defined $client->tcpsock()`, and
-# slimproto_close calls ->close on it - on the literal 1 that is "Can't locate
-# object method close via package 1", AFTER the client has left %clientHash.
-# 9.1 guards it (`ref $client->tcpsock eq "IO::Socket::INET"`); install.xml
-# allows 8.0+. A forgotten player has no use for it, so clear it first.
+# `slimproto_close($client->tcpsock()) if defined $client->tcpsock()`
+# (Client.pm, public/9.0 and 8.5), whose first call is
+# Select::removeRead(1) -> IO::Select::_remove -> `${*$fh}{$slot}`: under
+# `use strict` that is "Can't use string ("1") as a symbol ref" - AFTER the
+# client has left %clientHash. 9.1 guards it
+# (`ref $client->tcpsock eq "IO::Socket::INET"`); install.xml allows 8.0+.
+# A forgotten player has no use for it, so clear it first.
+#
+# AND CLOSE THE CONTROL LINK HERE, not only in _teardown: the bridge's own
+# _onForget only runs at the next notification pass, and until then the link's
+# backoff reconnect is still scheduled - a forgotten player must not be proven
+# again. (`client forget` runs playerInactive before this, whose <Stop/> used
+# to start a connect at once on a dead link; Control::send now fails a command
+# on a down link instead.)
 sub forgetClient {
     my $self = shift;
+    if ( my $ctl = $self->hqControl ) { $ctl->close }
     $self->tcpsock(undef);
     return $self->SUPER::forgetClient(@_);
 }

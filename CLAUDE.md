@@ -65,9 +65,13 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | renaming an instance making a NEW player and stranding its settings (`_idFor`, the discovery name) | **KNOWN, UNFIXED** 2026-09-20 — the name is a user-editable field, not a product string | `the discovery name is a SETTING` |
 | NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
 | `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance | `Lyrion's 5-second heartbeat` |
-| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down does NOT call playerInactive, `client forget` keyed on clientid (1.0.19) | `CONNECTED IS THE CONTROL LINK` |
+| the flat 5s discovery pace, `PROBE_BURST` (3 probes a round); discovery traffic filling HQPlayer's log | **REVERSED** 2026-09-25, Simon: "why are we polling more" - ONE probe a round; 2/4/8/10s while nothing is found, 10s while a known one is not connected, `IDLE_PERIOD` 15s once all are connected (`_linkUpFor` = `Player::connected`). A new HQPlayer appears within ~15s. NAA plays NO part | `DISCOVERY PACE 2026-09-25` |
+| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down does NOT call playerInactive, `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
+| `client new` sent only by the plugin's `_create`, so moving it moves the announcement | **WRONG, MEASURED** 2026-09-25 - `Slim::Player::Client::new` sends it itself (Client.pm:315); the offline stub does not, which hides it | `the constructor already sends` |
+| an expired HQPlayer trial that REPLIES with `result="Error"` reading connected (`Control::proven` on any reply) | **DECIDED** 2026-09-25, Simon's call - no trial detection; only a SHUT DOWN HQPlayer must leave the list, and it does | `we cant attempt to work out if its a trial` |
 | `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `cstring INTERPOLATES` |
 | `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `the error callback really is THREE args` |
+| Windows support for the restart helper - `install.ps1`, `t_powershell.py`, any `win32` branch in `hqrestart.py`; every Windows finding (Store placeholder, `-System` folder lock, `Stop-Helper`, firewall profiles, `pythonw`) | **REMOVED** 2026-09-25, Simon's call - "causing too many problems". macOS and Linux only; `main()` refuses any other OS with exit 2. Do not re-propose, and do not report a Windows gap | `WINDOWS SUPPORT REMOVED` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
 
 **Two standing rules that kill most repeat findings:**
@@ -101,6 +105,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | Finding | Verdict | Why |
 |---|---|---|
 | `install.sh --allow` / `install.ps1 -Allow` (via `hqrestart.py --allow`, `set_allow`) REPLACE the whole `allow` list rather than append, so following the helper's refusal hint (`./install.sh --allow <ip>`) drops any second Lyrion server already listed | **BY DESIGN** 2026-09-23, Simon's call | **ONE LYRION SERVER PER HQPLAYER.** Only one Lyrion server should be talking to an HQPlayer, so `allow` naming the one current server is the intended state; replace is correct and append would be the bug. Raised as a minor aside in the 2026-09-23 review of 5775983..6ee1185 and declined there. Do not re-report. |
+| The restart helper should support Windows (`install.ps1`, a scheduled task, `Restart-Service` / `taskkill` / `tasklist`, SID owner checks) | **REMOVED** 2026-09-25, Simon's call | **WINDOWS SUPPORT REMOVED.** Simon: *"remove all support for windows on the helper its causing too many problems."* It had never run on a real Windows install - only in a harness - and in the 2026-09-25 review 4 of 9 findings were Windows installer defects, after four earlier rounds of the same. Deleted: `install.ps1`, `tools/t_powershell.py`, the install.ps1 half of `t_installers.py`, the Windows cases in `t_hqrestart.py`, and every `win32` branch in `hqrestart.py` (`detect_win32`, `win32_owner_sids`, `powershell()`, the tasklist/taskkill paths, `creationflags`, the `pythonw` stderr-to-file fallback). `main()` now exits 2 with "hqrestart runs on macOS and Linux only" on any other OS, before a config or token is written (pinned in `t_hqrestart.py`, fails 2 against the old helper). The plugin side never had Windows code - the Restart row only calls `/ping` and `/restart`. The historical rounds below that discuss Windows are kept as history, not live guidance. |
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
 | Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayer-verify-playback-not-state]]. |
 | A bare `<Status/>` is not a subscribe - the vendor's client always writes the attribute, so a missing one reads as `subscribe="0"`, no pushes ever arrive, the clock freezes and LMS is stranded in `play` (`Player.pm` `_startPolling` / `_statusWatchdog`) | **DECLINED** 2026-08-28 | Measured A/B against engine 6.0.4 on one connection each, 6s: bare `<Status/>` -> **2** pushes, `subscribe="1"` -> **2**, `subscribe="0"` -> **1**. Bare is equivalent to `subscribe="1"`; the "missing attribute reads as 0" step was flagged as unproven by the reporter and is the step that is false. The log pattern has a different cause: **HQPlayer stops pushing when it is not playing**. Watchdog firings during the healthy sweep 16:21-16:27 = **0**; continuous from 16:29:36, right after a pause at 16:29:06. Sending `subscribe="1"` explicitly is harmless and slightly clearer, but fixes nothing. THE REPORT'S SYMPTOM IS REAL WITH ANOTHER CAUSE - see the row below. |
@@ -175,7 +180,7 @@ then plays it.
 | `HQPlayerBridge/Stream.pm` | Tier 4: the plugin's own audio endpoint, serving LMS's transcoded stream. Its paths carry no query string, but that is a convention, NOT the constraint the ledger disproves at the top of this file |
 | `HQPlayerBridge/Live.pm` | The standalone live page - a raw handler owning the WHOLE document |
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
-| `tools/hqrestart/` | The OPTIONAL restart helper (`hqrestart.py`, `install.sh`, `install.ps1`, its own README). Runs on the HQPlayer host; NOT in the zip. Build history: `## 1.0.10-1.0.13`; the install-time `allow` prompt, `hqrestart.py --allow` and rounds 26-27: `## HELPER 2026-09-23` |
+| `tools/hqrestart/` | The OPTIONAL restart helper (`hqrestart.py`, `install.sh`, its own README). Runs on the HQPlayer host - macOS or Linux only, Windows REMOVED 2026-09-25; NOT in the zip. Build history: `## 1.0.10-1.0.13`; the install-time `allow` prompt, `hqrestart.py --allow` and rounds 26-27: `## HELPER 2026-09-23` |
 
 ## Branches and releasing
 
@@ -2370,10 +2375,10 @@ one; corrected the same day, with the reason in the code.)
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
 tree, runs the five Perl suites (864 assertions) plus the live page EXECUTED
 under osascript (15, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (152) and the installers run end to end (24), checks `install.sh` parses,
-parses every piece of the helper's PowerShell with `pwsh` (18; skipped without
-it), and sweeps called-vs-defined subs. Counts as of 2026-09-23; they move every
-round, and the run prints them.
+the helper's Python suite (147) and the installer run end to end (13), checks
+`install.sh` parses, and sweeps called-vs-defined subs. Counts as of 2026-09-25;
+they move every round, and the run prints them. (The PowerShell parse check and
+the install.ps1 half of the installer suite went with Windows support.)
 
 | file | covers |
 |---|---|
@@ -2383,9 +2388,8 @@ round, and the run prints them.
 | `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper) |
 | `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
-| `t_powershell.py` | every piece of PowerShell the helper ships - `install.ps1` and each command `hqrestart.py` BUILDS, fed a quote in a path and a service name - PARSED by `pwsh` (PARSE ONLY: macOS pwsh has no CIM/`Restart-Service`), plus a refusal of PowerShell-7-only syntax (Windows ships 5.1). Skips, saying so, without `pwsh` |
-| `t_installers.py` | both installers RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt, no Python and `-NonInteractive` all leave the old helper running; `pythonw.exe` without `python.exe` leaves `allow` untouched and says so. Refuses to run unless the stub `launchctl` wins on PATH |
-| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS/Windows), config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log) |
+| `t_installers.py` | `install.sh` RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt and no Python all leave the old helper running. Refuses to run unless the stub `launchctl` wins on PATH |
+| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS), the refusal of any other OS at start, config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log) |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
 one, so hash-slot mistakes fail here rather than on the server.
@@ -3115,8 +3119,9 @@ returned `tcpsock`, a literal 1, for ever. Now:
   once per link at HQPlayer's first reply (`onProven`), and mirrors
   `Squeezebox::reconnect`: `disconnected(0)`, `playerActive` if powered (needed at
   FIRST link-up too: `Client::startup`'s `restoreSync` runs while the player still
-  reads disconnected), notify `client new` on the FIRST proof ever (`client new` is
-  no longer sent at `_create`) and `client reconnect` after.
+  reads disconnected), notify `client reconnect` - EVERY proof (round 3: LMS's own
+  constructor sends `client new`, and `_create` marks the player disconnected and
+  announces `client disconnect` straight after).
   DOWN is `Plugin::_onLinkState`, only when `_dropLink` reports the link WAS proven
   (`onState($ctl, 0, $wasProven)`), and does `disconnected(1)` + notify
   `client disconnect` - **deliberately NOT `playerInactive`** (see round 2 below).
@@ -3155,7 +3160,9 @@ then FIXED as 1.0.19 (1.0.18 never installed).** Every one was in code 1.0.17/1.
 `Request::client` is a `getClient()` lookup - undef. Now keyed on `$request->clientid`.
 The test had handed back a live client, so it passed against a handler that could not run;
 `FakeRequest->client` now returns undef. (2) **`forgetClient` DIES before LMS 9.1** on the
-literal `tcpsock` 1 (`slimproto_close(1)` -> `1->close`), after the client left
+literal `tcpsock` 1 (`slimproto_close(1)` -> `Select::removeRead(1)` ->
+`IO::Select::_remove`'s `${*$fh}` under strict refs: "Can't use string ("1") as a symbol
+ref"; corrected 2026-09-25 from a first reading that blamed `->close`), after the client left
 `%clientHash`; 9.0 and 8.5 read `... if defined $client->tcpsock()`, 9.1 checks
 `ref eq "IO::Socket::INET"` (fetched from LMS-Community `public/8.5|9.0|9.1`). install.xml
 allows 8.0+. `Player::forgetClient` now clears `tcpsock` first; both Plugin.pm sites call it
@@ -3172,7 +3179,8 @@ exactly what every release did while `connected` was always 1. `playerActive` on
 kept (restoreSync at init). (5) the feed's Connected row and the `_onInstances` removal
 guard still read the ACCEPT; both read `proven` now. (6) `client new` fired at `_create`
 with the player reading disconnected, and the first proof sent `reconnect` with no
-disconnect before it - now `new` at first proof, `reconnect` after. (7) `announced`
+disconnect before it - now `new` at first proof, `reconnect` after. **WRONG - see
+round 3: the constructor already sends `new`.** (7) `announced`
 duplicated Control's `proven` for the down path only because `_dropLink` clears `proven`
 before calling out; `_dropLink` now passes `$wasProven`, and `announced` only means "ever
 proven" (for new vs reconnect). (8) the forget test - see (1).
@@ -3192,9 +3200,11 @@ Material and the sibling plugins. Recorded so a review does not re-derive them:*
 * **Listeners of `client new/reconnect/disconnect`**: `serverstatusQuery_filter` answers
   ANY `client` notification with a push inside 1.3s - **this is what makes Material drop
   the player promptly**, so the notifications are load-bearing, not decoration. Also
-  `Discovery::Players` (a `fetch_servers`, cheap), UPnP `MediaRenderer` (adds/removes the
-  player's renderer, as for a Squeezebox), `ExtendedBrowseModes` (per-client menus, now at
-  first proof), xPL. `Buttons::Settings` listens to `disconnect` only in its server-switch
+  `Discovery::Players` (a `fetch_servers`, cheap), UPnP `MediaRenderer` (adds the
+  player's renderer on `new`/`reconnect`, removes it and clears its `uuid` on
+  `disconnect`, so a later `reconnect` registers it again - as for a Squeezebox),
+  `ExtendedBrowseModes` (per-client menus, on `new` at construction and each
+  `reconnect`), xPL. `Buttons::Settings` listens to `disconnect` only in its server-switch
   mode, on a display this player lacks. **Notifications are QUEUED** (`notifyFromArray`
   pushes `@notificationQueue`, delivered next idle loop), so no listener runs inside
   `_dispatch` or `_dropLink`.
@@ -3223,8 +3233,71 @@ Material and the sibling plugins. Recorded so a review does not re-derive them:*
   `connected` (the accept) on purpose - it must probe an accepted-but-silent link to time
   it out. The feed row is now pinned too (fails with the accept restored).
 
-**UNVERIFIED LIVE** until 1.0.19 is installed. (The 1.0.19 zip predates one comment edit in
-Control.pm and one added test - diffed: the only difference is that comment.)
+**REVIEW ROUND 3 2026-09-25 (/code-review of d298592), 4 findings, all VERIFIED then FIXED
+as 1.0.20:**
+(1) **`Slim::Player::Client::new` sends `client new` itself** (Client.pm:315, public/9.1;
+reached through `Player->new` -> `SUPER::new`). Round 2's fix (6) rested on the belief
+that `_create` was the only sender - so every player was announced `new` twice, and at
+construction it went out while the player read disconnected, with no `disconnect` ever
+following for one that never answers (UPnP's renderer stayed registered). **Also true
+before 1.0.17**: the constructor plus the plugin's own notify. Now `_create` does
+`disconnected(1)` + `client disconnect` right after construction (the `disconnected`
+accessor had read 0 while `connected` read 0), and every proof sends `reconnect`;
+`announced` is gone. The offline stub's `new` sends nothing - which is why a test could
+assert a sequence production never produces; the `_create` test now runs the REAL
+`_create`, and the stub gained the real `disconnected` accessor it lacked.
+(2) **The live page tested `b.connected.indexOf('-') > 0`** - true for both "Connected -
+ip" and "Not connected - ip", so a disconnected instance was always drawn green. Since
+0.2.61; 1.0.19 made the state common. `signalPathFor` now also returns `up` (1/0), the
+query sends it, the page reads it. Pinned by the EXECUTED page test (a down card is `bad`,
+control: the up one `ok`) and a test of the real `_signalPathQuery`.
+(3) `playerActive` in `_onLinkProven` ran before the announcement and outside an eval, so
+a die in its `_JumpToTime` path lost the `reconnect` (and Material's re-list). Now the
+flag and the notify go first, and `playerActive` is in its own eval, logged.
+(4) **The forget path's OWN `<Stop/>`**: `clientForgetCommand` runs `playerInactive`
+BEFORE `forgetClient`, which can reach `Player::stop` -> `Control::send` -> an immediate
+connect, with `_onForget` only running at the next notification pass - so a forgotten
+player's link could be proven again. `Player::forgetClient` now closes the control link
+itself (`Control::close` is idempotent: a second call finds no socket, fires no onState,
+schedules no reconnect). The round-2 audit covered only `_teardown`'s Stop.
+
+Mutations, each FAILS its own assertion: no disconnect at `_create` (2); the page parsing
+the string; `playerActive` unguarded; `forgetClient` not closing; `up` left out of the
+query. `t_plugin` 179, page 17, all suites green, sweep clean.
+**VERIFICATION PASS 2026-09-25 after round 3 (Simon: "stop assuming, check all things
+against the code, read all the docs").** Every claim in the 1.0.20 comments re-read against
+LMS `public/9.1` (and 9.0 where versions differ). Confirmed: `Player::init` calls
+`power($pref, 1)` BEFORE `startup`, and `power(on)` calls `playerActive` without testing
+`connected` (Player.pm:294; `mode` is unset at init so the line-208 guard passes) - so a
+powered SOLO player is active from init and `playerActive` at proof returns at once; only a
+synced player that `restoreSync` put in a group needs it. `_Stop`/`_stopClient` call
+`$client->stop`, ours sends `<Stop/>`. Fakes checked against the real signatures
+(`notifyFromArray($client, $lineRef)`, `addResultLoop($loop, $idx, $key, $val)`, `isQuery`,
+`clientid`). **Corrected:** (a) the 9.0 `forgetClient` death is in `Select::removeRead(1)`
+(`${*$fh}` under strict refs), not `->close` - reproduced in perl; (b) the `tcpsock(1)`
+comment claimed LMS still reads it - in core only the Squeezebox classes, Slimproto,
+`Display::Graphics`, NetTest and `Client::forgetClient` do; (c) the offline
+`Slim::Player::Client::new` stub now sends `client new` and starts `disconnected` at 0, as
+the real one does - the gap that hid round 3's finding (1). Zip (1.0.20) differs from the
+tree in comments only (diffed).
+**Reference read, not previously consulted: `Slim::Player::HTTP`** (LMS's own HTTP-fed
+player) ties `connected` to its streaming socket and sends NO client notifications on
+close; the bridge follows the Squeezebox model instead (Slimproto's close/hello
+bookkeeping), because Material only re-lists on a `client` notification.
+**OPEN, put to Simon:** "proven" is ANY reply, `result="Error"` included. An expired trial
+seen 2026-09-25 12:45 (ManCave) answered `VolumeRange`, `SetRepeat`, `GetTransport` and
+`Status` with `result="Error"` "not authenticated and no internet access"; no `GetInfo`
+failure was logged (inferred OK - not measured). So under 1.0.20 that instance reads
+CONNECTED in Material while refusing every command. **DECIDED 2026-09-25, Simon: "leave it
+as long as when its shutdown it goes away, we cant attempt to work out if its a trial or
+not"** - any reply proves the link; the bridge does NOT try to tell an expired trial from a
+licensed instance. The requirement that stands: a SHUT DOWN HQPlayer leaves the list.
+Checked in code: shutdown closes the socket, `_readable` reads 0 bytes -> `_dropLink('HQPlayer
+closed the link')` -> `onState(0, 1)` -> `disconnected(1)` + `client disconnect` ->
+serverstatus push (<=1.3s); seen live for ManCave at 12:46:56. A host that dies WITHOUT
+closing (power loss) takes the status watchdog's ~40s.
+
+**UNVERIFIED LIVE** until 1.0.20 is installed.
 
 **Two knock-on effects the faster pace would have caused, both fixed in the same
 change and both pinned by tests that FAIL against the previous commit:**
@@ -3247,6 +3320,53 @@ round-number counter is monotonic across stop/start and only ever compared
 within one table; the control link's own liveness (`STATUS_WATCHDOG` +
 `REPLY_TIMEOUT`, ~40s) is NOT tied to Lyrion's 15s - `PlaylistAdd` makes HQPlayer
 fetch the media before replying, which can legitimately take longer.
+
+**DISCOVERY PACE 2026-09-25 - the flat 5s and the 3-probe burst are REVERSED.** Simon:
+*"why are we polling more"*. Measured on the Mac mini's own log: ~54 `Discovery from`
+lines a minute, 141k of 152k lines (92%) since 1.0.16 went on. Now: ONE probe a round
+(multicast + the same datagram to each known address); while nothing is found
+2/4/8/10s, while a known instance is not connected 10s (`COLD_PERIOD`), once every
+known one is connected 15s (`IDLE_PERIOD`, Simon's pick from a 5/15/30/60s table).
+`_settled` asks `Plugin::_linkUpFor`, which is `$client->connected` - the same answer
+Material shows, so NAA or accept-vs-reply has nothing to do with it. The burst went
+because it could not do its job: its three probes span 0.4s and the restart window it
+was added for was 27s; the next round (<=10s while anything is missing) is what covers
+a lost probe. Unchanged: round-number liveness (`_liveOf`), INSTANCE_TTL 300, the
+connected-player removal guard, `%splitWarned`. Also NOT changed, Simon's call: the
+player still leaves Material the moment the control link drops, a settings-change
+restart (measured 2-6s link gap) included - a grace period was proposed and declined.
+Pinned in `t_plugin.pl` (184): the ladder, 10s unconnected, 15s idle, `_linkUpFor`
+reading the player's `connected`, one probe a round; 6 FAIL against 1.0.19's Discovery.pm.
+**Unverified live** - needs a build.
+
+**THE LAST THREE 2026-09-25 REVIEW FINDINGS, FIXED (after 1.0.21, unbuilt).**
+(1) `%splitWarned` was cleared only when a name shrank to one, so a pair that left the
+table entirely (both off overnight) and came back on the same addresses never warned
+again. `_idsFor` now drops the entry for any name absent from a COMPLETE list (a
+partial list holds only who has answered so far). (2) The connected test was repeated
+as `control && control->proven` in `signalPathFor` (twice) and the removal guard; all
+now ask `$client->connected` (Player::connected), and `t_plugin.pl` asserts Plugin.pm
+has no `->proven` of its own. Test fixtures now build a bridge the way `_create` does -
+the same control object on the bridge and the player (`link_of`, `feed_link`).
+(3) `Control::send` on a down link (no socket, not connecting) connected AT ONCE,
+skipping the backoff, from inside `_dropLink` when a link-down listener sent, and left
+the command queued for the next link. It now FAILS the command on the next event-loop
+turn (`_failLater`) and connects nothing - the reconnect is always already scheduled
+(`_create` opens the first link, every drop/failed connect schedules the next) or the
+link is closing (where a command used to sit with no callback for ever). The two
+workarounds keep their behaviour, comments corrected: link-down still does not call
+playerInactive (sync groups unchanged), `forgetClient` still closes the link (stops the
+backoff reconnect). **Knock-on, and its fix (Simon: "yes add that"):** a command to a
+player whose link is down, with HQPlayer actually back, no longer reconnected straight
+away - it waited for the backoff (up to 60s after a long outage). Now DISCOVERY is the
+trigger: when an instance answers THIS round (`$inst->{round} ==
+Discovery::round()`) and its link is down, `_onInstances` calls
+`Control::reconnectNow`, which drops the pending backoff retry and connects, leaving
+`backoff` where it was. So a returning HQPlayer's player is back within one discovery
+round (<=10s while anything is disconnected); an HQPlayer that answers discovery but
+refuses the link costs one attempt per round, not a faster ladder. Pinned:
+`t_control.pl` 83 (5 FAIL against 1.0.21's Control.pm), `t_plugin.pl` 189 (the two
+reconnect-now checks FAIL with the call removed; 2 more against the unfixed pieces).
 
 **The same ten-minute idle gap is in LMS-Platin-Bridge** (`PlatinBridge/Discovery.pm`,
 `IDLE_PERIOD => 10 * 60`), unchanged there.
@@ -5495,6 +5615,13 @@ has run it on Windows.
 
 **REVIEW 2026-09-23 of 5775983..6ee1185 (Bridge + helper): no bugs; two minor asides, both now settled.** (1) the installers REPLACE `allow` rather than append - **BY DESIGN**, see the ledger row `ONE LYRION SERVER PER HQPLAYER`. (2) **FIXED, `install.ps1` only:** with `pythonw.exe` on PATH and no `python.exe`, `Get-Allow`/`Set-Allow` ran the helper's `--allow` through pythonw, which has no console, so the answer and any refusal went nowhere, a failed write looked like an empty value, and a hand-edited `allow` was reported as "not set". Now `$pyForCfg` is `python.exe` ONLY; without it the installer warns (`No python.exe on PATH ...`, naming the hand edit), shows no prompt it cannot act on, never touches the key, and the summary says `not checked` rather than `not set`. The helper itself still RUNS under pythonw as before. `t_installers.py` +6 assertions (30 total), **4 FAIL against HEAD's install.ps1**, with a control that the same `-Allow` is written when python.exe is present. `run_checks.sh` all green. Windows still harness-only: the pythonw no-console behaviour is taken from round 16's finding, not re-measured on Windows.
 
+**WHOLE-HELPER REVIEW 2026-09-23 (after 0d48ae4): 4 findings, all Windows, all FIXED in `install.ps1`; plus one found while fixing.** Each has assertions in `t_installers.py` (66 total), **21 FAIL against 0d48ae4's install.ps1**. All offline: nothing here has run on Windows.
+(1) **Re-install / uninstall left the old helper RUNNING.** `Unregister-ScheduledTask` is not documented to end a running instance; the old helper kept its startup config, so a re-run with a new `-Allow` changed nothing until reboot, and `-Uninstall` left it serving. Worse than the review said: `socketserver.TCPServer.server_bind` sets `SO_REUSEADDR` whenever `allow_reuse_address` (read in the 3.9 source; `HTTPServer` sets it), and on Windows that lets a SECOND socket bind a port in use - so the new helper would not fail, TWO would answer. Fix: `Stop-Helper` = `Stop-ScheduledTask`, poll `Get-ScheduledTask` until not `Running` (20 x 0.5s, then carries on), then unregister; used by install AND uninstall. Uninstall now checks the task is really gone before saying "stopped and removed" (a non-admin `-System` uninstall fails both calls silently).
+(2) **No readable Python version PASSED the 3.7 check.** The Microsoft Store placeholder `python.exe` (WindowsApps) passes "found on PATH", prints to stderr and exits non-zero; the check only threw on a version it COULD read, so the task was registered to fail every minute. Now no version is a refusal, before anything is stopped or written. stderr deliberately NOT redirected: `2>$null` on a native command under `$ErrorActionPreference='Stop'` is a terminating error in Windows PowerShell 5.1, and the user should see Windows's own message. **VERIFIED LIVE on Windows 2026-09-24** (Simon's Windows box, no Python installed): `C:\Users\...\WindowsApps\python.exe` printed 'Python was not found; run without arguments to install from the Microsoft Store...' and the installer threw 'Could not read a Python version from ...WindowsApps\python.exe ... Nothing was changed.' at install.ps1:82 - Windows's message first, then ours, as designed.
+(3) **`-System` folder open to every local user.** ProgramData's default DACL gives Users read + create-files on subfolders, and `chmod 0o600` is a no-op on Windows: any user could read the token, plant `hqrestart-state.json` (the recipe a restart launches AS SYSTEM), or drop a `.py` beside `hqrestart.py` (sys.path[0]). Fix, `-System` only, before the config is first written: refuse if `$dir` is a reparse point (a pre-made junction would aim takeown/icacls elsewhere); `takeown /f $dir /a` (a user who pre-created the folder OWNS it and could rewrite any DACL); `icacls $dir /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F` (by SID, so non-English Windows works). Either failing REFUSES, before the old helper is stopped.
+(4) **Firewall rule is `-Profile Private` only**; Windows 11 files a new network as Public, so the rule exists, the no-rule warning stays quiet, and LMS cannot connect. Rule NOT widened (a scope call - the helper answers restarts). The installer now names every `Get-NetConnectionProfile` connection that is not Private, with `Set-NetFirewallRule -DisplayName hqrestart -Profile Private,<Public|Domain>` (`DomainAuthenticated` mapped to the profile name `Domain`). A failing cmdlet is swallowed.
+**UNKNOWN, NOT GUESSED AT - needs a real Windows box:** (a) whether stopping the helper's task also kills an HQPlayer the helper RELAUNCHED (app mode, `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP`, no `CREATE_BREAKAWAY_FROM_JOB`) - depends on whether Task Scheduler runs actions in a kill-on-close job. Adding BREAKAWAY blindly is NOT safe: without `JOB_OBJECT_LIMIT_BREAKAWAY_OK` CreateProcess fails and HQPlayer would be left down. (b) By the same `SO_REUSEADDR`, a per-user AND a `-System` helper both installed probably both bind 8090 on Windows, so the helper's "Another copy is probably already running" message cannot fire there; unchanged, since the Windows TIME_WAIT behaviour of `SO_EXCLUSIVEADDRUSE` is not known here either. (c) Files already inside a `-System` folder from BEFORE this fix are not re-owned; the README says uninstall, delete the folder, reinstall. No real Windows install is known.
+
 ## 1.0.16 (2026-09-23): discovery at Lyrion's pace, and Lyrion's forget time
 
 Plugin: `Discovery.pm`, `Plugin.pm`, one comment in `Player.pm`. Full account in
@@ -5506,6 +5633,41 @@ never removed over discovery alone, unless its address was re-keyed to another
 id that round. `t_plugin.pl` 153. Also carries the helper's round-27 fixes, the
 installer reorder (ask first, stop second) and `t_installers.py` - the helper
 is not in the zip. **Built, not yet installed or verified live.**
+
+## HELPER 2026-09-25: Windows support REMOVED
+
+Simon, after the 2026-09-25 review: *"remove all support for windows on the helper
+its causing too many problems."* Ledger row: `WINDOWS SUPPORT REMOVED`. The helper is
+not in the zip, so no version moves.
+
+**Removed:** `tools/hqrestart/install.ps1` (with its uncommitted fixes), `tools/t_powershell.py`,
+the install.ps1 half of `tools/t_installers.py`, the Windows cases in `tools/t_hqrestart.py`,
+and in `hqrestart.py`: `powershell()`, `detect_win32`, `win32_owner_sids`, the
+tasklist/taskkill branches of `find_pid` / `alive` / `stop_app`, `creationflags`, the
+`Restart-Service` / `Start-Process` commands, the `win32` process names, the `pythonw`
+stderr-to-file fallback, and the `.\install.ps1 -Allow` refusal advice.
+
+**Added:** `main()` refuses any OS but `darwin` / `linux` with exit 2 and one line, before
+`Config` runs (so no token is generated). `restart_service` raises on an unknown `os`
+instead of falling through to PowerShell; `pinned_how` returns None there. The `--allow`
+path still runs anywhere - it only reads and writes JSON.
+
+**Knock-on audit, so the next round need not re-derive it:**
+
+* **The plugin** (`HQPlayerBridge/*.pm`, strings, the zip) has no Windows code or text -
+  grepped; the Restart row speaks only HTTP to `/ping` and `/restart`. Unchanged.
+* **macOS / Linux paths are byte-for-byte the same behaviour.** `os.altsep` is None on
+  POSIX, so dropping it from `start_argv` changes nothing; `shlex.split(cmd)` is the
+  POSIX default that `posix=(PLATFORM != 'win32')` already gave; `stop_app`, `alive`,
+  `find_pid`, `may_signal`, `same_owner`, `start_app` keep their POSIX bodies unchanged
+  (de-indented only). The installed Mac helper runs the same code path.
+* **Coverage lost with the Windows cases has a POSIX twin in the suite**: exe unreadable
+  -> macOS bundle-gone case; SYSTEM-vs-user -> Linux/macOS owner cases; refused kill ->
+  POSIX outlives-SIGKILL case; refusal advice -> Linux and macOS cases.
+* **`install.sh`** only lost comments and the "on Windows use install.ps1" hint.
+* **No real Windows install exists** (it never ran on one), so no user is stranded.
+* Suites: Perl unchanged, `t_hqrestart.py` 147, `t_installers.py` 13, sweep clean. The new
+  refusal test fails 2 against the old helper (control run).
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 
@@ -5657,13 +5819,13 @@ which is a diagnostic that did not exist when this class of bug was last chased.
 
 * **The restart helper beyond the happy path.** macOS app mode is verified live
   end to end (1.0.13, 2026-09-21). Unrun live: every FAILURE path (refusals,
-  "left running", a stop that times out), macOS service mode, Linux, Windows.
-  Those are harness-only (`t_hqrestart.py`).
+  "left running", a stop that times out), macOS service mode, Linux.
+  Those are harness-only (`t_hqrestart.py`). Windows is not supported.
 * **1.0.16's discovery timing is unverified live**: a second HQPlayer
   appearing within ~5s while the first is connected, and a switched-off one's
   player going ~5 min after it went quiet. Offline-tested only.
 * **The install-time `allow` prompt (2026-09-23) has never run on a real
-  install.** Both installers are RUN end to end offline (`t_installers.py`, the
+  install.** The installer is RUN end to end offline (`t_installers.py`, the
   service managers stubbed), but the helper installed on the Mac predates the
   prompt, and the Mac mini has no helper yet. Installing it there is the first
   live run.

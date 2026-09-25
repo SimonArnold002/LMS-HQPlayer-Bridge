@@ -227,14 +227,14 @@ ok(!exists $moveUp->{'10.0.0.5'},
     # is up is kept when discovery stops hearing it...
     %$reg = ();
     $reg->{$pl} = { instance => { ip => '10.0.0.5', name => $PN }, name => 'HQ',
-                    control => LinkCtl->new(1) };
+                    link_of(1) };
     @ev = ();
     $on->([]);
     is(join(', ', @ev) || 'nothing', 'nothing',
        'a CONNECTED player is not removed when discovery stops hearing it');
 
     # ...and removed once the link is down.
-    $reg->{$pl}->{control} = LinkCtl->new(0);
+    %{ $reg->{$pl} } = ( %{ $reg->{$pl} }, link_of(0) );
     $on->([]);
     is(join(', ', @ev), "teardown $pl",
        'a DISCONNECTED player that discovery stopped hearing is removed');
@@ -245,9 +245,9 @@ ok(!exists $moveUp->{'10.0.0.5'},
     # switched-off member keeps its player until its own link drops.
     %$reg = ();
     $reg->{$q5} = { instance => { ip => '10.0.0.5', name => $PN }, name => 'HQ .5',
-                    control => LinkCtl->new(1) };
+                    link_of(1) };
     $reg->{$q7} = { instance => { ip => '10.0.0.7', name => $PN }, name => 'HQ .7',
-                    control => LinkCtl->new(1) };
+                    link_of(1) };
     @ev = ();
     $on->([ { ip => '10.0.0.5', name => $PN, lastSeen => $now, round => 9 } ]);
     is(join(', ', sort @ev), join(', ', sort ("create $pl", "teardown $q5")),
@@ -263,7 +263,21 @@ ok(!exists $moveUp->{'10.0.0.5'},
     sub new { my ( $c, $up, $proven ) = @_; bless { up => $up, proven => $proven // $up }, $c }
     sub connected { $_[0]->{up} }
     sub proven    { $_[0]->{proven} }
+
+    # A bridge's player, shaped as production builds it: the SAME control
+    # object on the bridge and on the player, and `connected` answered by the
+    # real Player::connected.
+    package LinkClient;
+    sub new       { bless { ctl => $_[1] }, $_[0] }
+    sub hqControl { $_[0]->{ctl} }
+    sub connected { Plugins::HQPlayerBridge::Player::connected( $_[0] ) }
 }
+
+# control => ..., client => ... for a bridge whose link is ($up, $proven)
+sub link_of { my $c = LinkCtl->new(@_); return ( control => $c, client => LinkClient->new($c) ) }
+
+# the same, with a feed player (FeedClient, defined with the feed tests)
+sub feed_link { my $c = LinkCtl->new(@_); my $cl = FeedClient->new({}); $cl->{ctl} = $c; return ( control => $c, client => $cl ) }
 
 is(Plugins::HQPlayerBridge::Discovery::INSTANCE_TTL(), 300,
    "an instance is forgotten after Lyrion's 300s (\$forget_disconnected_time)");
@@ -309,11 +323,13 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     is(join(', ', @ev), 'refreshInfo, startPolling, stopPolling',
        'accepted then dropped with no reply: nothing announced, sync group untouched');
 
-    # the FIRST reply ever announces the player as NEW, as Lyrion does at hello
+    # EVERY proof is a RECONNECT: `client new` came from LMS's own constructor,
+    # and _create marked the player disconnected straight after. The
+    # announcement goes out BEFORE playerActive, so nothing there can lose it.
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkProven('x');
-    is(join(', ', @ev), 'disconnected 0, playerActive, notify new',
-       'first proof, powered: announced as a NEW player, and active');
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
+       'first proof, powered: announced as a reconnect, then made active');
 
     # a proven link going down: flagged and announced - and NOT playerInactive,
     # which would send <Stop/> down the dead link and reconnect ahead of the backoff
@@ -322,11 +338,21 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect',
        'down after proven: flagged and announced, NO playerInactive (no command on a dead link)');
 
-    # later proofs are RECONNECTS
+    # later proofs are RECONNECTS too
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkProven('x');
-    is(join(', ', @ev), 'disconnected 0, playerActive, notify reconnect',
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
        'a later proof is a reconnect');
+
+    # playerActive DYING (it can run the whole _JumpToTime -> play() path) must
+    # not unwind the proof: the announcement is already out, and nothing escapes
+    $ctrl->{die} = 1;
+    @ev = ();
+    my $ok = eval { Plugins::HQPlayerBridge::Plugin::_onLinkProven('x'); 1 };
+    ok($ok, 'a playerActive that dies does not escape _onLinkProven');
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
+       'and the reconnect was announced regardless');
+    $ctrl->{die} = 0;
 
     # CONTROL: proven but powered off stays out of the active set
     $cl->{power} = 0;
@@ -347,6 +373,25 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     %$reg = ();
 }
 
+print "-- _create: the constructor said `new`, so the player is marked disconnected at once --\n";
+{
+    my @ev;
+    no warnings qw(redefine once);
+    local *Slim::Control::Request::notifyFromArray = sub { push @ev, "notify $_[1]->[1]" };
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @ev, 'connect' };
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    %$reg = ();
+    Plugins::HQPlayerBridge::Plugin::_create( '02:de:ad:00:00:03',
+        { ip => '10.9.9.9', name => 'Made' }, 'HQPlayer (Made)' );
+    my $c = ( $reg->{'02:de:ad:00:00:03'} || {} )->{client};
+    ok($c, 'the player was created');
+    is($c ? $c->disconnected : '(none)', 1, 'and reads disconnected until HQPlayer replies');
+    is(join(', ', @ev), 'notify new, notify disconnect, connect',
+       'the constructor announces `new`, then `disconnect` is queued BEFORE the link is opened');
+    is($c ? $c->connected : '(none)', 0, 'CONTROL: connected is 0 too - the two agree');
+    %$reg = ();
+}
+
 print "-- forgetClient clears the literal tcpsock first (LMS < 9.1 dies on it) --\n";
 {
     my $seen;
@@ -354,8 +399,11 @@ print "-- forgetClient clears the literal tcpsock first (LMS < 9.1 dies on it) -
     local *Slim::Player::Client::forgetClient = sub { $seen = defined $_[0]->tcpsock ? $_[0]->tcpsock : 'undef' };
     my $p = Plugins::HQPlayerBridge::Player->new('02:de:ad:00:00:02', 'paddr', 1.0, undef, 12, undef);
     $p->tcpsock(1);
+    my $closed = 0;
+    $p->hqControl( CloseCtl->new(\$closed) );
     $p->forgetClient;
     is($seen, 'undef', 'LMS forgetClient sees no tcpsock, so slimproto_close is never handed the 1');
+    is($closed, 1, 'and the control link is CLOSED, so a connect started by the forget\'s Stop ends there');
 
     my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
     $src =~ s/^\s*#.*$//mg;
@@ -371,12 +419,12 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     local *Plugins::HQPlayerBridge::Plugin::_create   = sub { push @ev, "create $_[0]" };
     my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
     %$reg = ( 'gone' => { instance => { ip => '10.9.0.1', name => 'Gone' }, name => 'HQ gone',
-                          control => LinkCtl->new(1, 0) } );
+                          link_of(1, 0) } );
     Plugins::HQPlayerBridge::Plugin::_onInstances([]);
     is(join(', ', @ev), 'teardown gone',
        'accepted but never answering, and gone from discovery: removed');
     %$reg = ( 'live' => { instance => { ip => '10.9.0.2', name => 'Live' }, name => 'HQ live',
-                          control => LinkCtl->new(1, 1) } );
+                          link_of(1, 1) } );
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onInstances([]);
     is(join(', ', @ev) || 'nothing', 'nothing', 'CONTROL: a proven link is still kept');
@@ -386,7 +434,7 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
 {
     package FakeController;
     sub new { bless { ev => $_[1], only => 0 }, $_[0] }
-    sub playerActive     { push @{ $_[0]->{ev} }, 'playerActive' }
+    sub playerActive     { push @{ $_[0]->{ev} }, 'playerActive'; die "boom\n" if $_[0]->{die} }
     sub playerInactive   { push @{ $_[0]->{ev} }, 'playerInactive' }
     sub onlyActivePlayer { $_[0]->{only} }
 
@@ -399,6 +447,18 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     sub refreshInfo  { push @{ $_[0]->{ev} }, 'refreshInfo' }
     sub _startPolling { push @{ $_[0]->{ev} }, 'startPolling' }
     sub _stopPolling  { push @{ $_[0]->{ev} }, 'stopPolling' }
+
+    package LoopReq;
+    sub new           { bless { loop => {} }, $_[0] }
+    sub isQuery       { 1 }
+    sub client        { undef }
+    sub addResultLoop { $_[0]->{loop}{ $_[2] }{ $_[3] } = $_[4] }
+    sub addResult     {}
+    sub setStatusDone {}
+
+    package CloseCtl;
+    sub new   { bless { n => $_[1] }, $_[0] }
+    sub close { ${ $_[0]->{n} }++ }
 
     package FakeRequest;
     # as in production after `client forget`: the id survives, the client does not
@@ -435,7 +495,7 @@ for my $f (glob '../HQPlayerBridge/*.pm') {
 }
 ok(!@copies, 'no module keeps its own copy of the version'.(@copies ? " (@copies)" : ''));
 
-print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
+print "-- discovery: the cold start must not cost a whole round --\n";
 {
     # One lost multicast datagram used to cost a full minute of the plugin
     # looking broken: with nothing found there is no player at all, and the
@@ -461,8 +521,8 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
     }
 
-    is(join(',', @waits), '5,5,5,5,5,5,5',
-       'with nothing found it looks every 5s - Lyrion\'s own heartbeat');
+    is(join(',', @waits), '2,4,8,10,10,10,10',
+       'with nothing found it looks again at 2, 4, 8, then every 10s');
 
     # ...and once an instance answers it settles down. Seed %found the way a
     # real round does, by handing _reply an actual datagram on loopback.
@@ -482,25 +542,22 @@ print "-- discovery: the cold start must not cost a whole ROUND_PERIOD --\n";
         my $t0 = Time::HiRes::time();
         Plugins::HQPlayerBridge::Discovery::_roundDone();
         my $t = Slim::Utils::Timers::_timers()->[0];
-        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '5',
-           'and with an instance known it STILL looks every 5s - it never goes quiet');
+        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '10',
+           'an instance known but no way to ask whether it is connected - 10s, never idle');
     }
 
     Plugins::HQPlayerBridge::Discovery->stop;
     Slim::Utils::Timers::_reset();
 }
 
-print "-- discovery: every 5s, whatever is known or connected --\n";
+print "-- discovery: how often to look is decided by the CONTROL LINK --\n";
 {
-    # Until 2026-09-23 the period WAS decided by the control link: ten minutes
-    # once every known instance was connected. That hid a second HQPlayer
-    # switched on meanwhile for up to ten minutes. The rest of this comment is
-    # the original reasoning, kept because the predicate below is still passed
-    # to prove it no longer matters: an instance that is connected needs no
-    # finding, and one that is not - powered off, asleep, moved - has to be
-    # found again quickly.  Simon's HQPlayer sat unused for a week; the probe a
-    # minute it collected in that time bought nothing, and when the endpoint
-    # finally came on the cold start still took a measured 63s.
+    # An instance that is connected needs no finding, and one that is not -
+    # powered off, asleep, moved - has to be found again quickly. Once every
+    # known one is connected only a NEW HQPlayer is left to find, so it looks
+    # every IDLE_PERIOD (15s). It was ten minutes until 2026-09-23, which hid a
+    # second HQPlayer for that long, then a flat 5s, which filled HQPlayer's
+    # log with discovery lines.
     require Plugins::HQPlayerBridge::Discovery;
 
     no warnings 'redefine';
@@ -538,21 +595,87 @@ print "-- discovery: every 5s, whatever is known or connected --\n";
         is($seen eq 'partial' ? 1 : 0, 1,
            'and it is flagged partial, so the caller must not remove anyone on it');
 
-        # THE BUG THIS REPLACES: with every known instance connected it went
-        # quiet for TEN MINUTES, so a SECOND HQPlayer switched on meanwhile
-        # waited up to ten minutes to appear (measured 2026-09-23, twice).
         $up = 1;
-        is($wait->(), '5', 'every known instance connected - it still looks every 5s');
+        is($wait->(), '15', 'every known instance connected - every 15s, not ten minutes');
 
         $up = 0;
-        is($wait->(), '5', 'a link that is down - the same 5s');
+        is($wait->(), '10', 'a link that is down puts it straight back on 10s');
 
         $up = 1;
-        is($wait->(), '5', 'and nothing about the links ever changes the period');
+        is($wait->(), '15', 'and back to 15s once the link is up again');
     }
 
     Plugins::HQPlayerBridge::Discovery->stop;
     Slim::Utils::Timers::_reset();
+}
+
+print "-- discovery hearing a disconnected HQPlayer reconnects it now --\n";
+{
+    package PokeCtl;
+    sub new { bless { pokes => 0 }, shift } sub reconnectNow { $_[0]->{pokes}++ }
+    sub connected { 0 } sub proven { 0 }
+    package main;
+
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Plugin::_create   = sub { };
+    local *Plugins::HQPlayerBridge::Plugin::_teardown = sub { };
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+    my $id   = Plugins::HQPlayerBridge::Plugin::_idFor('PokeTest');
+    my $ctl  = PokeCtl->new;
+    %$reg = ( $id => { instance => { ip => '10.7.0.5', name => 'PokeTest' }, name => 'HQ',
+                       control => $ctl, client => LinkClient->new($ctl) } );
+    my $now = Plugins::HQPlayerBridge::Discovery::round();
+
+    Plugins::HQPlayerBridge::Plugin::_onInstances(
+        [ { ip => '10.7.0.5', name => 'PokeTest', round => $now } ] );
+    is($ctl->{pokes}, 1, 'an instance that answered THIS round has its link retried now');
+
+    Plugins::HQPlayerBridge::Plugin::_onInstances(
+        [ { ip => '10.7.0.5', name => 'PokeTest', round => $now - 1 } ] );
+    is($ctl->{pokes}, 1, 'CONTROL: one only remembered from an earlier round is not');
+
+    %$reg = %keep;
+}
+
+print "-- one connected test: Player::connected, nowhere else --\n";
+{
+    # Plugin.pm used to repeat `control && control->proven` in three places
+    # (both signalPathFor fields and the removal guard). Round 2 of the
+    # 1.0.17 review had to fix copies that had drifted to the ACCEPT. Every
+    # reader now asks the player.
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    $src =~ s/^\s*#.*$//mg;
+    my @copies = $src =~ /(->proven\b)/g;
+    is(scalar @copies, 0, 'Plugin.pm has no copy of the connected test of its own');
+}
+
+print "-- discovery: the connected answer is the player's own --\n";
+{
+    # Discovery goes quiet (IDLE_PERIOD) only on this answer, so it must be the
+    # one Material shows - Player::connected - and nothing else.
+    package FakeConn; sub new { bless { c => $_[1] }, $_[0] } sub connected { $_[0]->{c} }
+    package main;
+
+    my $br = Plugins::HQPlayerBridge::Plugin::bridges();
+    local $br->{'02:00:00:00:00:99'} = { instance => { ip => '10.9.9.9' }, client => FakeConn->new(1) };
+
+    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.9'), 1,
+       'a connected player at that address reads connected');
+    $br->{'02:00:00:00:00:99'}->{client} = FakeConn->new(0);
+    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.9'), 0,
+       'a disconnected one does not');
+    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.8'), 0,
+       'an address with no player yet does not');
+
+    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    ok(scalar( $src =~ /Discovery->start\(\s*\\&_onInstances,\s*\\&_linkUpFor\s*\)/ ),
+       'and it is what the plugin hands discovery');
+
+    # One probe a round: nothing reschedules _probe inside a round.
+    my $dsrc = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Discovery.pm'); <> };
+    $dsrc =~ s/^\s*#.*$//mg;
+    ok(scalar( $dsrc !~ /setTimer\([^;]*\\&_probe/ ), 'a round sends one probe, not a burst');
 }
 
 print "-- reconcile: a partial list must never remove a player --\n";
@@ -615,6 +738,9 @@ print "-- the apps feed --\n";
     sub hqPath { $_[0]->{path} }
     sub hqTier { 1 }
     sub hqTransport { 5 }
+    sub id { "02:fe:ed:00:00:01" }
+    sub hqControl { $_[0]->{ctl} ||= FeedCtl->new }
+    sub connected { Plugins::HQPlayerBridge::Player::connected( $_[0] ) }
 
     package FeedCtl;
     sub new { bless {}, shift } sub connected { 1 } sub proven { 1 }
@@ -708,6 +834,8 @@ print "-- signalPathFor: one formatter, three surfaces --\n";
     sub hqRate { '44100' } sub hqBits { '16' } sub hqMime { 'audio/x-flac' }
     sub hqPath { $_[0]->{p} } sub hqTier { $_[0]->{tier} }
     sub hqTransport { $_[0]->{tr} }
+    sub hqControl { $_[0]->{ctl} ||= PathCtl->new }
+    sub connected { Plugins::HQPlayerBridge::Player::connected( $_[0] ) }
     package PathCtl;
     sub new { bless {}, shift } sub connected { 1 } sub proven { 1 }
 }
@@ -740,11 +868,27 @@ is($p->{connected}, 'PLUGIN_HQPLAYER_CONNECTED - 10.0.0.5:4321', 'and the link s
 {
     # an ACCEPT that has not replied is not "Connected" - the same test as
     # Player::connected, so the feed and Material cannot disagree
-    my $acc = { name => 'HQPlayer (Test)', control => LinkCtl->new(1, 0),
-                instance => { ip => '10.0.0.5' }, client => FeedClient->new({}) };
+    my $acc = { name => 'HQPlayer (Test)', instance => { ip => '10.0.0.5' }, feed_link(1, 0) };
     is(Plugins::HQPlayerBridge::Plugin::signalPathFor(undef, $acc)->{connected},
        'PLUGIN_HQPLAYER_DISCONNECTED - 10.0.0.5:4321',
        'accepted but never answered reads DISCONNECTED, as Material shows it');
+    is(Plugins::HQPlayerBridge::Plugin::signalPathFor(undef, $acc)->{up}, 0,
+       'and its `up` flag is 0 - the live page reads the flag, not the string');
+    %$acc = ( %$acc, feed_link(1, 1) );
+    is(Plugins::HQPlayerBridge::Plugin::signalPathFor(undef, $acc)->{up}, 1,
+       'CONTROL: a proven link is `up` 1');
+
+    # and the QUERY carries it - the live page reads the query, not signalPathFor
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+    %$reg = ( 'q1' => { %$acc, feed_link(1, 0) } );
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Plugin::nowPlayingFor = sub { {} };
+    my $rq = LoopReq->new;
+    Plugins::HQPlayerBridge::Plugin::_signalPathQuery($rq);
+    is(defined $rq->{loop}{0}{up} ? $rq->{loop}{0}{up} : '(absent)', 0,
+       'the signalpath query sends `up` (0 for an unanswered accept)');
+    %$reg = %keep;
 }
 
 # A key must be ABSENT, not empty - a caller tests it to skip the row rather
@@ -1122,6 +1266,23 @@ print "-- a same-named pair is reported once, not every round --\n";
     %{ Plugins::HQPlayerBridge::Plugin::bridges() } = ();
     $ids->( $pair->('10.2.0.5', '10.2.0.7'), 1 );
     is( scalar @warned, 0, 'a partial list says nothing' );
+
+    # The whole pair leaves the table - both switched off overnight - and
+    # comes back on the SAME addresses. The name never shrank to one, so only
+    # the name leaving the table can say the warning is owed again.
+    @warned = ();
+    $ids->( $pair->('10.3.0.5', '10.3.0.7') );
+    $ids->( [] );                                        # a complete round, nobody answers
+    $ids->( $pair->('10.3.0.5', '10.3.0.7') );
+    is( scalar @warned, 2, 'a pair that left the table and came back on the same addresses warns again' );
+
+    # CONTROL: a PARTIAL list without the name does not clear it - it only
+    # holds who has answered so far.
+    @warned = ();
+    $ids->( $pair->('10.4.0.5', '10.4.0.7') );
+    $ids->( [ { ip => '10.9.9.1', name => 'Other', round => 4 } ], 1 );
+    $ids->( $pair->('10.4.0.5', '10.4.0.7') );
+    is( scalar @warned, 1, 'CONTROL: a partial list missing the pair does not re-arm its warning' );
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;

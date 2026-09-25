@@ -175,7 +175,8 @@ sub proven    { $_[0]->{proven} }
 # Public: queue a command.
 #   $cmd is the bare element, e.g. '<Play/>' or '<Seek position="30"/>'
 #   $cb  is called as $cb->($attrs_hashref, $raw_xml) on success,
-#        or $cb->(undef, undef) if the command failed or the link dropped.
+#        or $cb->(undef, undef) if the command failed, the link dropped, or
+#        the link was already down when it was sent.
 #   $opts->{scope} groups commands which may be cancelled before they reach
 #        the wire; the player uses 'track' for generation-bound load work.
 # ---------------------------------------------------------------------------
@@ -191,6 +192,26 @@ sub send {
         return;
     }
 
+    # THE LINK IS DOWN: fail the command, and do NOT connect. A reconnect is
+    # already on its way - _create opens the first link, and every drop or
+    # failed connect schedules the next one with backoff - or the link is
+    # being closed for good. This used to connect at once, which skipped the
+    # backoff for every command LMS sends a disconnected player (a sync
+    # group's _JumpToTime, unsync's _stopClient, playerInactive's Stop), did
+    # it from inside _dropLink when a link-down listener sent something, and
+    # left the command queued for whatever link came next. Two call sites had
+    # grown workarounds for it (Plugin::_onLinkState, Player::forgetClient).
+    #
+    # Failed on the NEXT event-loop turn, not inside this call: a caller's
+    # failure path (a refused load -> playerStreamingFailed -> LMS loading the
+    # next track) must not re-enter code that is still in the middle of
+    # sending.
+    if ( !$self->{sock} && !$self->{connecting} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: link down, not sending <$verb>");
+        Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_failLater, $cb ) if $cb;
+        return;
+    }
+
     push @{ $self->{queue} }, {
         cmd      => $cmd,
         cb       => $cb,
@@ -199,14 +220,14 @@ sub send {
         queuedAt => Time::HiRes::time(),
     };
 
-    if ( !$self->{sock} && !$self->{connecting} ) {
-        $self->connect;
-    }
-    else {
-        $self->_pump;
-    }
+    $self->_pump;
 
     return;
+}
+
+sub _failLater {
+    my ( $self, $cb ) = @_;
+    $cb->( undef, undef );
 }
 
 # Drop work which is still WAITING behind the command on the wire. An
@@ -638,6 +659,23 @@ sub _scheduleReconnect {
 sub _reconnect {
     my $self = shift;
     $self->connect;
+}
+
+# Discovery has just heard this HQPlayer answer, so try now rather than wait
+# out the backoff - up to BACKOFF_MAX after a long outage, and Control::send no
+# longer connects on a command. The backoff itself is left where it is: if
+# this attempt fails, the next scheduled retry is as far away as before, so an
+# HQPlayer that answers discovery but refuses the link costs one attempt per
+# discovery round (Discovery::COLD_PERIOD), not a faster ladder.
+sub reconnectNow {
+    my $self = shift;
+
+    return if $self->{sock} || $self->{connecting} || $self->{closing};
+
+    Slim::Utils::Timers::killTimers( $self, \&_reconnect );
+    $self->connect;
+
+    return;
 }
 
 sub close {

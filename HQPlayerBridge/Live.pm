@@ -1028,7 +1028,9 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             html = '';
             for (var i = 0; i < loop.length; i++) {
                 var b = loop[i];
-                var connected = b.connected && b.connected.indexOf('-') > 0;
+                // the FLAG, never the display string: both "Connected - ip"
+                // and "Not connected - ip" contain a '-'
+                var connected = b.up == 1;
                 html += '<div class="card' +
                         ((CUR && b.playerid && b.playerid === CUR.playerid) ? ' sel' : '') + '">';
                 html += '<div class="name">' + esc(b.name || b.id || '') + '</div>';

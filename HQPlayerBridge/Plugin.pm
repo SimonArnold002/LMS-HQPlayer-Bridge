@@ -124,12 +124,12 @@ sub initPlugin {
     # reconnecting a player LMS no longer has. NO UI in LMS or Material sends
     # it to this player (Slimproto's timer is for SlimProto clients, and the
     # on-device menu needs a display) - only a third-party app or a hand-typed
-    # command. If the instance still answers discovery, the next round (~5s)
-    # makes a FRESH player: unlike a Lyrion player, which returns only when it
+    # command. If the instance still answers discovery, the next round (10s at
+    # most, since this one is not connected) makes a FRESH player: unlike a Lyrion player, which returns only when it
     # reconnects, this one returns when discovery answers.
     Slim::Control::Request::subscribe( \&_onForget, [ ['client'], ['forget'] ] );
 
-    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances );
+    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances, \&_linkUpFor );
 
     return;
 }
@@ -544,7 +544,7 @@ sub _signalPathQuery {
         $request->addResultLoop( 'bridges_loop', $i, 'playerid', $b->{client}->id )
             if $b->{client};
 
-        for my $k (qw( connected source output filter shaper speed tier )) {
+        for my $k (qw( connected up source output filter shaper speed tier )) {
             $request->addResultLoop( 'bridges_loop', $i, $k, $p->{$k} ) if defined $p->{$k};
         }
 
@@ -586,10 +586,17 @@ sub signalPathFor {
 
     my %out;
 
+    # Player::connected - the answer Material shows - and nothing else, so no
+    # surface can disagree with it.
+    my $up = $c->connected ? 1 : 0;
+
     $out{connected} = cstring( $client,
-        ( $b->{control} && $b->{control}->proven )
-            ? 'PLUGIN_HQPLAYER_CONNECTED' : 'PLUGIN_HQPLAYER_DISCONNECTED' )
+        $up ? 'PLUGIN_HQPLAYER_CONNECTED' : 'PLUGIN_HQPLAYER_DISCONNECTED' )
         . ' - ' . ( $b->{instance}->{ip} || '?' ) . ':4321';
+
+    # The same fact as a FLAG, for a reader that must not parse the display
+    # string: the live page used to test for a '-', which both strings contain.
+    $out{up} = $up;
 
     # SOURCE is off the <metadata/> child; OUTPUT off the <Status/> root. See
     # _onStatus in Player.pm for why they are different elements.
@@ -844,6 +851,21 @@ sub _fmtFormat {
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
 # ---------------------------------------------------------------------------
+# Discovery asks this to decide how often to look (Discovery::IDLE_PERIOD):
+# is the player at this address connected? The same answer Material shows,
+# Player::connected - so the two cannot disagree. An address with no player
+# yet is not connected: it is still being built.
+sub _linkUpFor {
+    my $ip = shift or return 0;
+
+    for my $b ( values %bridges ) {
+        next unless $b->{instance} && ( $b->{instance}->{ip} || '' ) eq $ip;
+        return $b->{client} && $b->{client}->connected ? 1 : 0;
+    }
+
+    return 0;
+}
+
 # $partial is set when discovery is announcing a reply mid-round, before the
 # rest of the instances have had their chance to answer.  Such a list is
 # additive only: see the removal pass at the end.
@@ -891,6 +913,13 @@ sub _onInstances {
             }
             else {
                 $b->{instance} = $inst;
+
+                # It answered THIS round, so it is there: if its link is down,
+                # reconnect now instead of waiting out the backoff (up to 60s
+                # after a long outage). A no-op while the link is up.
+                $b->{control}->reconnectNow
+                    if $b->{control}
+                    && ( $inst->{round} // -1 ) == Plugins::HQPlayerBridge::Discovery::round();
             }
         }
         else {
@@ -920,12 +949,10 @@ sub _onInstances {
         # daemon re-keyed (a pair shrinking to one takes the plain id), and
         # keeping the old player too would leave two players, and two control
         # links, on one HQPlayer.
-        my $b   = $bridges{$id};
-        my $ctl = $b->{control};
-        my $ip  = ( $b->{instance} || {} )->{ip};
-        # PROVEN, the same test as Player::connected: an accept hqplayerd is
-        # about to drop is not a live player.
-        next if $ctl && $ctl->proven && !( defined $ip && $ids->{$ip} );
+        my $b  = $bridges{$id};
+        my $ip = ( $b->{instance} || {} )->{ip};
+        # Player::connected, the answer Material shows.
+        next if $b->{client} && $b->{client}->connected && !( defined $ip && $ids->{$ip} );
 
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
         _teardown($id);
@@ -965,7 +992,7 @@ sub _nameFor {
 #
 # It used to be judged by the clock - replies within ADDR_SLACK (10s) of the
 # newest counted as the same round. That only worked while rounds were MORE
-# than 10s apart; when discovery moved to Lyrion's 5s heartbeat, an address
+# than 10s apart; when discovery moved to rounds 5-15s apart, an address
 # left one round ago would have looked fresh, and a DHCP move would have split
 # one daemon into two players again - the 1.0.8 bug. Counting rounds says what
 # was meant directly, and does not care how far apart they are.
@@ -1014,7 +1041,7 @@ sub _isSplit {
 # HQPlayer Embedded instance answers "HQPlayerEmbedded", so on the name alone
 # two instances are one player: each discovery round would see the id it
 # already has arrive with the other one's address, tear the player down and
-# build it again 60 seconds later, killing playback every time.  (A DHCP move
+# build it again a round later, killing playback every time.  (A DHCP move
 # is the same shape - the old address lingers in the discovery table for
 # INSTANCE_TTL, so for that window the instance appears twice under one name.)
 #
@@ -1122,10 +1149,10 @@ sub _idsFor {
             next;
         }
 
-        # Said once per CHANGE, not once per round: discovery now runs every
-        # 5s, and a same-named pair is a steady state - HQPlayer Embedded names
-        # every instance "HQPlayerEmbedded" - so saying it each round would put
-        # a warning in the log every few seconds for as long as both are up.
+        # Said once per CHANGE, not once per round: discovery runs every
+        # 10-15s, and a same-named pair is a steady state - HQPlayer Embedded
+        # names every instance "HQPlayerEmbedded" - so saying it each round
+        # would fill the log for as long as both are up.
         my $addrs = join( ', ', sort map { $_->{ip} } @$group );
         if ( ( $splitWarned{$name} // '' ) ne $addrs ) {
             $splitWarned{$name} = $addrs;
@@ -1138,6 +1165,16 @@ sub _idsFor {
                 id   => _idFor( $name . '@' . $inst->{ip} ),
                 name => _nameFor( $inst, 1 ),
             };
+        }
+    }
+
+    # A name that has left the table altogether - both of a pair switched
+    # off, say - is no longer a pair, so its warning is owed again if it comes
+    # back. Only on a COMPLETE list: a partial one holds only the instances
+    # that have answered so far.
+    if ( !$partial ) {
+        for my $name ( keys %splitWarned ) {
+            delete $splitWarned{$name} unless $byName{$name};
         }
     }
 
@@ -1174,8 +1211,11 @@ sub _create {
     $client->macaddress($id);
 
     # A literal 1, never a socket. It no longer decides `connected` - that is
-    # the proven control link, see Player::connected - but LMS code that
-    # expects a Squeezebox-style player still reads it.
+    # the proven control link, see Player::connected. Kept because every
+    # release has set it and code outside LMS may test it; in LMS core
+    # (public/9.1) only the Squeezebox classes, Slimproto, Display::Graphics
+    # (not this player's NoDisplay), NetTest and Client::forgetClient read it -
+    # and forgetClient is why Player::forgetClient clears it first.
     $client->tcpsock(1);
 
     $client->display( Slim::Display::NoDisplay->new($client) );
@@ -1224,11 +1264,16 @@ sub _create {
         name     => $name,
     };
 
-    $ctl->connect;
+    # `client new` WAS ALREADY SENT - by LMS's own Slim::Player::Client::new,
+    # which every constructor reaches. The player reads disconnected until
+    # HQPlayer replies (Player::connected is `proven`), so say so now: this
+    # also takes back what `new` set up for a player that may never answer
+    # (UPnP's MediaRenderer registers on `new` and unregisters on
+    # `disconnect`). Every proof after this is a `client reconnect`.
+    $client->disconnected(1);
+    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
 
-    # NO `client new` here: the player reads disconnected until HQPlayer
-    # replies, and a Lyrion player is announced when its socket is up, not
-    # before. _onLinkProven sends it at the first reply.
+    $ctl->connect;
 
     return;
 }
@@ -1260,11 +1305,11 @@ sub _onLinkState {
         # must announce nothing.
         #
         # DELIBERATELY NOT playerInactive, which Slimproto's close does call:
-        # here it reaches Player::stop -> <Stop/> -> Control::send, which on a
-        # dead link reconnects AT ONCE (inside _dropLink, ahead of the backoff)
-        # and leaves the Stop queued for the next link. Leaving a synced member
-        # in the active set is what every release before 1.0.17 did, when
-        # `connected` was always 1.
+        # leaving a synced member in the active set is what every release
+        # before 1.0.17 did, when `connected` was always 1, and a sync group is
+        # not changed here. (It was also once unsafe: its Stop reached
+        # Control::send, which connected at once on a dead link. send now
+        # fails a command on a down link instead - see Control::send.)
         if ($wasProven) {
             $client->disconnected(1);
             Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
@@ -1275,13 +1320,12 @@ sub _onLinkState {
 }
 
 # HQPlayer's FIRST REPLY on a link: the player is now connected as far as LMS
-# is concerned (Player::connected reads the same flag). Lyrion's
-# Squeezebox::reconnect: a powered player rejoins its sync group's active set -
-# needed at the first link too, since Client::startup's restoreSync ran while
-# it still read as disconnected. The first proof ever is `client new`, as
-# Lyrion announces a player once its socket is up; later ones are `client
-# reconnect`. Forgetting is unchanged: Lyrion's 300s, via discovery
-# (INSTANCE_TTL).
+# is concerned (Player::connected reads the same flag). Always `client
+# reconnect` - the constructor sent `new`, and _create marked the player
+# disconnected straight after. Lyrion's Squeezebox::reconnect: a powered player
+# rejoins its sync group's active set - needed at the first link too, since
+# Client::startup's restoreSync ran while it read as disconnected. Forgetting is
+# unchanged: Lyrion's 300s, via discovery (INSTANCE_TTL).
 sub _onLinkProven {
     my $id = shift;
 
@@ -1289,13 +1333,18 @@ sub _onLinkProven {
 
     my $client = $b->{client} or return;
 
+    # The flag and the announcement FIRST, so nothing below can lose them:
+    # without the notification Material never re-lists the player.
     $client->disconnected(0);
+    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'reconnect' ] );
 
+    # playerActive can run the whole _JumpToTime -> play() path when the group
+    # is playing; a failure there is logged, not allowed to unwind the proof.
     my $controller = eval { $client->controller };
-    $controller->playerActive($client) if $controller && $client->power;
-
-    Slim::Control::Request::notifyFromArray( $client,
-        [ 'client', $b->{announced}++ ? 'reconnect' : 'new' ] );
+    if ( $controller && $client->power ) {
+        eval { $controller->playerActive($client); 1 }
+            or $log->error( ( $b->{name} || $id ) . ": could not rejoin the sync group: $@" );
+    }
 
     return;
 }
