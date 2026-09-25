@@ -65,6 +65,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | renaming an instance making a NEW player and stranding its settings (`_idFor`, the discovery name) | **KNOWN, UNFIXED** 2026-09-20 — the name is a user-editable field, not a product string | `the discovery name is a SETTING` |
 | NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
 | `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance | `Lyrion's 5-second heartbeat` |
+| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down does NOT call playerInactive, `client forget` keyed on clientid (1.0.19) | `CONNECTED IS THE CONTROL LINK` |
 | `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `cstring INTERPOLATES` |
 | `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `the error callback really is THREE args` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
@@ -2611,8 +2612,8 @@ control path, fatal in the daemon's main loop.
 read LMS's `/stream.mp3` as ending 8ms in, advanced, and died. So a tier-2
 track can crash the daemon at the *start* rather than the end.
 
-**Diagnosing it from the LMS side**, since the player still *looks* connected
-(`Player::connected` returns `tcpsock`, a literal 1):
+**Diagnosing it from the LMS side** (before 1.0.17 the player still *looked* connected;
+since then `connected` follows the control link):
 
 1. `control link down - connect: Connection refused`, then again on the 2/4/8/16s
    backoff. Refused is not "HQPlayer closed the link" — nothing is listening.
@@ -3098,6 +3099,132 @@ check: 2, TTL 900: 1). **Lyrion's 15s player drop is deliberately NOT copied:**
 the link's ~40s is STATUS_WATCHDOG 10 + REPLY_TIMEOUT 30, and the reply window
 has to cover HQPlayer fetching a track before it answers `PlaylistAdd` - a 15s
 drop would cut a slow-origin load mid-fetch.
+
+**SUPERSEDED 2026-09-25 (1.0.17) - `CONNECTED IS THE CONTROL LINK`.** The note above
+answered the wrong question. Simon saw a dead HQPlayer (ManCave, .238, link refused
+from 12:46:56) stay in Material until the 300s forget at 12:52:03 and said "it should
+follow LMS players, that's what was agreed". A Lyrion player leaves Material's list
+the moment it is DISCONNECTED (socket closed, or 15s silent), because Material lists
+ONLY `connected` players (`server.js`: `1==parseInt(i.connected)`), and is FORGOTTEN
+300s later. The bridge had the forget but not the disconnect: `Player::connected`
+returned `tcpsock`, a literal 1, for ever. Now:
+
+* `Player::connected` = `hqControl->proven` - the link has carried a REPLY, not
+  merely been accepted (see the review round below). `tcpsock` stays a literal 1.
+* Lyrion's bookkeeping. UP is `Plugin::_onLinkProven`, fired by `Control::_dispatch`
+  once per link at HQPlayer's first reply (`onProven`), and mirrors
+  `Squeezebox::reconnect`: `disconnected(0)`, `playerActive` if powered (needed at
+  FIRST link-up too: `Client::startup`'s `restoreSync` runs while the player still
+  reads disconnected), notify `client new` on the FIRST proof ever (`client new` is
+  no longer sent at `_create`) and `client reconnect` after.
+  DOWN is `Plugin::_onLinkState`, only when `_dropLink` reports the link WAS proven
+  (`onState($ctl, 0, $wasProven)`), and does `disconnected(1)` + notify
+  `client disconnect` - **deliberately NOT `playerInactive`** (see round 2 below).
+* `client forget` refuses a connected player (Commands.pm, bug 6508), so these could
+  never be forgotten before; now a disconnected one can. `_onForget` tears the bridge
+  down with it, or its link would keep reconnecting a player LMS no longer has.
+* Forget timing UNCHANGED (INSTANCE_TTL 300, link-up guard). REPLY_TIMEOUT unchanged:
+  a HQPlayer that QUITS closes or refuses the socket, so it drops at once; only a host
+  that loses power silently takes the watchdog's ~40s.
+* HQPlayer restarting on a settings change now shows as a brief disconnect, exactly as
+  a Lyrion player rebooting does. A solo player is not made inactive (Slimproto's rule).
+
+**REVIEW ROUND 2026-09-25 (/code-review of the 1.0.17 tree), 2 findings, both VERIFIED
+then FIXED as 1.0.18 (1.0.17 was built, never installed):** (1) the first cut hung
+`connected` and the bookkeeping on the TCP ACCEPT (`Control::connected`). hqplayerd
+accepts and then drops whenever its endpoint is missing (`TRAP: hqplayerd ACCEPTS the
+socket and then throws`), on every retry of the 2s->60s ladder - so the player would
+blink in and out of Material's list, notify reconnect/disconnect each cycle, and on a
+powered player in a PLAYING sync group `playerActive` -> `_JumpToTime` would restart
+the whole group every cycle. Moved onto `proven` (the first reply), which the backoff
+reset already uses for the same reason. The accept path still does only what it did
+before 1.0.17 (refreshInfo, polling, restart probe). An expired trial that REPLIES
+with `result="Error"` counts as proven - HQPlayer is there and answering. (2) the
+`tcpsock(1)` comment in `_create` still said it made LMS treat the player as
+connected; corrected.
+
+Pinned in `t_plugin.pl` (`connected is the PROVEN control link`, `Lyrion's
+disconnect/reconnect bookkeeping, on the PROVEN link` - incl. the accept-then-drop
+cycle announcing nothing) and `t_control.pl` (`onProven: once per link`). Mutations:
+the old `connected` fails 2; `connected` on the accept fails 1; bookkeeping removed
+fails 2; `onProven` never fired fails 1.
+**REVIEW ROUND 2 2026-09-25 (/code-review of the 1.0.18 tree), 8 findings, all VERIFIED
+then FIXED as 1.0.19 (1.0.18 never installed).** Every one was in code 1.0.17/1.0.18 wrote.
+(1) **`_onForget` could never fire**: `client forget` is notified from the queue AFTER
+`clientForgetCommand` -> `forgetClient` deleted the client from `%clientHash`, and
+`Request::client` is a `getClient()` lookup - undef. Now keyed on `$request->clientid`.
+The test had handed back a live client, so it passed against a handler that could not run;
+`FakeRequest->client` now returns undef. (2) **`forgetClient` DIES before LMS 9.1** on the
+literal `tcpsock` 1 (`slimproto_close(1)` -> `1->close`), after the client left
+`%clientHash`; 9.0 and 8.5 read `... if defined $client->tcpsock()`, 9.1 checks
+`ref eq "IO::Socket::INET"` (fetched from LMS-Community `public/8.5|9.0|9.1`). install.xml
+allows 8.0+. `Player::forgetClient` now clears `tcpsock` first; both Plugin.pm sites call it
+as a METHOD so the override runs. (3) After a forget, a HQPlayer still answering discovery
+is re-created at the next round (~5s) - unlike a Lyrion player, which returns only on
+reconnect. **Kept, comment corrected**: NO UI in LMS or Material sends `client forget` to
+this player (the only core senders are Slimproto's timer, SlimProto clients only, and the
+on-device menu, which needs a display) - a third-party app or hand-typed command only.
+(4) **`playerInactive` on link-down sent `<Stop/>` down the dead link**: `_stopClient` ->
+`Player::stop` -> `Control::send`, which with no socket calls `connect` AT ONCE, from inside
+`_dropLink`, ahead of `_scheduleReconnect` - the backoff skipped and the Stop left queued
+for the next link. DROPPED: a synced member stays in the active set on a drop, which is
+exactly what every release did while `connected` was always 1. `playerActive` on proof is
+kept (restoreSync at init). (5) the feed's Connected row and the `_onInstances` removal
+guard still read the ACCEPT; both read `proven` now. (6) `client new` fired at `_create`
+with the player reading disconnected, and the first proof sent `reconnect` with no
+disconnect before it - now `new` at first proof, `reconnect` after. (7) `announced`
+duplicated Control's `proven` for the down path only because `_dropLink` clears `proven`
+before calling out; `_dropLink` now passes `$wasProven`, and `announced` only means "ever
+proven" (for new vs reconnect). (8) the forget test - see (1).
+
+Mutations, each FAILS its own assertion: forget via `->client`; no `forgetClient` override;
+removal guard on `connected`; `playerInactive` restored; `wasProven` not passed;
+always `reconnect`. `t_control` 68, `t_plugin` 168, all suites green, sweep clean.
+**CARRIER AUDIT 2026-09-25 (after round 2, Simon: "double check over all the code that
+this affects"). Every reader of the changed state, checked against LMS `public/9.1`,
+Material and the sibling plugins. Recorded so a review does not re-derive them:**
+
+* **LMS readers of `$client->connected`**: `players` query + `status` `player_connected`
+  / `player_ip` (the intended effect); `client forget` refuses a connected player (why
+  forget became reachable); `StreamingController::sync` (activation at sync, covered by
+  `playerActive` on proof). `->disconnected` is read only by `Squeezebox2::songElapsedSeconds`
+  - not our class. Nothing else.
+* **Listeners of `client new/reconnect/disconnect`**: `serverstatusQuery_filter` answers
+  ANY `client` notification with a push inside 1.3s - **this is what makes Material drop
+  the player promptly**, so the notifications are load-bearing, not decoration. Also
+  `Discovery::Players` (a `fetch_servers`, cheap), UPnP `MediaRenderer` (adds/removes the
+  player's renderer, as for a Squeezebox), `ExtendedBrowseModes` (per-client menus, now at
+  first proof), xPL. `Buttons::Settings` listens to `disconnect` only in its server-switch
+  mode, on a display this player lacks. **Notifications are QUEUED** (`notifyFromArray`
+  pushes `@notificationQueue`, delivered next idle loop), so no listener runs inside
+  `_dispatch` or `_dropLink`.
+* **Material**: `server.js` and `playerlist-dialog.js` filter on `connected == 1`; nothing
+  else. **Sibling plugins**: only NowPlayingDisplay reads `->connected` (skips disconnected
+  players - consistent); Listening History, Eversolo Screen Control, Album Booklet (an
+  httpClient), Platin Bridge (its own players) are unaffected.
+* **Ordering**: `proven` is set before `onProven` and cleared before `onState(0)`, and
+  `disconnected()` is set before each notify, so a listener always reads the new state.
+  A command queued from `onProven` (via `playerActive` -> `_JumpToTime`) waits behind the
+  in-flight request, because `onProven` fires inside `_dispatch` before the reply is
+  matched.
+* **`playerActive` on proof** returns at once for an already-active player - every
+  reconnect, since a drop no longer makes it inactive - and acts only for a synced player
+  restored at init or one never made active; it restarts the group only if the group is
+  playing. A solo controller starts with `players => []`.
+* **Forget path**: the command runs `playerInactive` then `$client->forgetClient` (our
+  override), then `_onForget` -> `_teardown` calls `forgetClient` a SECOND time, inside an
+  eval; LMS's `forgetClient` only deletes and clears, so the repeat is harmless.
+  `_teardown`'s `controller->stop` queues a `<Stop/>` on a Control already `closing`,
+  where `connect` refuses - dropped. **Pre-existing, not changed**: a `_teardown` of a
+  player (re-key, removal) sends no `client` notification, so Material learns at its next
+  serverstatus poll; before 1.0.17 the same.
+* **Bridge-internal readers of the link**: `Player::connected`, the feed's Connected row
+  and the `_onInstances` removal guard read `proven`; `_statusWatchdog` (Player.pm) keeps
+  `connected` (the accept) on purpose - it must probe an accepted-but-silent link to time
+  it out. The feed row is now pinned too (fails with the accept restored).
+
+**UNVERIFIED LIVE** until 1.0.19 is installed. (The 1.0.19 zip predates one comment edit in
+Control.pm and one added test - diffed: the only difference is that comment.)
 
 **Two knock-on effects the faster pace would have caused, both fixed in the same
 change and both pinned by tests that FAIL against the previous commit:**
@@ -5510,7 +5637,8 @@ which is a diagnostic that did not exist when this class of bug was last chased.
   HQPlayer's fixed volume is a startup LEVEL, not a lock — the range stays full
   width, `enabled` stays 1, and the volume remains changeable. There is no state
   to present. See the Review Ledger; the detectors that assumed one are deleted.
-* `Player::connected` returns `tcpsock` (a literal 1) as LMS-Groups does, so LMS
+* ~~`Player::connected` returns `tcpsock` (a literal 1)~~ **REVERSED 2026-09-25,
+  1.0.17 - see `CONNECTED IS THE CONTROL LINK`.** Old note: it returned `tcpsock` (a literal 1) as LMS-Groups does, so LMS
   shows the player as present even when the control link is down. Discovered-but-
   unreachable is a normal recurring state here (the NAA lives at home), and
   tying the two together would risk LMS churning prefs and sync groups.

@@ -118,7 +118,35 @@ sub initPlugin {
     Slim::Control::Request::addDispatch(
         [ 'hqplayerbridge', 'signalpath' ], [ 0, 1, 0, \&_signalPathQuery ] );
 
+    # A disconnected player can now be FORGOTTEN from LMS - `client forget`
+    # refuses a connected one, and these used to read connected for ever. When
+    # that happens the bridge lets go too, or its control link would go on
+    # reconnecting a player LMS no longer has. NO UI in LMS or Material sends
+    # it to this player (Slimproto's timer is for SlimProto clients, and the
+    # on-device menu needs a display) - only a third-party app or a hand-typed
+    # command. If the instance still answers discovery, the next round (~5s)
+    # makes a FRESH player: unlike a Lyrion player, which returns only when it
+    # reconnects, this one returns when discovery answers.
+    Slim::Control::Request::subscribe( \&_onForget, [ ['client'], ['forget'] ] );
+
     Plugins::HQPlayerBridge::Discovery->start( \&_onInstances );
+
+    return;
+}
+
+sub _onForget {
+    my $request = shift;
+
+    # THE ID, NOT ->client: the notification is delivered from the queue
+    # AFTER clientForgetCommand has run forgetClient, which deletes the client
+    # from %clientHash - and Request::client is a getClient() lookup, so it is
+    # always undef here.
+    my $id = $request->clientid or return;
+
+    return unless $bridges{$id};
+
+    main::INFOLOG && $log->is_info && $log->info("$bridges{$id}->{name}: forgotten in LMS, dropping its link");
+    _teardown($id);
 
     return;
 }
@@ -192,6 +220,7 @@ sub postinitPlugin {
 }
 
 sub shutdownPlugin {
+    Slim::Control::Request::unsubscribe( \&_onForget );
     Plugins::HQPlayerBridge::Discovery->stop;
     %splitWarned = ();
 
@@ -558,7 +587,7 @@ sub signalPathFor {
     my %out;
 
     $out{connected} = cstring( $client,
-        ( $b->{control} && $b->{control}->connected )
+        ( $b->{control} && $b->{control}->proven )
             ? 'PLUGIN_HQPLAYER_CONNECTED' : 'PLUGIN_HQPLAYER_DISCONNECTED' )
         . ' - ' . ( $b->{instance}->{ip} || '?' ) . ':4321';
 
@@ -894,7 +923,9 @@ sub _onInstances {
         my $b   = $bridges{$id};
         my $ctl = $b->{control};
         my $ip  = ( $b->{instance} || {} )->{ip};
-        next if $ctl && $ctl->connected && !( defined $ip && $ids->{$ip} );
+        # PROVEN, the same test as Player::connected: an accept hqplayerd is
+        # about to drop is not a live player.
+        next if $ctl && $ctl->proven && !( defined $ip && $ids->{$ip} );
 
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
         _teardown($id);
@@ -1142,8 +1173,9 @@ sub _create {
 
     $client->macaddress($id);
 
-    # A literal 1, never a socket: this is what lets the rest of LMS treat the
-    # player as connected without there being a SlimProto link to speak to.
+    # A literal 1, never a socket. It no longer decides `connected` - that is
+    # the proven control link, see Player::connected - but LMS code that
+    # expects a Squeezebox-style player still reads it.
     $client->tcpsock(1);
 
     $client->display( Slim::Display::NoDisplay->new($client) );
@@ -1151,7 +1183,7 @@ sub _create {
     eval { $client->init };
     if ($@) {
         $log->error("player init failed for $name: $@");
-        eval { Slim::Player::Client::forgetClient($client) };
+        eval { $client->forgetClient };
         return;
     }
 
@@ -1170,9 +1202,10 @@ sub _create {
         ip      => $inst->{ip},
         name    => $name,
         onState => sub {
-            my ( $c, $up ) = @_;
-            _onLinkState( $id, $up );
+            my ( $c, $up, $wasProven ) = @_;
+            _onLinkState( $id, $up, $wasProven );
         },
+        onProven => sub { _onLinkProven($id) },
         # Every Status message - the one we asked for and the ~1/s HQPlayer
         # pushes afterwards - drives the player's state machine.
         onStatus => sub {
@@ -1193,19 +1226,24 @@ sub _create {
 
     $ctl->connect;
 
-    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'new' ] );
+    # NO `client new` here: the player reads disconnected until HQPlayer
+    # replies, and a Lyrion player is announced when its socket is up, not
+    # before. _onLinkProven sends it at the first reply.
 
     return;
 }
 
 sub _onLinkState {
-    my ( $id, $up ) = @_;
+    my ( $id, $up, $wasProven ) = @_;
 
     my $b = $bridges{$id} or return;
 
     my $client = $b->{client} or return;
 
     if ($up) {
+        # The TCP accept only. Nothing LMS-facing happens here: hqplayerd also
+        # accepts when it is about to drop the socket, so the player is not
+        # reported connected until HQPlayer REPLIES - see _onLinkProven.
         $client->refreshInfo;
 
         # The status subscription is armed HERE, not at a track load.  It is
@@ -1217,7 +1255,47 @@ sub _onLinkState {
     }
     else {
         $client->_stopPolling;
+
+        # Only a link LMS was told about: an accept-then-drop never was, and
+        # must announce nothing.
+        #
+        # DELIBERATELY NOT playerInactive, which Slimproto's close does call:
+        # here it reaches Player::stop -> <Stop/> -> Control::send, which on a
+        # dead link reconnects AT ONCE (inside _dropLink, ahead of the backoff)
+        # and leaves the Stop queued for the next link. Leaving a synced member
+        # in the active set is what every release before 1.0.17 did, when
+        # `connected` was always 1.
+        if ($wasProven) {
+            $client->disconnected(1);
+            Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
+        }
     }
+
+    return;
+}
+
+# HQPlayer's FIRST REPLY on a link: the player is now connected as far as LMS
+# is concerned (Player::connected reads the same flag). Lyrion's
+# Squeezebox::reconnect: a powered player rejoins its sync group's active set -
+# needed at the first link too, since Client::startup's restoreSync ran while
+# it still read as disconnected. The first proof ever is `client new`, as
+# Lyrion announces a player once its socket is up; later ones are `client
+# reconnect`. Forgetting is unchanged: Lyrion's 300s, via discovery
+# (INSTANCE_TTL).
+sub _onLinkProven {
+    my $id = shift;
+
+    my $b = $bridges{$id} or return;
+
+    my $client = $b->{client} or return;
+
+    $client->disconnected(0);
+
+    my $controller = eval { $client->controller };
+    $controller->playerActive($client) if $controller && $client->power;
+
+    Slim::Control::Request::notifyFromArray( $client,
+        [ 'client', $b->{announced}++ ? 'reconnect' : 'new' ] );
 
     return;
 }
@@ -1233,6 +1311,7 @@ sub _teardown {
         # player actually go away.
         delete $ctl->{onStatus};
         delete $ctl->{onState};
+        delete $ctl->{onProven};
     }
 
     if ( my $client = $b->{client} ) {
@@ -1241,7 +1320,7 @@ sub _teardown {
 
             $client->controller->stop if $client->controller;
         };
-        eval { Slim::Player::Client::forgetClient($client) };
+        eval { $client->forgetClient };
     }
 
     return;

@@ -136,9 +136,13 @@ sub new {
     my $self = bless {
         ip        => $args{ip},
         name      => $args{name} || $args{ip},
-        onState   => $args{onState},      # called as $cb->($self, $connected)
+        onState   => $args{onState},      # called as $cb->($self, 1) at the
+                                          # accept, and $cb->($self, 0, $wasProven)
+                                          # when a link that was up drops
         onStatus  => $args{onStatus},     # called as $cb->($attrs, $raw) for
                                           # EVERY Status message, pushed or not
+        onProven  => $args{onProven},     # called as $cb->($self) ONCE per link,
+                                          # at HQPlayer's first reply - see proven
         queue     => [],
         wbuf      => '',
         rbuf      => '',
@@ -160,6 +164,12 @@ sub new {
 sub ip        { $_[0]->{ip} }
 sub name      { $_[0]->{name} }
 sub connected { $_[0]->{connected} }
+
+# The link has carried a reply - the first real evidence HQPlayer is serving.
+# `connected` is only the TCP accept, which hqplayerd also gives when it is
+# about to drop the socket (no endpoint, expired trial). LMS's view of the
+# player - Player::connected - is this, not that.
+sub proven    { $_[0]->{proven} }
 
 # ---------------------------------------------------------------------------
 # Public: queue a command.
@@ -465,6 +475,11 @@ sub _dispatch {
     if ( !$self->{proven} ) {
         $self->{proven}  = 1;
         $self->{backoff} = BACKOFF_MIN;
+
+        if ( $self->{onProven} ) {
+            eval { $self->{onProven}->($self) };
+            $log->error("$self->{name}: onProven handler died: $@") if $@;
+        }
     }
 
     my $attrs = parseAttrs($raw);
@@ -564,7 +579,8 @@ sub _extractMessage {
 sub _dropLink {
     my ( $self, $why ) = @_;
 
-    my $wasUp = $self->{connected};
+    my $wasUp     = $self->{connected};
+    my $wasProven = $self->{proven};
 
     Slim::Utils::Timers::killTimers( $self, \&_connectTimeout );
     Slim::Utils::Timers::killTimers( $self, \&_replyTimeout );
@@ -593,7 +609,10 @@ sub _dropLink {
 
     $log->warn("$self->{name}: control link down - $why") if $wasUp || $log->is_debug;
 
-    $self->{onState}->( $self, 0 ) if $wasUp && $self->{onState};
+    # $wasProven: whether this link had carried a reply, i.e. whether LMS was
+    # told it was connected (Player::connected is `proven`). Passed because
+    # `proven` is already cleared above, so the listener cannot ask.
+    $self->{onState}->( $self, 0, $wasProven ) if $wasUp && $self->{onState};
 
     $self->_scheduleReconnect unless $self->{closing};
 

@@ -279,7 +279,37 @@ sub canDirectStream {
 sub canHTTPS         { 1 }
 sub canDoReplayGain   { 0 }
 sub needsWeightedPlayPoint { 0 }
-sub connected         { $_[0]->tcpsock ? 1 : 0 }
+# CONNECTED IS THE CONTROL LINK, as a Lyrion player's is its SlimProto socket.
+# It used to be `tcpsock`, a literal 1, so a dead HQPlayer stayed listed as
+# connected until it was forgotten 300s later - and Material lists ONLY
+# connected players (server.js: `1==parseInt(i.connected)`), so a Lyrion
+# player vanishes the moment its socket goes and this one did not. The
+# disconnect/reconnect bookkeeping that goes with it is in Plugin::_onLinkState
+# and Plugin::_onLinkProven.
+#
+# PROVEN, NOT MERELY ACCEPTED: hqplayerd accepts and then drops the socket
+# whenever its endpoint is missing, on every retry. Counting the accept would
+# blink the player in and out of the list each cycle - and restart a playing
+# sync group each time, via playerActive. See Control::proven.
+#
+# `tcpsock` stays a literal 1: it is not a socket and nothing should treat it
+# as one.
+sub connected {
+    my $ctl = $_[0]->hqControl;
+    return $ctl && $ctl->proven ? 1 : 0;
+}
+
+# TRAP: BEFORE LMS 9.1, forgetClient DIES ON OUR tcpsock. It ends with
+# `slimproto_close($client->tcpsock()) if defined $client->tcpsock()`, and
+# slimproto_close calls ->close on it - on the literal 1 that is "Can't locate
+# object method close via package 1", AFTER the client has left %clientHash.
+# 9.1 guards it (`ref $client->tcpsock eq "IO::Socket::INET"`); install.xml
+# allows 8.0+. A forgotten player has no use for it, so clear it first.
+sub forgetClient {
+    my $self = shift;
+    $self->tcpsock(undef);
+    return $self->SUPER::forgetClient(@_);
+}
 sub opened            { undef }
 sub signalStrength    { 100 }
 

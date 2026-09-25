@@ -238,5 +238,36 @@ print "-- superseded track work is removed before it reaches HQPlayer --\n";
         'and does not invent an HQPlayer reply' );
 }
 
+print "-- onProven: once per link, at HQPlayer's FIRST reply --\n";
+{
+    my $n = 0;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onProven => sub { $n++ } );
+    $c->{connected} = 1;    # the accept alone
+    is($c->proven ? 1 : 0, 0, 'an accepted link is not proven');
+    is($n, 0, 'and onProven has not fired');
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    is($c->proven ? 1 : 0, 1, 'a reply proves it');
+    is($n, 1, 'onProven fires exactly once for two replies');
+    $c->{closing} = 1;
+    $c->_dropLink('test');
+    is($c->proven ? 1 : 0, 0, 'a dropped link is unproven again');
+}
+
+print "-- onState(0) says whether the dropped link had been PROVEN --\n";
+{
+    my @got;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onState => sub { push @got, $_[2] ? 1 : 0 } );
+    $c->{closing}   = 1;
+    $c->{connected} = 1;
+    $c->_dropLink('accept then drop');
+    $c->{connected} = 1;
+    $c->{proven}    = 1;
+    $c->_dropLink('after a reply');
+    is(join(',', @got), '0,1', 'an unanswered accept reports 0, a replied link reports 1');
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);
