@@ -6,10 +6,9 @@
 # is a minimal stub tree that satisfies the `use` lines; it is NOT a simulator
 # and proves nothing about runtime behaviour on a real server.
 #
-# Also run: the live page's own JavaScript (osascript), the helper's Python
-# suite, a PowerShell parse (pwsh), and both installers END TO END with the
-# service managers stubbed. Each of the last three skips, out loud, without its
-# tool.
+# Also run: the live page's own JavaScript (osascript, skipped out loud
+# without it), the helper's Python suite, and its installer END TO END with the
+# service managers stubbed.
 #
 # Usage:  sh tools/run_checks.sh        (from the repo root)
 set -e
@@ -30,8 +29,7 @@ perl -I. t_plugin.pl
 perl -I. t_live.pl
 python3 t_hqrestart.py   # its own log is silenced inside; a traceback must be VISIBLE
 sh -n hqrestart/install.sh && echo "  ok   the macOS/Linux installer parses"   # nothing else reads it
-python3 t_powershell.py  # install.ps1 + every command the helper builds, parsed by pwsh (skips without it)
-python3 t_installers.py  # both installers RUN end to end, service managers stubbed: stop/ask/start ORDER
+python3 t_installers.py  # the installer RUNS end to end, service managers stubbed: stop/ask/start ORDER
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="

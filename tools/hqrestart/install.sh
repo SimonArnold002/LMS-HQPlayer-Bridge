@@ -53,10 +53,9 @@ if [ $SYSTEM = 1 ] && [ "$(id -u)" != 0 ]; then echo "--system needs sudo" >&2; 
 # It is asked for here instead.
 # ---------------------------------------------------------------------------
 # Reading and writing that key is done by the helper itself (`--allow`), not
-# reimplemented here: one rule, one validator, and install.ps1 calls the same
-# one. It refuses a host name - `allow` is matched against the address a request
-# arrives from - and never rewrites a config that does not parse, because the
-# token lives in that file.
+# reimplemented here: one rule, one validator. It refuses a host name -
+# `allow` is matched against the address a request arrives from - and never
+# rewrites a config that does not parse, because the token lives in that file.
 read_allow() {
   "$PY" "$SRC" --allow "$1" 2>/dev/null || true
 }
@@ -94,7 +93,7 @@ elif [ "$OS" = Linux ]; then
     SC="systemctl --user"; WANTED=default.target
   fi
 else
-  echo "unsupported OS $OS - on Windows use install.ps1" >&2; exit 1
+  echo "unsupported OS $OS - the helper runs on macOS and Linux only" >&2; exit 1
 fi
 
 CONF="$DIR/hqrestart.json"
@@ -137,7 +136,7 @@ elif [ $ALLOW_GIVEN = 0 ] && [ -t 0 ]; then
 elif [ $ALLOW_GIVEN = 1 ] && [ -n "$ALLOW" ]; then
   # Warn and carry on: a typo must not block an upgrade. A refused address
   # changes nothing in the config, so the previous value stands and the
-  # closing line reports it. install.ps1 does the same.
+  # closing line reports it.
   if ! write_allow "$CONF" "$ALLOW" >/dev/null; then
     echo "warning: --allow $ALLOW was not accepted; leaving it as it was." >&2
   fi

@@ -155,12 +155,6 @@ hq.restart_service = lambda how, b: calls.append(('service', how['target']))
 r, e = run(cfg)
 ok(('service', 'hqplayerd.service') in calls, 'service restarted (%s)' % e)
 
-print('== Windows: exe path unreadable (elevated process): LEFT RUNNING')
-cfg = setup('win32')
-hq.detect = lambda pid, c: {'mode': 'app', 'os': 'win32', 'exe': None}
-r, e = run(cfg)
-ok(e and not any(c[0] == 'stop' for c in calls), 'refused, nothing stopped (%s)' % e)
-
 print('== macOS: bundle and exe both gone: LEFT RUNNING')
 cfg = setup('darwin')
 hq.detect = lambda pid, c: {'mode': 'app', 'os': 'darwin', 'exe': '/Applications/gone.app/Contents/MacOS/x', 'bundle': '/Applications/gone.app'}
@@ -258,6 +252,28 @@ def bind_test(err, second=None):
         sys.argv = argv; hq.server_for = real_server_for
     return code, logged(), tries
 
+print('== any OS but macOS and Linux is refused at start, before a config is read')
+was = hq.PLATFORM
+d5 = tempfile.mkdtemp(); c5 = os.path.join(d5, 'hqrestart.json')
+argv, sys.argv = sys.argv[:], ['hqrestart.py', c5]
+real_stderr, sys.stderr = sys.stderr, io.StringIO()
+def no_bind(listen, port):                          # a build without the refusal must FAIL here,
+    raise SystemExit('reached the bind')            # not serve on a real port
+real_server_for, hq.server_for = hq.server_for, no_bind
+try:
+    hq.PLATFORM = 'win32'
+    try:
+        code = hq.main()
+    except SystemExit as e:
+        code = e.code
+    except Exception as e:
+        code = '%s: %s' % (type(e).__name__, e)
+    said = sys.stderr.getvalue()
+finally:
+    sys.argv, sys.stderr, hq.PLATFORM, hq.server_for = argv, real_stderr, was, real_server_for
+ok(code == 2 and 'macOS and Linux only' in said, 'Windows exits 2, saying why (%r)' % (code,))
+ok(not os.path.exists(c5), 'and writes no config (no token generated)')
+
 code, said, tries = bind_test(OSError(_errno.EADDRINUSE, 'Address already in use'))
 ok(code == 2, 'a port already in use stops the helper (exit %r)' % (code,))
 ok('already in use' in said and 'no IPv6' not in said,
@@ -336,26 +352,6 @@ try:
     ok(lambda: hq.same_owner(100) is True, 'macOS: ps failing is not a refusal')
 finally:
     os.geteuid = real_geteuid
-    hq.run = real_run
-
-print('== Windows: a SYSTEM helper against a USER\'s app: LEFT RUNNING')
-real_run = hq.run
-def ps_sids(out):
-    return lambda argv, timeout=30: (0, out) if argv[0] == 'powershell' else (1, '')
-try:
-    for sids, refused, label in (('S-1-5-21-9-1001 S-1-5-18\n', True, 'a user app under a SYSTEM helper is refused'),
-                                 ('S-1-5-21-9-1001 S-1-5-21-9-1001\n', False, 'the same account still restarts'),
-                                 ('', False, 'an owner PowerShell cannot read is not a refusal')):
-        cfg = setup('win32', pinned=[EXE])
-        hq.detect = lambda pid, c: {'mode': 'app', 'os': 'win32', 'exe': EXE}
-        hq.run = ps_sids(sids)
-        r, e = run(cfg)
-        stopped = any(c[0] == 'stop' for c in calls)
-        if refused:
-            ok(e and 'another user' in e and not stopped, '%s (%s)' % (label, e))
-        else:
-            ok(e is None and stopped, '%s (%s)' % (label, e))
-finally:
     hq.run = real_run
 
 print('== HQPlayer NOT running: what is PINNED starts it, with no saved state')
@@ -445,30 +441,6 @@ real_run, real_kill, real_wait = hq.run, os.kill, getattr(hq, 'KILL_WAIT', 3)
 hq.KILL_WAIT = 0.3
 kcfg = conf(stop_timeout=0.3)
 try:
-    # Windows: taskkill /F refused (an elevated HQPlayer), tasklist still lists it
-    hq.PLATFORM = 'win32'
-    hq.run = lambda argv, timeout=30: ((0, '"hqplayerd.exe","100","Console"\n') if argv[0] == 'tasklist'
-                                       else (1, 'ERROR: Access is denied.'))
-    try:
-        REAL_STOP_APP(100, kcfg, 5); e = None
-    except RuntimeError as ex:
-        e = str(ex)
-    ok(e and 'left running' in e, 'Windows: a refused taskkill is not taken for a stop (%s)' % e)
-    # a tasklist that FAILS knows nothing - it must not read as "gone"
-    hq.run = lambda argv, timeout=30: (127, '')
-    ok(lambda: hq.alive(100) is True, 'Windows: a failed tasklist is not "the process is gone"')
-    # CONTROL: taskkill works, tasklist then finds nothing
-    gone = []
-    def works(argv, timeout=30):
-        if argv[0] == 'taskkill': gone.append(1); return 0, 'SUCCESS'
-        return (0, 'INFO: No tasks are running which match the specified criteria.\n') if gone else \
-               (0, '"hqplayerd.exe","100","Console"\n')
-    hq.run = works
-    try:
-        REAL_STOP_APP(100, kcfg, 5); e = None
-    except RuntimeError as ex:
-        e = str(ex)
-    ok(e is None, 'Windows: a stop that worked still returns (%s)' % e)
     # POSIX: a process that outlives SIGKILL
     hq.PLATFORM = 'linux'
     os.kill = lambda pid, sig: None                 # every signal "sent", nothing dies
@@ -594,8 +566,7 @@ try:
              {'Content-Type': 'application/json'}, b'{}')
     ok(logged().count('not in "allow"') == 0, 'and it is not repeated for the same address')
 
-    # The advice must name the installer THIS machine has. Telling a Windows
-    # user to run install.sh is worse than saying nothing.
+    # The advice names the installer and the flag for a service install.
     def advice(platform):
         was = hq.PLATFORM
         hq.PLATFORM = platform
@@ -609,9 +580,8 @@ try:
             hq.PLATFORM = was
 
     ok(lambda: './install.sh --allow' in advice('linux'), 'on Linux it names install.sh')
-    ok(lambda: 'install.ps1 -Allow' in advice('win32'), 'on Windows it names install.ps1')
-    ok(lambda: '--system' in advice('darwin') and '-System' in advice('win32'),
-       'and both say to add the service flag if HQPlayer runs as one')
+    ok(lambda: './install.sh --allow' in advice('darwin'), 'on macOS it names install.sh')
+    ok(lambda: '--system' in advice('darwin'), 'and says to add --system if HQPlayer runs as a service')
 
     # The throttle bounds the LOG. Nothing bounded the MAP, so one entry per
     # distinct address accumulated for ever on a host anything scans.
@@ -633,8 +603,8 @@ finally:
     srv.shutdown(); srv.server_close()
 
 # ---------------------------------------------------------------------------
-# `allow`, as the installers set it. One validator, called by install.sh and
-# install.ps1 alike - three copies of this rule would drift.
+# `allow`, as the installer sets it. One validator, called by install.sh - two
+# copies of this rule would drift.
 # ---------------------------------------------------------------------------
 print('== the installers\' --allow, which is the only way a user sets this')
 CONF = os.path.join(tmp, 'allow.json')

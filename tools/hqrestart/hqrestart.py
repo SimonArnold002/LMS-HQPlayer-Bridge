@@ -2,15 +2,13 @@
 """hqrestart - a tiny webhook that restarts HQPlayer on the machine it runs on.
 
 Run it on the HQPlayer host. It finds the running HQPlayer, works out HOW it
-was started - as a service (launchd job, systemd unit, Windows service) or as
-an app - and restarts it the same way:
+was started - as a service (launchd job, systemd unit) or as an app - and
+restarts it the same way. macOS and Linux only:
 
     macOS    service: launchctl kickstart -k <domain>/<label>
              app:     SIGTERM, wait for exit, `open` the bundle unless macOS respawns it
     Linux    service: systemctl [--user] restart <unit>   (unit read from /proc/<pid>/cgroup)
              app:     SIGTERM, relaunch the recorded /proc/<pid>/cmdline, detached
-    Windows  service: Restart-Service <name>              (the service owning the pid)
-             app:     taskkill, Start-Process <recorded exe path>
 
 The last launch recipe seen is saved, so HQPlayer can be STARTED when it is not
 running at all. Every guess can be pinned in the config file.
@@ -37,7 +35,7 @@ Run:
     python3 hqrestart.py --allow CONFIG ADDRS
                                             validate and write it, keeping every
                                             other key; exits 1 naming a bad one.
-                                            install.sh and install.ps1 call this.
+                                            install.sh calls this.
 
 Standard library only; Python 3.7+.
 """
@@ -61,12 +59,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PLATFORM = sys.platform  # 'darwin' | 'linux' | 'win32'
+PLATFORM = sys.platform  # 'darwin' | 'linux'; main() refuses anything else
 
 DEFAULT_NAMES = {
     'darwin': ['hqplayerd', 'HQPlayer6Desktop', 'HQPlayer5Desktop'],
     'linux':  ['hqplayerd', 'hqplayer6desktop', 'hqplayer5desktop'],
-    'win32':  ['hqplayerd.exe', 'HQPlayer6Desktop.exe', 'HQPlayer5Desktop.exe'],
 }
 
 # What a relaunched Linux app needs from its session, and nothing more: the
@@ -86,7 +83,7 @@ DEFAULTS = {
     'hostnames':     [],      # names besides an IP / localhost the tokenless path may be addressed by
     'process_names': None,  # None -> DEFAULT_NAMES for this OS
     'mode':          'auto',  # auto | app | service
-    'service':       '',      # pin the launchd label / systemd unit / Windows service name
+    'service':       '',      # pin the launchd label / systemd unit
     'user_service':  None,    # Linux: True for `systemctl --user`; None = detect
     'start_command': None,    # pin the app relaunch, as an argv list
     'stop_timeout':  20,      # seconds for a clean exit before SIGKILL
@@ -134,10 +131,6 @@ def run(argv, timeout=30):
     except (OSError, subprocess.TimeoutExpired) as e:
         log('%s failed: %s' % (argv[0], e))
         return 127, ''
-
-
-def powershell(script, timeout=60):
-    return run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script], timeout)
 
 
 # ---------------------------------------------------------------- config / state
@@ -207,7 +200,7 @@ class Config:
         cmd = self.c['start_command']
         if isinstance(cmd, str):
             log('config: "start_command" should be a list; splitting it')
-            self.c['start_command'] = shlex.split(cmd, posix=(PLATFORM != 'win32'))
+            self.c['start_command'] = shlex.split(cmd)
         elif isinstance(cmd, (list, tuple)):
             # every element reaches Popen, and a number raises in start_argv
             self.c['start_command'] = [str(x) for x in cmd] or None
@@ -309,16 +302,6 @@ class Config:
 
 def find_pid(names):
     """First pid whose process name matches one of `names` exactly."""
-    if PLATFORM == 'win32':
-        for n in names:
-            rc, out = run(['tasklist', '/FI', 'IMAGENAME eq %s' % n, '/FO', 'CSV', '/NH'])
-            if rc != 0:
-                continue
-            for line in out.splitlines():
-                cols = [c.strip('"') for c in line.split('","')]
-                if len(cols) > 1 and cols[0].lower() == n.lower() and cols[1].isdigit():
-                    return int(cols[1])
-        return None
     for n in names:
         # Linux keeps only the first 15 characters of a process name (comm),
         # and pgrep -x matches against that: `hqplayer6desktop` is 16, so the
@@ -337,11 +320,6 @@ def find_pid(names):
 def alive(pid):
     if pid is None:
         return False
-    if PLATFORM == 'win32':
-        rc, out = run(['tasklist', '/FI', 'PID eq %d' % pid, '/FO', 'CSV', '/NH'])
-        # A tasklist that FAILED knows nothing: reading its empty output as
-        # "gone" would start a second HQPlayer next to one still running.
-        return rc != 0 or ('"%d"' % pid) in out
     # A copy WE started (a relaunch) is our child: once it exits it lingers as
     # a zombie that kill(pid, 0) still reports alive, so every stop would wait
     # out stop_timeout and SIGKILL a process that had already gone. Reap first.
@@ -457,52 +435,31 @@ def detect_linux(pid, cfg):
     return {'mode': 'app', 'os': 'linux', 'argv': argv, 'cwd': cwd, 'exe': exe, 'env': env}
 
 
-def detect_win32(pid, cfg):
-    name = cfg['service']
-    if not name:
-        rc, out = powershell(
-            "(Get-CimInstance Win32_Service -Filter 'ProcessId=%d' | Select-Object -First 1).Name" % pid)
-        name = out.strip() if rc == 0 else ''
-    if cfg['mode'] == 'service' or (cfg['mode'] == 'auto' and name):
-        if not name:
-            raise RuntimeError('mode is "service" but no Windows service owns the process; set "service"')
-        return {'mode': 'service', 'os': 'win32', 'target': name}
-    rc, out = powershell('(Get-Process -Id %d).Path' % pid)
-    return {'mode': 'app', 'os': 'win32', 'exe': out.strip() or None}
-
-
 def detect(pid, cfg):
-    return {'darwin': detect_darwin, 'linux': detect_linux, 'win32': detect_win32}[PLATFORM](pid, cfg)
+    return {'darwin': detect_darwin, 'linux': detect_linux}[PLATFORM](pid, cfg)
 
 
 # ---------------------------------------------------------------- stop / start
 
 def stop_app(pid, cfg, budget):
-    if PLATFORM == 'win32':
-        run(['taskkill', '/PID', str(pid)])            # polite close first
-    else:
-        try:
-            os.kill(pid, signal.SIGTERM)                  # hqplayerd shuts down cleanly on TERM
-        except ProcessLookupError:
-            return
-        except PermissionError:                          # checked before the stop; belt and braces
-            raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
+    try:
+        os.kill(pid, signal.SIGTERM)                      # hqplayerd shuts down cleanly on TERM
+    except ProcessLookupError:
+        return
+    except PermissionError:                              # checked before the stop; belt and braces
+        raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
     deadline = time.time() + min(cfg['stop_timeout'], budget)
     while time.time() < deadline and alive(pid):
         time.sleep(0.25)
     if alive(pid):
         log('pid %d ignored the polite stop, killing' % pid)
-        if PLATFORM == 'win32':
-            run(['taskkill', '/F', '/PID', str(pid)])
-        else:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass    # it exited between the check and the kill: stopped, as wanted
-            except PermissionError:
-                raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
-        # Nothing else checks the kill worked (taskkill /F answers Access
-        # denied for an elevated process; a process stuck in the kernel
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass    # it exited between the check and the kill: stopped, as wanted
+        except PermissionError:
+            raise RuntimeError('not allowed to stop pid %d - it runs as another user' % pid)
+        # Nothing else checks the kill worked (a process stuck in the kernel
         # outlives SIGKILL for a while), and starting HQPlayer now would put
         # a SECOND copy next to it, both wanting port 4321.
         deadline = time.time() + KILL_WAIT
@@ -520,8 +477,6 @@ def may_signal(pid):
     unless it is caught here, before the stop. The REVERSE mistake - a root
     helper against a user's app - passes this, because root may signal anything:
     that one is `same_owner`'s."""
-    if PLATFORM == 'win32':
-        return True                                 # stop_app checks the kill worked
     try:
         os.kill(pid, 0)
         return True
@@ -548,30 +503,13 @@ def process_uid(pid):
     return None
 
 
-def win32_owner_sids(pid):
-    """(HQPlayer's owner SID, this helper's SID), or None when either cannot be read."""
-    rc, out = powershell(
-        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
-        "$o = if ($p) { (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid).Sid }; "
-        "\"$o $([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\"" % pid)
-    sids = out.split() if rc == 0 else []
-    if len(sids) == 2 and all(x.startswith('S-1-') for x in sids):
-        return sids[0], sids[1]
-    return None
-
-
 def same_owner(pid):
     """Whether HQPlayer runs as the user this helper runs as. An app is started
-    again as THIS helper's user, so a root / SYSTEM helper (`--system`) against a
-    user's app would stop it and then run it as that account: on Linux with the
-    user's HOME (files left owned by root), on macOS `open`ed from outside the
-    desktop session, where it does not come back, on Windows in SYSTEM's
-    windowless session reading SYSTEM's profile - not the user's saved settings.
-    An owner that cannot be read is not a refusal: `may_signal` still stands
-    behind it."""
-    if PLATFORM == 'win32':
-        sids = win32_owner_sids(pid)
-        return sids is None or sids[0] == sids[1]
+    again as THIS helper's user, so a root helper (`--system`) against a user's
+    app would stop it and then run it as that account: on Linux with the user's
+    HOME (files left owned by root), on macOS `open`ed from outside the desktop
+    session, where it does not come back. An owner that cannot be read is not a
+    refusal: `may_signal` still stands behind it."""
     uid = process_uid(pid)
     return uid is None or uid == os.geteuid()
 
@@ -602,13 +540,10 @@ def start_argv(how, cfg):
         if (argv and os.sep not in argv[0] and not shutil.which(argv[0])
                 and how.get('exe') and os.path.isfile(how['exe'])):
             argv[0] = how['exe']
-    elif how['os'] == 'win32' and how.get('exe') and os.path.isfile(how['exe']):
-        argv = ['powershell', '-NoProfile', '-Command',
-                "Start-Process -FilePath '%s'" % how['exe'].replace("'", "''")]
     if not argv:
         return None
     exe = argv[0]
-    if os.sep in exe or (os.altsep and os.altsep in exe):
+    if os.sep in exe:
         if not os.path.isabs(exe):
             # relative to HQPlayer's own directory - unusable if that is unknown
             # or no longer there
@@ -632,27 +567,24 @@ def start_app(how, cfg):
           'close_fds': True, 'cwd': launch_cwd(how)}
     if how.get('env'):
         kw['env'] = dict(os.environ, **how['env'])
-    if PLATFORM == 'win32':
-        kw['creationflags'] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        kw['start_new_session'] = True                  # outlive this webhook
-        # Under systemd a new session is NOT a new cgroup: the app would stay
-        # in this helper's unit, be killed by its stop, and be mistaken for
-        # it next time. A transient scope gives it a cgroup of its own.
-        if PLATFORM == 'linux' and own_unit() and run(['systemd-run', '--version'])[0] == 0:
-            scoped = (['systemd-run', '--scope', '--quiet', '--collect']
-                      + (['--user'] if os.geteuid() != 0 else []) + ['--'] + list(argv))
-            p = subprocess.Popen(scoped, **kw)
-            # systemd-run execs the app once the scope exists, so it only EXITS
-            # this fast when it could not make one (no user bus, say). Then a
-            # plain launch beats leaving HQPlayer stopped.
-            for _ in range(10):
-                time.sleep(0.1)
-                if p.poll() is not None:
-                    break
-            if p.returncode is None or p.returncode == 0:
-                return
-            log('systemd-run failed (rc %d); starting it without a scope' % p.returncode)
+    kw['start_new_session'] = True                      # outlive this webhook
+    # Under systemd a new session is NOT a new cgroup: the app would stay
+    # in this helper's unit, be killed by its stop, and be mistaken for
+    # it next time. A transient scope gives it a cgroup of its own.
+    if PLATFORM == 'linux' and own_unit() and run(['systemd-run', '--version'])[0] == 0:
+        scoped = (['systemd-run', '--scope', '--quiet', '--collect']
+                  + (['--user'] if os.geteuid() != 0 else []) + ['--'] + list(argv))
+        p = subprocess.Popen(scoped, **kw)
+        # systemd-run execs the app once the scope exists, so it only EXITS
+        # this fast when it could not make one (no user bus, say). Then a
+        # plain launch beats leaving HQPlayer stopped.
+        for _ in range(10):
+            time.sleep(0.1)
+            if p.poll() is not None:
+                break
+        if p.returncode is None or p.returncode == 0:
+            return
+        log('systemd-run failed (rc %d); starting it without a scope' % p.returncode)
     subprocess.Popen(argv, **kw)
 
 
@@ -662,8 +594,7 @@ def restart_service(how, budget):
     elif how['os'] == 'linux':
         argv = ['systemctl'] + (['--user'] if how.get('user') else []) + ['restart', how['target']]
     else:
-        argv = ['powershell', '-NoProfile', '-Command',
-                "Restart-Service -Name '%s' -Force" % how['target'].replace("'", "''")]
+        raise RuntimeError('do not know how to restart a service on %r' % how.get('os'))
     log('restarting service: %s' % ' '.join(argv))
     rc, out = run(argv, timeout=max(1, budget))
     if rc != 0:
@@ -687,7 +618,7 @@ def pinned_how(cfg):
             return {'mode': 'service', 'os': 'darwin', 'target': '%s/%s' % (launchd_domain(), cfg['service'])}
         if PLATFORM == 'linux':
             return {'mode': 'service', 'os': 'linux', 'target': cfg['service'], 'user': bool(cfg['user_service'])}
-        return {'mode': 'service', 'os': PLATFORM, 'target': cfg['service']}
+        return None
     if cfg['mode'] != 'service' and cfg['start_command']:
         return {'mode': 'app', 'os': PLATFORM}
     return None
@@ -844,12 +775,9 @@ class Handler(BaseHTTPRequestHandler):
                     % (who, self.headers.get('Host') or ''))
             return
 
-        # Name the installer this machine actually has - telling a Windows user
-        # to run install.sh is worse than saying nothing.
-        how = ('.\\install.ps1 -Allow %s' if PLATFORM == 'win32' else './install.sh --allow %s') % who
         log('refused a restart from %s: that address is not in "allow". If %s is your '
-            'Lyrion server, run  %s  on this machine (add %s if HQPlayer runs as a service).'
-            % (who, who, how, '-System' if PLATFORM == 'win32' else '--system'))
+            'Lyrion server, run  ./install.sh --allow %s  on this machine (add --system if '
+            'HQPlayer runs as a service).' % (who, who, who))
 
     def handle_any(self):
         url = urlparse(self.path)
@@ -909,7 +837,7 @@ def server_for(listen, port):
 
         def server_bind(self):
             if self.address_family == socket.AF_INET6:
-                try:                                 # Linux/Windows default it to ON
+                try:                                 # Linux defaults it to ON
                     self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
                 except OSError:
                     pass
@@ -921,9 +849,9 @@ def server_for(listen, port):
 def set_allow(path, raw=None):
     """Read or write the config's `allow` list, for the installers to call.
 
-    It lives here, not in install.sh and install.ps1, because it is ONE rule -
-    an address the tokenless restart trusts - and three copies of a validator
-    drift. The installers shell out to this.
+    It lives here, not in install.sh, because it is ONE rule - an address the
+    tokenless restart trusts - and two copies of a validator drift. The
+    installer shells out to this.
 
     `raw` None reads; otherwise it is a comma/space separated list of IP
     addresses. Returns the list written. Raises ValueError, naming the offending
@@ -980,12 +908,11 @@ def main():
         return 0
 
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'hqrestart.json')
-    # Under pythonw (how install.ps1 runs it on Windows) there is no stderr at
-    # all: the first log line - and http.server's own error output - would
-    # raise and kill the helper before it listens. Log to a file instead.
-    if sys.stderr is None:
-        sys.stderr = open(os.path.join(os.path.dirname(os.path.abspath(path)), 'hqrestart.log'),
-                          'a', buffering=1, encoding='utf-8')
+    # macOS and Linux only. Windows support was REMOVED (2026-09-25): say so
+    # once rather than failing later inside a restart.
+    if PLATFORM not in ('darwin', 'linux'):
+        sys.stderr.write('hqrestart runs on macOS and Linux only (this is %s)\n' % PLATFORM)
+        return 2
     cfg = Config(path)
     Handler.cfg = cfg
     # A port already taken (both the per-user AND the system install, say) or a

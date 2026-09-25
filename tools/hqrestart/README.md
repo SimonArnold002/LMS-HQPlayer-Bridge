@@ -9,6 +9,8 @@ saved settings. HQPlayer's control API has no restart command, and `:8088/restar
 
 ## What it restarts, and how
 
+It runs on **macOS and Linux**. Windows is not supported.
+
 It finds the running HQPlayer (`hqplayerd`, or HQPlayer 5/6 Desktop), works out how that copy was
 started, and restarts it the same way:
 
@@ -16,26 +18,23 @@ started, and restarts it the same way:
 |---|---|---|
 | macOS | `launchctl kickstart -k` on its launchd label | SIGTERM, then `open` its `.app` (unless macOS relaunches it first) |
 | Linux | `systemctl [--user] restart` on the unit found in `/proc/<pid>/cgroup` | SIGTERM, then rerun its original command line |
-| Windows | `Restart-Service` on the service that owns the process | stop it, then start the same `.exe` |
 
 It can also start HQPlayer when it is not running: from `service` or `start_command` if the config
 pins one, otherwise from the last launch it saw.
 
 **Only the macOS app row has been run for real.** Every other cell in that table - macOS as a
-service, and all of Linux and Windows - is written and covered by automated tests, but has not
+service, and all of Linux - is written and covered by automated tests, but has not
 been run on a real machine yet. See [Tested](#tested).
 
 ## Install
 
-Install it the same way HQPlayer runs. For a system service the webhook needs root / SYSTEM. For
+Install it the same way HQPlayer runs. For a system service the webhook needs root. For
 an app, it must run as the logged-in user. Installed the wrong way round, a restart is refused
 before anything is stopped, with "runs as another user", and HQPlayer keeps playing.
 
 ```
-./install.sh                  # macOS/Linux, HQPlayer is an app (or a user service)
-sudo ./install.sh --system    # macOS/Linux, HQPlayer is a system service
-.\install.ps1                 # Windows, HQPlayer is an app
-.\install.ps1 -System         # Windows, HQPlayer is a service (admin PowerShell)
+./install.sh                  # HQPlayer is an app (or a Linux user service)
+sudo ./install.sh --system    # HQPlayer is a system service
 ```
 
 **It asks for your Lyrion server's address**, because that is what makes the Bridge's Restart
@@ -54,7 +53,6 @@ keeps the rest of the config:
 
 ```
 ./install.sh --allow 192.168.1.234
-.\install.ps1 -Allow 192.168.1.234
 ```
 
 It must be an **IP address**, not a host name: it is matched against the address the request
@@ -67,33 +65,28 @@ all stored in `hqrestart.json` next to the installed script.
 ## Uninstall
 
 ```
-./install.sh --uninstall                  # macOS/Linux, app
-sudo ./install.sh --system --uninstall    # macOS/Linux, system service
-.\install.ps1 -Uninstall                  # Windows, app
-.\install.ps1 -System -Uninstall          # Windows, service (admin PowerShell)
+./install.sh --uninstall                  # app
+sudo ./install.sh --system --uninstall    # system service
 ```
 
 This stops the helper and removes it from startup. The config folder is left in place; delete
-it if you won't reinstall. On Windows, also remove the firewall rule from an admin PowerShell:
-`Remove-NetFirewallRule -DisplayName hqrestart`.
+it if you won't reinstall.
 
 ## What it looks like on the machine
 
-It runs as Python, so on macOS and Windows it mostly shows up under Python's name rather than
-its own:
+It runs as Python, so on macOS it mostly shows up under Python's name rather than its own:
 
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| started by | a LaunchAgent, `com.hqrestart.webhook` (a LaunchDaemon with `--system`) | a systemd unit, `hqrestart.service` (user, or system with `--system`) | a scheduled task, `hqrestart` (as SYSTEM with `-System`) |
-| where to see it | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a system install) | Task Scheduler → Task Scheduler Library → **hqrestart** |
-| the process | **Python** in Activity Monitor | `python3 …/hqrestart.py` | **pythonw.exe** in Task Manager → Details |
+| | macOS | Linux |
+|---|---|---|
+| started by | a LaunchAgent, `com.hqrestart.webhook` (a LaunchDaemon with `--system`) | a systemd unit, `hqrestart.service` (user, or system with `--system`) |
+| where to see it | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a system install) |
+| the process | **Python** in Activity Monitor | `python3 …/hqrestart.py` |
 
 macOS shows a "Background Items Added" notice when it is installed. Switching the item off
-in *Allow in the Background* stops the helper; use `--uninstall` instead. On Windows the
-installer also adds an inbound firewall rule named **hqrestart**.
+in *Allow in the Background* stops the helper; use `--uninstall` instead.
 
-Only the macOS column has been checked on a real machine. The Linux and Windows columns are
-what the installers set up; neither has been run on a real Linux or Windows machine yet.
+Only the macOS column has been checked on a real machine. The Linux column is what the
+installer sets up; it has not been run on a real Linux machine yet.
 
 ## From LMS (HQPlayer Bridge)
 
@@ -144,10 +137,10 @@ Every key is optional except `token`, which is generated on first run.
 | key | default | meaning |
 |---|---|---|
 | `port` / `listen` | `8090` / `::` | where it listens. `::` serves IPv6 AND IPv4 on one socket, falling back to `0.0.0.0` where IPv6 is off. Keep 8090 for the HQPlayer Bridge to find it |
-| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). **Set by the installer** - it asks, or takes `--allow` / `-Allow`. Your Lyrion server, e.g. `["192.168.1.234"]`. IPv4 and IPv6 both work, and a v4 address written the ordinary way still matches a client arriving over the IPv6 socket |
+| `allow` | `[]` | addresses that may restart WITHOUT the token, but only with a JSON POST addressed by IP (see below). **Set by the installer** - it asks, or takes `--allow`. Your Lyrion server, e.g. `["192.168.1.234"]`. IPv4 and IPv6 both work, and a v4 address written the ordinary way still matches a client arriving over the IPv6 socket |
 | `hostnames` | `[]` | host names, besides an IP address or `localhost`, that the tokenless route may be addressed by |
 | `mode` | `auto` | force `app` or `service` |
-| `service` | detected | pin the launchd label, systemd unit or Windows service name |
+| `service` | detected | pin the launchd label or systemd unit |
 | `user_service` | detected | Linux: `true` for `systemctl --user`. Detected from where HQPlayer runs, even with `service` pinned; set it if HQPlayer is a user unit and may be stopped when you restart it |
 | `start_command` | detected | pin how the app is started, as a list, e.g. `["open", "-a", "/Applications/hqplayerd.app"]` |
 | `process_names` | per OS | process names to look for |
@@ -165,19 +158,8 @@ it uses the last way it saw HQPlayer started, if that still works. Failing that,
 restart fails with "HQPlayer (pid N) was left running" and HQPlayer keeps playing. To fix
 it for good, set `start_command`.
 
-The same goes for a copy of HQPlayer the helper cannot stop - one running as administrator
-on Windows, say. If it is still there a few seconds after a forced stop, the restart gives
+The same goes for a copy of HQPlayer the helper cannot stop. If it is still there a few seconds after a forced stop, the restart gives
 up with "would not stop, so it was left running" rather than starting a second copy.
-
-## Windows notes
-
-`install.ps1` runs the helper with `pythonw`, which has no console. The helper then writes
-its log to `hqrestart.log` next to its config. Opening the firewall port needs an admin
-PowerShell. Without it the installer warns you, and LMS may not be able to reach the helper.
-
-Setting your Lyrion server's address needs `python.exe` on PATH as well. If only `pythonw.exe`
-is there, the installer can't read or write `allow`: it warns you, leaves the setting as it is,
-and you add your Lyrion server to `"allow"` in `hqrestart.json` by hand, then re-run the installer.
 
 ## Linux notes
 
@@ -199,19 +181,18 @@ for as `hqplayer6deskto`.
 If the helper refuses to start - a config file that doesn't parse, or a port it can't bind -
 it says so in one line and exits 2, and the systemd unit's `RestartPreventExitStatus=2` leaves
 it stopped rather than retrying for ever: `systemctl --user status hqrestart` shows the reason.
-A crash still restarts. On macOS and Windows there is no such filter, so it retries (every 10s
-under launchd, every minute under Task Scheduler) until the config is fixed.
+A crash still restarts. On macOS there is no such filter, so launchd retries every 10s until
+the config is fixed.
 
 ## Tested
 
 macOS app mode, 2026-09-21: `hqplayerd` Embedded 6.0.2 on macOS 26.6, restarted in 7.1s. The
 saved SDM settings came back (`Set dither: 9` / `Set modulator: 18`), and the Bridge and the
 Eversolo NAA reconnected. The same again from the HQPlayer Bridge's Restart row (1.0.13): about 7s, and
-playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux, Windows.
-Linux and Windows are covered by a test suite that fakes the OS, and every piece of PowerShell
-is checked to parse with `pwsh` - but neither has run on a real Linux or Windows machine.
+playback carried on in SDM afterwards. **Not yet run:** any failure path live, macOS service mode, Linux.
+Linux is covered by a test suite that fakes the OS, but has not run on a real Linux machine.
 
-**The installers** are run end to end by the test suite with the service managers replaced by
+**The installer** is run end to end by the test suite with the service managers replaced by
 stubs: a fresh install, a typo in `--allow`, Ctrl-C at the prompt, no Python, a non-interactive
 run and an uninstall, each checked to leave the existing helper running where it should. **The
 install-time address prompt (2026-09-23) has not yet been run on a real install** - the helper

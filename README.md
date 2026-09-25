@@ -67,9 +67,9 @@ sudo systemctl restart lyrionmusicserver
 
 **What it's for.** If you switch your NAA endpoint off and on again, HQPlayer often won't use it again until HQPlayer itself is restarted. Signalyst's advice is to start the NAA first, then HQPlayer. HQPlayer's **Refresh devices** button reconnects the endpoint but drops your saved output mode (SDM comes back as PCM). A restart reloads your saved settings. HQPlayer's control API has no restart command, so doing this from LMS needs a small helper on the HQPlayer machine.
 
-**What it is.** `hqrestart` is one Python script (standard library only) in [`tools/hqrestart/`](tools/hqrestart/) of this repository. It is **not part of the plugin**, and playback works exactly the same without it. It listens on port **8090**. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS, Linux or Windows. It never restarts anything by itself.
+**What it is.** `hqrestart` is one Python script (standard library only) in [`tools/hqrestart/`](tools/hqrestart/) of this repository. It is **not part of the plugin**, and playback works exactly the same without it. It listens on port **8090**. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS or Linux (Windows is not supported). It never restarts anything by itself.
 
-**Only tested on macOS so far.** It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and all of Linux and Windows, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried. The installer's question for your LMS server's address is new and is covered by those tests, but has not yet been run on a real install either.
+**Only tested on macOS so far.** It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and Linux, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried. The installer's question for your LMS server's address is new and is covered by those tests, but has not yet been run on a real install either.
 
 **Using it.** Once the helper is running, **Apps → HQPlayer Bridge** shows a **Restart *name*** row under HQPlayer Live View. Tap it, then **Restart *name* now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.
 
@@ -81,10 +81,10 @@ On the **HQPlayer machine**, with **Python 3.7 or later**:
 
 **Step 2.** Run the installer that matches how HQPlayer runs there:
 
-| HQPlayer runs as… | macOS / Linux | Windows (PowerShell) |
-|---|---|---|
-| an app, or a Linux user service | `./install.sh` | `.\install.ps1` |
-| a system service | `sudo ./install.sh --system` | `.\install.ps1 -System` (as administrator) |
+| HQPlayer runs as… | macOS / Linux |
+|---|---|
+| an app, or a Linux user service | `./install.sh` |
+| a system service | `sudo ./install.sh --system` |
 
 **Step 3.** It asks for your **LMS server's IP address**:
 
@@ -92,7 +92,7 @@ On the **HQPlayer machine**, with **Python 3.7 or later**:
 Lyrion server IP address (press return to skip):
 ```
 
-Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with `./install.sh --allow 192.168.1.234` (`-Allow` on Windows); pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.
+Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with `./install.sh --allow 192.168.1.234`; pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.
 
 It must be an IP address rather than a name, because it is matched against the address the request arrives from.
 
@@ -102,18 +102,17 @@ The helper then starts at once, and again at every login (app) or boot (service)
 
 **Step 4.** Check it from the LMS machine: `curl http://<hqplayer-ip>:8090/ping` should answer with `"service": "hqrestart"`. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.
 
-| | macOS | Linux | Windows |
-|---|---|---|---|
-| config (app) | `~/Library/Application Support/hqrestart/` | `~/.config/hqrestart/` | `%LOCALAPPDATA%\hqrestart\` |
-| config (service) | `/Library/Application Support/hqrestart/` | `/etc/hqrestart/` | `%ProgramData%\hqrestart\` |
-| log | `~/Library/Logs/hqrestart.log` (`/Library/Logs/` for a service) | `journalctl --user -u hqrestart` (no `--user` for a service) | `hqrestart.log` in the config folder |
-| runs as | a LaunchAgent (LaunchDaemon for a service) | a systemd unit | a scheduled task |
-| listed in | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a service) | Task Scheduler → Task Scheduler Library → **hqrestart** |
-| process | **Python** in Activity Monitor | `python3 …/hqrestart.py` in `ps` or `top` | **pythonw.exe** in Task Manager → Details |
+| | macOS | Linux |
+|---|---|---|
+| config (app) | `~/Library/Application Support/hqrestart/` | `~/.config/hqrestart/` |
+| config (service) | `/Library/Application Support/hqrestart/` | `/etc/hqrestart/` |
+| log | `~/Library/Logs/hqrestart.log` (`/Library/Logs/` for a service) | `journalctl --user -u hqrestart` (no `--user` for a service) |
+| runs as | a LaunchAgent (LaunchDaemon for a service) | a systemd unit |
+| listed in | System Settings → General → Login Items & Extensions → *Allow in the Background*, as **python3** | `systemctl --user status hqrestart` (no `--user` for a service) |
+| process | **Python** in Activity Monitor | `python3 …/hqrestart.py` in `ps` or `top` |
 
-**It doesn't appear under its own name everywhere.** macOS names the background item after the Python it runs, so it shows as *python3*, not *hqrestart*, and macOS tells you with a "Background Items Added" notice when you install it. If you switch that item off, the helper stops and the Restart row goes with it; use the uninstaller rather than the switch. On Windows the installer also adds a firewall rule called **hqrestart**. The macOS column was checked on a real Mac; the Linux and Windows columns describe what the installers set up, and have not been seen on a real machine.
+**It doesn't appear under its own name everywhere.** macOS names the background item after the Python it runs, so it shows as *python3*, not *hqrestart*, and macOS tells you with a "Background Items Added" notice when you install it. If you switch that item off, the helper stops and the Restart row goes with it; use the uninstaller rather than the switch. The macOS column was checked on a real Mac; the Linux column describes what the installer sets up, and has not been seen on a real machine.
 
-- **Windows:** if PowerShell refuses to run the script, use `powershell -ExecutionPolicy Bypass -File .\install.ps1`. Opening the helper's port (8090 unless you change `port`) in Windows Firewall needs an administrator PowerShell; the installer warns you if the rule is missing.
 - **Linux, app mode:** the helper runs only while you're logged in, unless you run `sudo loginctl enable-linger <your user>` (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
 - The helper can also be called without LMS, with the token, e.g. from a phone shortcut. See [`tools/hqrestart/README.md`](tools/hqrestart/README.md) for that and for every config option.
 
@@ -121,12 +120,12 @@ The helper then starts at once, and again at every login (app) or boot (service)
 
 Run the installer from the same folder with the uninstall option, matching how you installed it:
 
-| | macOS / Linux | Windows (PowerShell) |
-|---|---|---|
-| app | `./install.sh --uninstall` | `.\install.ps1 -Uninstall` |
-| service | `sudo ./install.sh --system --uninstall` | `.\install.ps1 -System -Uninstall` (as administrator) |
+| | macOS / Linux |
+|---|---|
+| app | `./install.sh --uninstall` |
+| service | `sudo ./install.sh --system --uninstall` |
 
-This stops the helper and removes it from startup. Your config folder (above) is left in place; delete it if you won't reinstall. On Windows, remove the firewall rule too, from an administrator PowerShell: `Remove-NetFirewallRule -DisplayName hqrestart`. The Restart row disappears from Apps when LMS next restarts.
+This stops the helper and removes it from startup. Your config folder (above) is left in place; delete it if you won't reinstall. The Restart row disappears from Apps when LMS next restarts.
 
 ---
 

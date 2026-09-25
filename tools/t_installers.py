@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the helper's REAL installers end to end, with the service managers stubbed.
+"""Run the helper's REAL installer end to end, with the service managers stubbed.
 
 Why this exists: three review rounds in a row found a bug the previous fix had
 introduced, and each one was a question of ORDER - what runs between stopping
@@ -11,24 +11,19 @@ whole script and reads the order off a log the stubs write.
   * install.sh  - `launchctl` / `systemctl` are stubs on PATH that log each call
                   and, on start, write a token the way the helper's first start
                   does. HOME is a temp dir, so the plist and config land there.
-  * install.ps1 - the ScheduledTask and firewall cmdlets are stub FUNCTIONS
-                  (a function outranks a cmdlet, and on macOS the cmdlets do not
-                  exist anyway); `python.exe` / `pythonw.exe` are stubs on PATH.
-                  Skipped, out loud, without pwsh.
 
 SAFETY: the stub `launchctl` MUST win on PATH. The real one, handed
 `bootout gui/<uid>/com.hqrestart.webhook`, would stop the helper installed on
 this machine. That is checked before install.sh is run at all, and the run is
 refused if it does not hold.
 
-usage: python3 tools/t_installers.py [install.sh] [install.ps1]
+usage: python3 tools/t_installers.py [install.sh]
 """
 import json, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
 
 _here = os.path.dirname(os.path.abspath(__file__))
 HQ = os.path.join(_here, 'hqrestart')
 INSTALL_SH = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HQ, 'install.sh')
-INSTALL_PS1 = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(HQ, 'install.ps1')
 HELPER = os.path.join(HQ, 'hqrestart.py')
 PY = sys.executable
 
@@ -194,127 +189,6 @@ else:
         status, out = pty_sh(sh, ['--uninstall'], env, [])
         ok('IP address' not in out and stop in out and start not in out,
            'an uninstall asks nothing, stops it, and starts nothing')
-
-# ===========================================================================
-# install.ps1
-# ===========================================================================
-print('== install.ps1, run for real with the ScheduledTask cmdlets stubbed')
-pwsh = shutil.which('pwsh')
-
-PS_STUBS = r'''
-$ErrorActionPreference = 'Stop'
-function _log($m) { [Console]::Out.WriteLine("STUB $m"); [Console]::Out.Flush() }
-function Unregister-ScheduledTask { _log 'Unregister-ScheduledTask' }
-function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory) 'a' }
-function New-ScheduledTaskSettingsSet { 's' }
-function New-ScheduledTaskTrigger { 't' }
-function New-ScheduledTaskPrincipal { 'p' }
-function New-TimeSpan { [TimeSpan]::FromMinutes(1) }
-function Register-ScheduledTask { _log 'Register-ScheduledTask' }
-function Start-ScheduledTask {
-    _log 'Start-ScheduledTask'
-    # what the helper's first start does: add a token, keep everything else
-    $c = Join-Path $env:LOCALAPPDATA 'hqrestart/hqrestart.json'
-    & '{py}' -c 'import json,os,sys
-p=sys.argv[1]; d=json.load(open(p)) if os.path.exists(p) else {{}}
-d.setdefault("token","tok-from-first-start"); json.dump(d,open(p,"w"))' $c
-}
-function Get-NetFirewallRule { 'rule' }
-function New-NetFirewallRule { }
-'''
-
-def ps_env(with_python=True, exes=('python.exe', 'pythonw.exe')):
-    local = tempfile.mkdtemp()
-    stubs = tempfile.mkdtemp()
-    if with_python:
-        for exe in exes:
-            p = os.path.join(stubs, exe)
-            open(p, 'w').write('#!/bin/sh\nexec "%s" "$@"\n' % PY)
-            os.chmod(p, 0o755)
-    # no python3 on this PATH: only the .exe stubs, or nothing at all
-    path = os.pathsep.join([stubs, os.path.dirname(pwsh), '/usr/bin', '/bin'])
-    env = dict(os.environ, LOCALAPPDATA=local, USERNAME='tester', COMPUTERNAME='testbox', PATH=path)
-    return env, local
-
-def run_ps(installer, args, env, noninteractive=True, seed=None, local=None):
-    if seed is not None:
-        c = os.path.join(local, 'hqrestart', 'hqrestart.json')
-        os.makedirs(os.path.dirname(c), exist_ok=True)
-        json.dump(seed, open(c, 'w'))
-    wrap = os.path.join(tempfile.mkdtemp(), 'wrap.ps1')
-    open(wrap, 'w').write(PS_STUBS.replace('{py}', PY).replace('{{}}', '{}') +
-                          "\n& '%s' %s\n" % (installer, ' '.join(args)))
-    cmd = [pwsh, '-NoProfile'] + (['-NonInteractive'] if noninteractive else []) + ['-File', wrap]
-    r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
-    return r.returncode, r.stdout
-
-if not pwsh:
-    print('  skip install.ps1: no pwsh on PATH')
-else:
-    ps = staged(INSTALL_PS1)
-    STOP, START = 'STUB Unregister-ScheduledTask', 'STUB Start-ScheduledTask'
-
-    env, local = ps_env()
-    rc, out = run_ps(ps, ['-Allow', '192.168.1.234'], env, local=local)
-    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
-    ok(rc == 0 and START in out, 'a fresh install starts the task (rc %s)' % rc)
-    ok(lambda: json.load(open(c)).get('allow') == ['192.168.1.234'], 'and writes the address')
-    ok('token:   tok-from-first-start' in out, 'and prints the token the first start wrote')
-
-    env, local = ps_env()
-    seed = {'token': 'keepme', 'allow': ['192.168.1.234']}
-    rc, out = run_ps(ps, ['-Allow', '192.168.1'], env, seed=seed, local=local)
-    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
-    ok(rc == 0 and START in out, 'a bad -Allow still ends with the task STARTED (rc %s)' % rc)
-    ok(before(out, 'not accepted', STOP), 'and is refused BEFORE the task is unregistered')
-    ok('leaving it as it was' in out, 'and says the previous value stands, not that it is unset')
-    ok(lambda: json.load(open(c)) == seed, 'and the previous address and token are untouched')
-
-    env, local = ps_env()
-    rc, out = run_ps(ps, [], env, noninteractive=True, local=local)
-    ok(rc == 0 and 'not interactive' in out and START in out,
-       'under -NonInteractive the prompt is skipped and the install completes (rc %s)' % rc)
-
-    # pythonw.exe alone: it has no console, so `--allow` through it answers
-    # nowhere. The installer must leave `allow` alone and SAY so - not write
-    # blind, and not report a hand-edited value it never read as "not set".
-    # (The stub pythonw here DOES print, so a write through it would land -
-    # which is what makes the untouched config the evidence.)
-    env, local = ps_env(exes=('pythonw.exe',))
-    seed = {'token': 'keepme', 'allow': ['192.168.1.234']}
-    rc, out = run_ps(ps, ['-Allow', '10.0.0.9'], env, seed=seed, local=local)
-    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
-    ok(rc == 0 and START in out, 'pythonw.exe only: the install still completes (rc %s)' % rc)
-    ok('No python.exe on PATH' in out, 'and warns that the address cannot be set here')
-    ok(lambda: json.load(open(c)).get('allow') == ['192.168.1.234'],
-       'and leaves the existing allow list untouched')
-    ok('not checked' in out and 'not set' not in out,
-       'and the summary says unchecked, not unset')
-
-    env, local = ps_env(exes=('pythonw.exe',))
-    rc, out = run_ps(ps, [], env, noninteractive=False, local=local)
-    ok(rc == 0 and 'Lyrion server IP address' not in out and START in out,
-       'pythonw.exe only, interactive: no prompt it could not act on (rc %s)' % rc)
-
-    # control: python.exe present, the same call DOES write
-    env, local = ps_env()
-    rc, out = run_ps(ps, ['-Allow', '10.0.0.9'], env, seed=dict(seed), local=local)
-    c = os.path.join(local, 'hqrestart', 'hqrestart.json')
-    ok(lambda: json.load(open(c)).get('allow') == ['10.0.0.9'] and 'No python.exe' not in out,
-       'control: with python.exe the same -Allow is written, with no warning')
-
-    # The Python checks THROW. Before this change they ran after the unregister,
-    # so a missing Python left no helper at all.
-    env, local = ps_env(with_python=False)
-    rc, out = run_ps(ps, ['-Allow', '192.168.1.234'], env, local=local)
-    ok(rc != 0 and 'Python not found' in out, 'no Python refuses the install (rc %s)' % rc)
-    ok(STOP not in out, 'and has unregistered NOTHING - the existing task is still there')
-
-    env, local = ps_env(with_python=False)
-    rc, out = run_ps(ps, ['-Uninstall'], env, local=local)
-    ok(rc == 0 and STOP in out and START not in out,
-       'an uninstall needs no Python, unregisters it, and starts nothing (rc %s)' % rc)
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)
