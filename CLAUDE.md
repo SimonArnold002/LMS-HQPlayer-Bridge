@@ -3368,6 +3368,17 @@ refuses the link costs one attempt per round, not a faster ladder. Pinned:
 `t_control.pl` 83 (5 FAIL against 1.0.21's Control.pm), `t_plugin.pl` 189 (the two
 reconnect-now checks FAIL with the call removed; 2 more against the unfixed pieces).
 
+**LOG VOLUME 2026-09-25 (1.0.23): link failures warn ONCE per outage.** Simon: "we need
+to keep log traffic down". Measured over 6.5h of LMS log: the bridge wrote 414 lines at
+WARN, 401 of them one instance that accepts and resets (`control link down - read:
+Connection reset by peer`) on every retry - once a minute on the old backoff, every
+~11s once 1.0.22's `reconnectNow` retried it each discovery round. `Control::_outage`
+now warns on the FIRST failure (refused, timed out, reset, closed, no reply on an
+unanswered accept) and sends the rest to debug until HQPlayer answers (`_dispatch`
+clears `quiet`); a PROVEN link dropping always warns and marks the outage reported.
+Pinned in `t_control.pl` (89; 6 FAIL against 1.0.22's Control.pm). For scale: the same
+log had 96,025 lines from LMS-Discography - 96% of it.
+
 **The same ten-minute idle gap is in LMS-Platin-Bridge** (`PlatinBridge/Discovery.pm`,
 `IDLE_PERIOD => 10 * 60`), unchanged there.
 

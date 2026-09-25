@@ -156,6 +156,8 @@ sub new {
         proven    => 0,
         backoff   => BACKOFF_MIN,
         closing   => 0,
+        # This outage has been reported - see _outage.
+        quiet     => 0,
     }, $class;
 
     return $self;
@@ -278,7 +280,7 @@ sub connect {
     );
 
     if ( !$sock ) {
-        $log->warn("$self->{name}: cannot create socket: $!");
+        $self->_outage("cannot create socket: $!");
         return $self->_scheduleReconnect;
     }
 
@@ -291,7 +293,7 @@ sub connect {
     if ( !CORE::connect( $sock, $addr ) ) {
         my $err = $!;
         if ( $err != EINPROGRESS && $err != EWOULDBLOCK ) {
-            $log->warn("$self->{name}: connect failed immediately: $err");
+            $self->_outage("connect failed immediately: $err");
             return $self->_dropLink("connect: $err");
         }
     }
@@ -320,7 +322,7 @@ sub _connectResolved {
 
     if ($err) {
         $! = $err;
-        $log->warn("$self->{name}: connect refused: $!");
+        $self->_outage("connect refused: $!");
         return $self->_dropLink("connect: $!");
     }
 
@@ -354,14 +356,17 @@ sub _connectResolved {
 
 sub _connectTimeout {
     my $self = shift;
-    $log->warn("$self->{name}: connect timed out after " . CONNECT_TIMEOUT . 's');
+    $self->_outage( 'connect timed out after ' . CONNECT_TIMEOUT . 's' );
     $self->_dropLink('connect timeout');
 }
 
 sub _replyTimeout {
     my $self = shift;
     my $verb = $self->{inflight} ? $self->{inflight}->{verb} : '(none)';
-    $log->warn("$self->{name}: no reply to <$verb> after " . REPLY_TIMEOUT . 's');
+    my $msg  = "no reply to <$verb> after " . REPLY_TIMEOUT . 's';
+    # A link that had been answering going silent is news; an accept that
+    # never answered is one more failed attempt of an outage.
+    $self->{proven} ? $log->warn("$self->{name}: $msg") : $self->_outage($msg);
     $self->_dropLink('reply timeout');
 }
 
@@ -496,6 +501,7 @@ sub _dispatch {
     if ( !$self->{proven} ) {
         $self->{proven}  = 1;
         $self->{backoff} = BACKOFF_MIN;
+        $self->{quiet}   = 0;      # the outage is over; the next one is news
 
         if ( $self->{onProven} ) {
             eval { $self->{onProven}->($self) };
@@ -628,7 +634,18 @@ sub _dropLink {
         $q->{cb}->( undef, undef ) if $q->{cb};
     }
 
-    $log->warn("$self->{name}: control link down - $why") if $wasUp || $log->is_debug;
+    # A link that had been ANSWERING going down is always worth a line. A
+    # failed attempt during an outage is not - see _outage.
+    if ($wasProven) {
+        $log->warn("$self->{name}: control link down - $why");
+        $self->{quiet} = 1;
+    }
+    elsif ($wasUp) {
+        $self->_outage("control link down - $why");
+    }
+    elsif ( $log->is_debug ) {
+        $log->debug("$self->{name}: control link down - $why");
+    }
 
     # $wasProven: whether this link had carried a reply, i.e. whether LMS was
     # told it was connected (Player::connected is `proven`). Passed because
@@ -636,6 +653,28 @@ sub _dropLink {
     $self->{onState}->( $self, 0, $wasProven ) if $wasUp && $self->{onState};
 
     $self->_scheduleReconnect unless $self->{closing};
+
+    return;
+}
+
+# ONE warning per outage, not one per retry. While HQPlayer is off, restarting,
+# or accepting and then resetting the socket, every retry fails the same way,
+# and discovery now prompts a retry every round (reconnectNow): at WARN that
+# was a line every ~11s for as long as it lasted - 401 of the bridge's 414
+# lines in a 6.5-hour log (2026-09-25, one instance that accepts and resets).
+# The first failure is reported; the rest go to debug until HQPlayer answers
+# again (_dispatch clears `quiet`), and a working link that drops is always
+# reported (_dropLink).
+sub _outage {
+    my ( $self, $msg ) = @_;
+
+    if ( $self->{quiet} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: $msg");
+        return;
+    }
+
+    $self->{quiet} = 1;
+    $log->warn("$self->{name}: $msg - further attempts are logged at debug until it answers");
 
     return;
 }

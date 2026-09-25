@@ -346,5 +346,44 @@ print "-- reconnectNow: discovery heard it, so try now --\n";
     Slim::Utils::Timers::_reset();
 }
 
+print "-- ONE warning per outage, not one per retry --\n";
+{
+    # 401 of the bridge's 414 log lines in 6.5 hours were one instance that
+    # accepts and resets, warned on every retry. Now: the first failure, then
+    # quiet until HQPlayer answers again.
+    my @warned;
+    no warnings qw(redefine once);
+    local *Slim::Utils::Log::Obj::warn = sub { push @warned, $_[1] };
+    Slim::Utils::Timers::_reset();
+
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    for ( 1 .. 5 ) { $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer') }
+    is(scalar @warned, 1, 'five accept-then-reset retries warn ONCE');
+    $c->_connectTimeout for 1 .. 3;
+    is(scalar @warned, 1, 'and timeouts in the same outage add nothing');
+
+    # it answers: the outage is over
+    $c->{connected} = 1;
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->_dropLink('HQPlayer closed the link');
+    is(scalar @warned, 2, 'a link that had been ANSWERING going down always warns');
+    $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer');
+    $c->_connectTimeout;
+    is(scalar @warned, 2, 'and the retries after it are quiet - that outage is already reported');
+
+    # CONTROL: after another recovery, a fresh outage is reported again
+    $c->{connected} = 1;
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->{proven} = 0;                              # as a new link would start
+    $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer');
+    is(scalar @warned, 3, 'CONTROL: a new outage after a recovery warns again');
+
+    # CONTROL: a first failure with nothing before it still warns
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $d->_connectTimeout;
+    is(scalar @warned, 4, 'CONTROL: the very first failure is reported');
+    Slim::Utils::Timers::_reset();
+}
+
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);
