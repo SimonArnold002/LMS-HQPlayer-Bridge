@@ -886,12 +886,31 @@ def set_allow(path, raw=None):
             addrs.append(part)
 
     data['allow'] = addrs
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
+
+    # ATOMIC, because the docstring above is a promise about the TOKEN: opening
+    # the real path 'w' truncates it first, so an interrupted or short write
+    # leaves exactly the unparseable config this is not allowed to produce -
+    # and Config.__init__ then exits 2, with the token gone.  Write a sibling
+    # (same filesystem, so os.replace is atomic), chmod it BEFORE it is in
+    # place so the token is never world-readable, then swap.
+    tmp = path + '.new'
     try:
-        os.chmod(path, 0o600)                        # it holds the token
-    except OSError:
-        pass
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)                     # it holds the token
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return addrs
 
 

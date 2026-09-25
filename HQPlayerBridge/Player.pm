@@ -1616,7 +1616,16 @@ sub flush {
 sub _queueTrack {
     my ( $self, $url, $song, $seek ) = @_;
 
-    if ( !$self->hqControl ) {
+    # THE LINK, NOT THE OBJECT.  hqControl is set once in _create and cleared
+    # only at teardown, so it is true straight through a drop.  Control::send no
+    # longer connects on demand: on a down link it fails the command, so all
+    # three sends below would fail and the PlaylistAdd callback would report
+    # `PlaylistAdd refused` - one PROBLEM_OPENING per track as LMS walks the
+    # playlist.  Fail the load ONCE here instead.  `up` is deliberately true
+    # while a reconnect is in flight, because send() queues on that link.
+    my $ctl = $self->hqControl;
+
+    if ( !$ctl || !$ctl->up ) {
         $log->error( $self->name . ': no control link - cannot start playback' );
         $self->_loadFailed('no control link');
         return;

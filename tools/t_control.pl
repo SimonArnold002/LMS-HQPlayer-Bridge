@@ -318,6 +318,31 @@ print "-- send on a DOWN link fails the command and does NOT connect --\n";
     Slim::Utils::Timers::_reset();
 }
 
+print "-- up(): will send() accept a command? --\n";
+{
+    # Player::_queueTrack asks this instead of "does an hqControl object exist",
+    # which is true straight through a drop.  It has to answer EXACTLY what
+    # send() accepts: read `connected` there instead and a load arriving while a
+    # reconnect is in flight is refused, though send() would have queued and
+    # carried it.
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    is($d->up, '0', 'a link with no socket is not up');
+
+    $d->{connecting} = 1;
+    is($d->up, '1', 'a link still CONNECTING is up - send() queues on it');
+    is($d->connected, '0', 'though `connected` is false there - why up() is not that');
+
+    $d->{connecting} = 0;
+    $d->{sock}       = 'pending';
+    is($d->up, '1', 'and an established link is up');
+
+    # CONTROL: what up() calls down, send() really does refuse.
+    $d->{sock} = undef;
+    $d->send('<Stop/>');
+    is(scalar @{ $d->{queue} }, '0', 'CONTROL: send() queues nothing on a link up() calls down');
+    Slim::Utils::Timers::_reset();
+}
+
 print "-- reconnectNow: discovery heard it, so try now --\n";
 {
     my @connects;

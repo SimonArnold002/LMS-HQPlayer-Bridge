@@ -173,6 +173,13 @@ sub connected { $_[0]->{connected} }
 # player - Player::connected - is this, not that.
 sub proven    { $_[0]->{proven} }
 
+# Will send() accept a command?  The SAME sock-or-connecting test send() makes,
+# so the two cannot drift: a link that is still connecting queues, a link that
+# is down fails on the next event-loop turn.  Callers that must not begin work
+# send() would reject - Player::_queueTrack - ask this, not `connected`, which
+# is false for the whole of a reconnect that will nevertheless carry the load.
+sub up        { ( $_[0]->{sock} || $_[0]->{connecting} ) ? 1 : 0 }
+
 # ---------------------------------------------------------------------------
 # Public: queue a command.
 #   $cmd is the bare element, e.g. '<Play/>' or '<Seek position="30"/>'

@@ -648,6 +648,36 @@ open(CONF, 'w').write('{"token": "keepme",}')
 ok(lambda: refuses('192.168.1.234'), 'a config that does not PARSE is refused')
 ok(lambda: open(CONF).read() == '{"token": "keepme",}', 'and is left exactly as it was')
 
+# ...and neither is a write that DIES HALF WAY.  Opening the real path 'w'
+# truncates it first, so a torn write left exactly the unparseable config the
+# check above refuses to create - with the token gone and Config.__init__
+# exiting 2, so the helper would not start again.  set_allow writes a sibling
+# and os.replace()s it.
+json.dump({'token': 'keepme', 'port': 9999, 'allow': ['10.0.0.1']}, open(CONF, 'w'))
+_realdump = hq.json.dump
+
+def _torndump(data, f, **kw):
+    f.write('{"token": "keep')                       # half a config, then the disk goes
+    raise IOError('no space left on device')
+
+def torn():
+    hq.json.dump = _torndump
+    try:
+        try:
+            hq.set_allow(CONF, '192.168.1.234')
+        except (IOError, OSError):
+            pass
+    finally:
+        hq.json.dump = _realdump
+    was = json.load(open(CONF))                      # raises if it no longer parses
+    return was.get('token') == 'keepme' and was.get('allow') == ['10.0.0.1']
+
+ok(torn, 'a write that fails half way leaves the ORIGINAL config, parseable, token and all')
+ok(lambda: not os.path.exists(CONF + '.new'), 'and does not leave its temp file behind')
+ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'],
+   'CONTROL: a write that does not fail still lands')
+ok(lambda: oct(os.stat(CONF).st_mode & 0o777) == oct(0o600), 'and the config it lands is 0600 - it holds the token')
+
 # ---------------------------------------------------------------------------
 # The installer's closing report. `allow` is now written BEFORE the helper ever
 # starts, so the file EXISTS with no token in it - and both installers used to

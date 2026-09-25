@@ -73,6 +73,12 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `the error callback really is THREE args` |
 | Windows support for the restart helper - `install.ps1`, `t_powershell.py`, any `win32` branch in `hqrestart.py`; every Windows finding (Store placeholder, `-System` folder lock, `Stop-Helper`, firewall profiles, `pythonw`) | **REMOVED** 2026-09-25, Simon's call - "causing too many problems". macOS and Linux only; `main()` refuses any other OS with exit 2. Do not re-propose, and do not report a Windows gap | `WINDOWS SUPPORT REMOVED` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
+| `_queueTrack` gating a load on "an `hqControl` OBJECT exists" while `Control::send` no longer connects on demand; three `PROBLEM_OPENING` skips for one drop | **FIXED** 2026-09-25 — a knock-on of 1.0.22's send fix, found by review. `Control::up` (the sock-or-connecting test `send` itself makes) is the gate now; pinned in `t_control.pl` and `t_player.pl` | `A LOAD IN THE DROP WINDOW` |
+| `_onLinkProven`'s `playerActive` being a no-op on a reconnect (LMS's "already active" guard), a synced member not reloading after an outage | **DECLINED** 2026-09-25, Simon's call — "isn't a problem I want to bother with". The call is harmless and does its work at the FIRST proof; calling `playerInactive` to make it live again is the settled-declined remedy (`CONNECTED IS THE CONTROL LINK`) | `PLAYERACTIVE ON A RECONNECT` |
+| auto-RESUME after a control-link outage (remember the song + position on the drop, re-load with a seek on the next proven link); "the music does not come back after a config save or a restart" | **DECLINED** 2026-09-26, Simon's call — **HQPlayer has to be sent the WHOLE stream, so any re-load plays from the START; it has always done this.** A "resume" would be a track silently restarting, which is worse than the stop. Do not re-propose from the fact that `_queueTrack` accepts a `$seek` | `RESUME AFTER AN OUTAGE IS DECLINED` |
+| resuming at a position by handing LMS `playlist jump <idx>` with `{ timeOffset => N }` (`Commands.pm:1021` -> `controller->play`, resolved in `Song::open`) | **WRONG, MEASURED LIVE 2026-09-26** — it does NOT seek, and it makes LMS LIE: the clock froze at the claimed offset while the audio played from the track start, and hqplayerd logged NO `Seek to:` line. Do not re-propose from LMS's source | `THE SEEKDATA RESUME IS A DISPLAY LIE` |
+| `set_allow` truncating the TOKEN-bearing config in place (`open(path,'w')`), against its own docstring | **FIXED** 2026-09-25 — sibling + `os.replace`, chmod before the swap; a torn write is pinned in `t_hqrestart.py` | `THE CONFIG WRITE IS ATOMIC` |
+| `FakeCtl` in `t_player.pl` being a bare `bless {}` with no package, so any new method call on the control link kills 20+ load tests | **FIXED** 2026-09-25 — it is a real stub of `Control`'s accessors (`up`/`connected`/`proven`). Keep it in step when one is added | `FAKECTL IS A REAL STUB` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -5679,6 +5685,218 @@ path still runs anywhere - it only reads and writes JSON.
 * **No real Windows install exists** (it never ran on one), so no user is stranded.
 * Suites: Perl unchanged, `t_hqrestart.py` 147, `t_installers.py` 13, sweep clean. The new
   refusal test fails 2 against the old helper (control run).
+
+## REVIEW 2026-09-25 (1.0.16-1.0.23 + the helper rework): two fixed, one declined
+
+Scope `origin/dev...HEAD`, 8 commits `6ee1185`..`ad9328e`, tree clean. Three
+findings; Simon took 1 and 3 and declined 2.
+
+**A LOAD IN THE DROP WINDOW - FIXED (`Player.pm::_queueTrack`, `Control.pm::up`).**
+`_queueTrack` guarded on `!$self->hqControl`, which asks "does a Control OBJECT
+exist". It does straight through a drop: `hqControl` is set once in `_create` and
+cleared only at teardown. That guard was written when `Control::send` connected on
+demand and queued, so a load arriving mid-drop played ~2s later. 1.0.22
+(`911ea1f`) deliberately stopped it connecting - a down link now fails the command
+on the next event-loop turn - so `<Stop/>`, `<PlaylistClear/>` and `PlaylistAdd`
+all failed and the `PlaylistAdd` callback reported `PlaylistAdd refused`, i.e. one
+`PROBLEM_OPENING` per track as LMS walked the playlist. **This is a knock-on of the
+send fix, not the send fix, so the entry recording 1.0.22 does not cover it.**
+New accessor `Control::up` = `( {sock} || {connecting} ) ? 1 : 0` - **exactly the
+test `send` makes**, so the two cannot drift. Deliberately NOT `connected`: that is
+false for the whole of a reconnect, on which `send` still queues and delivers, so
+reading it would refuse loads the link would have carried. `_queueTrack` fails
+once, at the guard, with `no control link`.
+
+**PLAYERACTIVE ON A RECONNECT - DECLINED, Simon's call: "isn't a problem I want to
+bother with".** `Plugin.pm::_onLinkProven` calls `$controller->playerActive($client)`
+and its comment says a powered player rejoins its sync group's active set. It does
+at the FIRST link. On a reconnect it cannot: the down branch never calls
+`playerInactive` (by design - `CONNECTED IS THE CONTROL LINK`), so the client is
+never removed from the controller's `{players}` and LMS returns at its "already
+active" guard (`StreamingController.pm:2045`, verified in the source tree) before
+reaching `_JumpToTime`. Effect: a synced member that loses and regains its link
+stays active without a reload. Harmless where it stands; the remedy that would make
+it live is the declined one. Not a defect - do not re-report it as one.
+
+**THE CONFIG WRITE IS ATOMIC - FIXED (`hqrestart.py::set_allow`).** Six lines under
+a docstring promising "a config that does not PARSE is never rewritten - the token
+is in that file", the write was `open(path, 'w')` + `json.dump`, which truncates
+first. A torn write therefore produced exactly the unparseable config the docstring
+rules out, and `Config.__init__` then `SystemExit(2)`s - helper dead, token gone.
+Now: write `<path>.new`, `fsync`, `chmod 0600` **before** the swap so the token is
+never briefly world-readable, then `os.replace` (same directory, so it is atomic),
+and unlink the temp file on any failure.
+
+**A TEST-RIG TRAP THIS COST AN HOUR - `FAKECTL IS A REAL STUB`.** `t_player.pl`
+handed the player `bless {}, 'FakeCtl'` in 28 places with **no `package FakeCtl`
+anywhere**, which works only while `Player.pm` calls no method on the link. Adding
+`$ctl->up` killed every load test with "Can't locate object method". Worse, the
+first run READ AS GREEN: `sh tools/run_checks.sh | tail` reports **tail's** exit
+code, not perl's. Check a suite by its own exit code and its `N passed, M failed`
+line. `FakeCtl` is now a real stub of `Control`'s public accessors - keep it in step
+when one is added.
+
+**Both fixes are pinned, and both suites were confirmed to FAIL against the old
+code** (old guard: 3 failures in `t_player.pl`; in-place write: the torn-write and
+CONTROL assertions both fail, the config unparseable). Full suite green by its own
+exit code: `t_control` 94, `t_player` 447, `t_stream` 64, `t_plugin` 189,
+`t_live` 159, `t_hqrestart` 151, `t_installers` 13.
+
+**Cleared on evidence this round (LMS source at `/private/tmp/claude-502/ss`) - do
+not pay for these measurements again:** `client forget` is NOT delivered when
+`clientForgetCommand` bails on a connected client (`executeDone` pops the unqueued
+notification); `notifyFromArray` QUEUES rather than notifies, so `_create`'s
+`new`->`disconnected` ordering holds; `disconnected` is a real accessor read only by
+Slimproto/Squeezebox2; `Player::forgetClient`'s `SUPER::` resolves to the only
+`forgetClient` in the chain; no LMS or Material UI can send `client forget` to a
+display-less player; `onProven` firing before `onStatus` inside `_dispatch` is
+harmless because the `HQP_STOPPED` branch is gated on `hqStarted`; no dangling
+references to the removed `ADDR_SLACK`/`ROUND_PERIOD`/`PROBE_BURST`/`PROBE_GAP`.
+Also re-confirmed settled and dropped without report: `reconnectNow` bypassing the
+climbed backoff, `_onLinkState` not calling `playerInactive`, the address-qualified
+corpse held to `INSTANCE_TTL`, the helper's Windows removal.
+
+**INSTALLED 2026-09-25 23:5x, and a real HQPlayer restart under playback observed
+(Simon restarted it by hand on the Mac mini .248; the helper could not do it - see
+below).** What the rig showed:
+
+- **Loads still work** - the one way the new gate could have broken everything.
+  Kiefer/`Memory Bomb`, 13 queued, clock advanced 52.5s -> 132.7s on one track, so
+  real playback, not a `mode=play` with a frozen clock.
+- **The drop is ONE line**, as 1.0.23 intends: `23:59:16.4836 Control::_dropLink
+  (640) HQPlayer (MacMini): control link down - HQPlayer closed the link`, and
+  nothing else at warn or above for the whole outage.
+- **It reconnected and was playing again**: `connected 1`, idx 1 at 20.6s. No
+  `PROBLEM_OPENING` storm, no stranded player, no second warn. **Whether the resume
+  was automatic or Simon pressed play is NOT established** - it read `mode stop` at
+  23:59:33 and `mode play` at 00:00:0x, with nothing in between measured. Do not cite
+  this as evidence of an automatic resume.
+
+**MEASURED 2026-09-26 00:06 - A SETTINGS CHANGE IN HQPLAYER DROPS THE CONTROL LINK,
+AND PLAYBACK RIDES THROUGH IT ANYWAY.** Simon changed a setting while the log was being
+captured: `00:06:36.7633 Control::_dropLink (640) HQPlayer (MacMini): control link down -
+HQPlayer closed the link` - the same line a restart produces - and the music kept playing
+(Simon, confirming after first reporting the opposite and correcting it: *"sorry i made a
+mistake it does"*). **Why:** the control link and the audio path are separate. HQPlayer
+pulls the bytes from the plugin's URL itself, so losing the control socket does not
+interrupt a stream already in progress; a full restart kills the process, so the stream
+dies with it. **Consequence for the fix below: the drop window is reached only if a TRACK
+BOUNDARY happens to fall inside the outage** - a settings change costs nothing because no
+load is attempted, and a restart stops the music for reasons that have nothing to do with
+this guard. **Playback has never survived a full restart** (Simon: *"I dont recall it
+playing through restarts before only through changes in settings"*), so there is no older
+behaviour that 1.0.22 took away and nothing to restore - an earlier note in this entry
+framed the queue-on-a-down-link path as restart survival, which was a code-level inference
+and is WRONG.
+
+**STILL NOT EXERCISED - `_queueTrack`'s new branch itself.** LMS **stopped** at the
+track boundary (`mode stop`, idx 1, `time 0`) rather than attempting a load while the
+link was down, so the `no control link` path never ran. It remains offline-tested
+only. To see it live, a play has to be fired INTO the ~7s outage window.
+
+**A WRITER FACT, measured the same night: LMS will not dispatch ANY command to a
+player it holds disconnected.** A `playlist loadtracks` AND a plain `status` aimed at
+`HQPlayer (HQPlayerEmbedded)` (link down, `connected 0`) both came back `http 000`,
+zero bytes - killed at `validate()` before dispatch, the 103 path - while the same
+`status` on the connected instance answered 200. **So a load can only reach
+`_queueTrack` on a down link during the RACE** - the link has dropped but the player
+is still held connected - never once LMS has been told the player is gone. That
+bounds the finding: it is real, and it is narrower than "any load while down".
+
+**RESUME AFTER AN OUTAGE IS DECLINED - and the measurement that led there.** A config
+save in HQPlayer, captured 2026-09-26 with the log and the player polled every 2s:
+
+```
+00:10:57  mode=play  time=160.5  idx=1 conn=1
+00:10:59  mode=play  time=160.5  idx=1 conn=0    <- link drops (the config save)
+00:11:00.1046  Control::_dropLink: control link down - HQPlayer closed the link
+00:11:01  mode=stop  time=0.0    idx=1 conn=1    <- link ALREADY back, playback stopped
+00:13:41  mode=stop  time=0.0    idx=1 conn=1    <- still stopped 2.5 min later
+```
+
+**The control link is back in ~2s, not the 10s HQPlayer is out for**, and NOTHING attempts a
+load in the window: no `no control link`, no `PlaylistAdd refused`, no `PROBLEM_OPENING`. So
+**a config save does not reach `_queueTrack`'s new guard at all** - the guard's window is only
+a track boundary that happens to fall inside an outage. LMS keeps the queue and the index
+(`idx=1`) and loses only the position, and the reason nothing comes back is
+`PLAYERACTIVE ON A RECONNECT` above.
+
+**Why a resume was nevertheless declined, Simon's call:** *"In our case as it needs to send the
+whole stream any restart forces it to play from start, its always done this."* HQPlayer is
+handed a stream and reads it from the beginning, so a re-load after the stream was torn down
+starts at zero whatever offset is asked for. **This is NOT contradicted by seeking working** -
+Simon: *"seeking can work and does"* - because a scrub is LMS applying an offset on a LIVE link
+(tier 4: LMS opens the source already at the offset; tier 5: `<Seek position>` to HQPlayer),
+which is a different thing from re-establishing a torn-down stream. A "resume" would therefore
+be a track silently restarting from 0, worse than leaving it stopped. Also relevant: **tier 3
+cannot seek at all** and tier 5's CDN range support is marked UNTESTED in `_queueTrack`.
+
+**THE SEEKDATA RESUME IS A DISPLAY LIE - measured on the rig 2026-09-26 00:24, BEFORE any
+code was written** (Simon: *"test first"*). The proposed resume was to hand LMS
+`playlist jump <idx>` with seekdata carrying only `timeOffset`, which LMS's own source says
+it resolves into a byte offset at `Song::open` (*"last chance to get the byte offset if not
+already provided"*, `Song.pm:367`; `playlistJumpCommand` passes `_seekdata` to
+`controller->play`, `Commands.pm:1021`). **It does not work, and it fails DISHONESTLY:**
+
+```
+00:24:23  before: mode=pause time=128.5 idx=0
+00:24:23  playlist jump 1 with {timeOffset:160}
+00:24:25  mode=play time=155.5 idx=1      <- and FROZEN at 155.5 for 35s+
+```
+
+hqplayerd's own log for the same second: `Playlist add URI:
+http://...:9000/music/702929/download.flac`, `NAA output network engine started at: 11289600`
+- so it WAS playing (tier 1, DSD256 to the NAA) - **but there is NO `Seek to:` line at
+00:24:23** (the last one in the log is `00:20:52 Seek to: 125`, an earlier manual scrub). So
+HQPlayer was never asked to seek and read the URL from byte 0: **the audio played from the
+START of the track while LMS displayed 155.5 and its clock did not move.** A frozen progress
+bar at a position the audio is not at is worse than the stop it would replace.
+
+**This is Simon's point, measured:** *"as it needs to send the whole stream any restart forces
+it to play from start, its always done this"* - and it is NOT contradicted by *"seeking can
+work and does"*, because a scrub on a LIVE link reaches `_queueTrack` with a `$seek` and
+sends `<Seek position=N>` (hqplayerd logs `Seek to:`), whereas the seekdata route never
+delivered one. A resume would have to pass the offset INTO `_queueTrack` so the `<Seek>` is
+actually sent. **That variant is DECLINED TOO** (Simon, 2026-09-26, after seeing this
+measurement: *"resume dead as it is now"*) - so do not re-propose the resume by offering the
+explicit-`<Seek>` version as the one that would have worked. The whole feature is closed. A fresh track
+load advances the clock normally, so the freeze belongs to the seekdata entry, not to
+playback generally.
+
+**Playback surviving a SETTINGS change is not the same event as a CONFIG SAVE** (Simon): a
+sample-rate change keeps playing, a config save takes HQPlayer out for ~10s and the stream dies
+with it. Both close the control link; only the second kills the audio.
+
+**THE RESTART HELPER AND THE RESTART ROW: RESOLVED, and my first diagnosis was WRONG.**
+Early in the session `http://192.168.1.248:8090/ping` gave a TCP accept and then no reply, and
+I read that as "something else holds 8090, so the helper cannot bind". **That was wrong.** A
+proper port sweep (Python, comparing against a control port with nothing on it) showed:
+
+```
+192.168.1.248  8090  -> REFUSED (nothing listening)   19999 -> REFUSED (control)
+               8088  -> connected (hqplayerd web)     4321  -> connected (control socket)
+192.168.1.237  every port -> Host is down             (so its player reads connected 0 - correct)
+```
+
+**8090 was REFUSED, exactly like an unused port: the helper simply was not running.** The one
+accept-then-close I had seen fits the helper binding, dying about a second later and launchd's
+`KeepAlive` restarting it until launchd gave up on a job that kept exiting fast. **It is not a
+firewall and not a port conflict** (Simon, twice: *"There is no firewall blocking anything"*,
+*"i dont have a firewall on"*). Once Simon got it running, `/ping` answered
+`{"ok": true, "service": "hqrestart"}` 200 and **the Restart row appeared and the restart
+works** (Simon: *"it works"*).
+
+**A REAL BEHAVIOUR TO KNOW, not a defect: the Restart row appears one DRAW LATE.**
+`_probeRestart` is async, so the browse that triggers the probe renders without the row and the
+NEXT draw has it (`topLevel` re-asks throttled by `REPROBE_AFTER` 60s; a known host is never
+re-asked). Measured: first browse 7 rows and no Restart row, second browse 8 rows with
+`Restart HQPlayer (MacMini)` at position 1. So installing the helper while the Apps list is
+open needs one back-out-and-in. **Do not report the row's absence as a bug without drawing the
+list twice.**
+
+**DIAGNOSTIC RULE EARNED HERE: a TCP accept is not evidence that something is listening until
+it is compared with a port known to be empty.** `curl -v` reporting `Connected to ... port 8090`
+sent a whole round of reasoning down the wrong path. Probe a control port in the same sweep.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 

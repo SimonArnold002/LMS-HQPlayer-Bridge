@@ -23,6 +23,20 @@ sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
 sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
   $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
 
+# The stub the load tests hand the player as its control link.  It was `bless
+# {}, 'FakeCtl'` with NO package at all, which works only for as long as
+# Player.pm never calls a method on the link.  TRAP: the moment one was added -
+# _queueTrack's `$ctl->up` check - every load test died with "Can't locate
+# object method up", and a `perl t_player.pl | tail` reads as a PASS because
+# the exit code belongs to tail.  Keep this in step with Control.pm's public
+# accessors.
+{
+    package FakeCtl;
+    sub up        { 1 }   # send() would accept a command - what _queueTrack gates on
+    sub connected { 1 }
+    sub proven    { 1 }
+}
+
 print "-- player construction --\n";
 my $c = eval { Plugins::HQPlayerBridge::Player->new('02:ab:88:42:4c:69', 'paddr', 1.0, undef, 12, undef) };
 ok($c && !$@, "new() does not die".($@ ? " ($@)" : ""));
@@ -1297,6 +1311,40 @@ $p->controller($lc);
 # stop microseconds after the start is exercising that guard, not end-of-track,
 # so age the player first wherever a REAL end is meant.
 sub aged { $_[0]->hqStartedAt( Time::HiRes::time() - 30 ); return }
+
+print "-- a load in the drop->reconnect window --\n";
+{
+    # Control::send NO LONGER CONNECTS on demand: on a down link it fails the
+    # command on the next event-loop turn.  _queueTrack used to gate on "an
+    # hqControl object exists", which is true straight through a drop, so all
+    # three sends failed and the PlaylistAdd callback reported `PlaylistAdd
+    # refused` - one PROBLEM_OPENING per track as LMS walked the playlist.
+    # Fail the load ONCE, at the guard, and put nothing on the wire.
+    my ( @sent, @failed );
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Player::_send       = sub { push @sent, $_[1] };
+    local *Plugins::HQPlayerBridge::Player::_loadFailed = sub { push @failed, $_[1] };
+    local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+
+    my $dn = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:55', 'paddr', 1.0, undef, 12, undef);
+    $dn->hqControl( bless {}, 'DownCtl' );
+    $dn->_queueTrack( 'http://x/one.flac', $one, undef );
+    is(scalar @sent,   '0', 'a load on a DOWN link puts nothing on the wire');
+    is(scalar @failed, '1', 'and fails the load exactly once, not once per command');
+    is($failed[0], 'no control link', 'with the link as the reason, not a PlaylistAdd refusal');
+
+    # CONTROL: the guard must not reject a load the link would have carried.
+    @sent = (); @failed = ();
+    my $lv = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:56', 'paddr', 1.0, undef, 12, undef);
+    $lv->hqControl( bless {}, 'FakeCtl' );
+    $lv->_queueTrack( 'http://x/one.flac', $one, undef );
+    is(scalar @sent,   '3', 'CONTROL: a live link still sends Stop, PlaylistClear and PlaylistAdd');
+    is(scalar @failed, '0', 'and fails nothing');
+}
+{
+    package DownCtl;
+    sub up { 0 }          # the drop window: a link that send() would refuse
+}
 
 # helper: one pushed <Status/>, with the metadata child HQPlayer really sends.
 # $track is HQPlayer's own playlist index (it reports track="n" tracks_total="n"
