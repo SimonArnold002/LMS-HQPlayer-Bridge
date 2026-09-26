@@ -45,7 +45,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqTier hqRate hqBits hqMime hqPathData hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
     hqWanted hqVolDb hqVolMin hqVolMax
-    hqVolSent hqVolSentAt hqVolPending
+    hqVolSent hqVolSentAt hqVolPending hqVolLinkNew hqVolStartup
     hqGen hqPlayAck hqURL hqPrevURL
     hqNext hqArmNext hqTrackNo hqTrackSerial hqStaleRun hqStartedAt hqFailRun
     hqArt
@@ -2222,7 +2222,23 @@ sub volume {
     $self->hqVolSent($db);
     $self->hqVolSentAt( Time::HiRes::time() );
 
+    # LMS has now set a level on this link, so HQPlayer's opening level stops
+    # being special: anything it reports from here is either our own level
+    # coming back, or a clamp of it, or somebody turning it - all followable.
+    $self->_lmsOwnsVolume;
+
     return $vol;
+}
+
+# LMS has asserted a level on this link. Drop the startup latch, or a CLAMPED
+# reply to our own assert would be ignored as "still the startup level".
+sub _lmsOwnsVolume {
+    my $self = shift;
+
+    $self->hqVolLinkNew(0);
+    $self->hqVolStartup(undef);
+
+    return;
 }
 
 # THE HOLD'S ONE RELEASE: HQPlayer answered this very <Volume>, so the level is
@@ -2305,6 +2321,8 @@ sub assertPendingVolume {
     $self->hqVolDb($db);
     $self->hqVolSent($db);
     $self->hqVolSentAt( Time::HiRes::time() );
+
+    $self->_lmsOwnsVolume;
 
     return;
 }
@@ -2447,6 +2465,49 @@ sub _followVolume {
     $self->hqVolDb($db);
 
     $self->_learnFromClamp( $db );
+
+    # HQPLAYER'S STARTUP VOLUME IS NOT A USER ACTION, SO IT IS NOT FOLLOWED.
+    #
+    # HQPlayer applies a configured startup level (Simon's is -36dB) every time
+    # it restarts. Following that overwrote LMS's STORED volume, and LMS then
+    # had nothing of its own left to re-assert: the level LMS was holding was
+    # gone before the user pressed play, so the slider "dropped back to
+    # HQPlayer's level" for good.
+    #
+    # The level reported on a new link is LATCHED instead and ignored while it
+    # stands. Suppressing one push would achieve nothing - HQPlayer re-reports
+    # the same level every second, so the next push would follow it. Any level
+    # that DIFFERS from the latch is a real change on HQPlayer's side (its own
+    # UI, the endpoint's knob) and is followed exactly as before.
+    #
+    # LMS's own re-assert then does the rest: it writes its stored volume at the
+    # start of every track that begins from stopped (Bug 10310 - see _volTol),
+    # which is the "alter the volume when it plays" half, with no code here.
+    #
+    # THE TRIGGER IS THE LINK, AND ONLY THE LINK. `hqVolLinkNew` is armed in
+    # Plugin::_onLinkState on link-up. It is deliberately NOT armed from
+    # _startPolling, which the track-load path also calls (see the <Play/>
+    # callback) - arming there would re-latch at every track boundary, which is
+    # exactly how the 0.2.31 guard went wrong on `transport_serial` and got
+    # reversed. See `An endpoint re-registering announces its own level`.
+    if ( $self->hqVolLinkNew ) {
+        $self->hqVolLinkNew(0);
+        $self->hqVolStartup($db);
+
+        main::INFOLOG && $log->is_info && $log->info( $self->name
+            . ": HQPlayer is at ${db}dB on this link - not following it, LMS"
+            . " re-asserts its own level at the next play" );
+
+        return;
+    }
+
+    if ( defined $self->hqVolStartup ) {
+        return if abs( $db - $self->hqVolStartup ) <= $self->_volTol;
+
+        # It moved off the startup level, so somebody turned it. Follow from
+        # here on, and stop treating this link's opening level as special.
+        $self->hqVolStartup(undef);
+    }
 
     return if $self->_volumeIsFixed;
 

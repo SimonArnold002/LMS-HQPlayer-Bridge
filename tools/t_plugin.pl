@@ -320,7 +320,7 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 1 );
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 0 );
-    is(join(', ', @ev), 'refreshInfo, startPolling, stopPolling',
+    is(join(', ', @ev), 'linkNew 1, refreshInfo, startPolling, stopPolling',
        'accepted then dropped with no reply: nothing announced, sync group untouched');
     # AND NOTHING TOUCHES THE HELD VOLUME. _onLinkProven used to release it on
     # any first reply, which is looser than the truth: a slider move made after
@@ -453,6 +453,9 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     sub power        { $_[0]->{power} }
     sub disconnected { push @{ $_[0]->{ev} }, "disconnected $_[1]" }
     sub refreshInfo  { push @{ $_[0]->{ev} }, 'refreshInfo' }
+    # The startup-volume latch. Recorded as an event because WHERE it is armed
+    # is the whole point: on link-up, never on a track load.
+    sub hqVolLinkNew { push @{ $_[0]->{ev} }, "linkNew $_[1]" }
     sub _startPolling { push @{ $_[0]->{ev} }, 'startPolling' }
     sub _stopPolling  { push @{ $_[0]->{ev} }, 'stopPolling' }
 

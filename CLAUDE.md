@@ -55,7 +55,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | a remote track's cover not being size-capped like the local one | REVERSED 1.0.1, Simon's call — remote covers now go through LMS's image proxy at ART_SIZE (`_remoteArt`) | `THE REMOTE ROUTE NOW GOES THROUGH THE IMAGE PROXY` |
 | `_remoteArt`, a dead / unfetchable cover showing LMS's `radio.png` | ACCEPTED 2026-09-17, Simon's call — no bridge-side detection | `The image proxy answers a dead cover with 200 and radio.png` |
 | `flush()`'s `<PlaylistClear/>` dropped by `cancelQueued('track')` | MOOT 2026-09-11 — both `_newGeneration` callers cover it | `` `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` `` |
-| `np_extid`, `_extid`, `loadEmblems`, the live page's service badge missing | BY DESIGN 2026-09-20, Simon's call — only Material draws badges | `only Material shows badges, and that is the whole point` |
+| `np_extid`, `_extid`, `loadEmblems`, the live page's service badge missing | BY DESIGN 2026-09-20, Simon's call — only Material draws badges | `Material shows badges, and that is` |
 | `_idsFor` splitting one daemon into two players after a DHCP move (a remembered address counted as a second instance) | **FIXED** 1.0.9 — `_liveOf` freshness gate plus the `_isSplit` pair guard; 1.0.8 had the gate WITHOUT the guard and must not be installed | `A CORPSE IS NOT AN INSTANCE` |
 | `_liveOf` collapsing an established PAIR when one member misses a round (`_isSplit`, `_onInstances` passing `\%bridges`) | **FIXED** 1.0.9 — found in review 2026-09-21, introduced by 1.0.8 | `AN ESTABLISHED PAIR IS NOT A DHCP MOVE` |
 | a DEAD address in a still-duplicated group keeping an address-qualified player until it expires (`_idsFor`, the `@$group` loop) | **DECLINED** 2026-09-21 — pre-existing in 1.0.7, it is `INSTANCE_TTL`'s designed grace, and looping `@$live` would strip that grace from a quiet member of a real pair | `a quiet pair member and a dead address are the same row` |
@@ -69,8 +69,8 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down does NOT call playerInactive, `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
 | `client new` sent only by the plugin's `_create`, so moving it moves the announcement | **WRONG, MEASURED** 2026-09-25 - `Slim::Player::Client::new` sends it itself (Client.pm:315); the offline stub does not, which hides it | `the constructor already sends` |
 | an expired HQPlayer trial that REPLIES with `result="Error"` reading connected (`Control::proven` on any reply) | **DECIDED** 2026-09-25, Simon's call - no trial detection; only a SHUT DOWN HQPlayer must leave the list, and it does | `we cant attempt to work out if its a trial` |
-| `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `cstring INTERPOLATES` |
-| `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `the error callback really is THREE args` |
+| `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `DOES interpolate` |
+| `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `error callback really is three args` |
 | Windows support for the restart helper - `install.ps1`, `t_powershell.py`, any `win32` branch in `hqrestart.py`; every Windows finding (Store placeholder, `-System` folder lock, `Stop-Helper`, firewall profiles, `pythonw`) | **REMOVED** 2026-09-25, Simon's call - "causing too many problems". macOS and Linux only; `main()` refuses any other OS with exit 2. Do not re-propose, and do not report a Windows gap | `WINDOWS SUPPORT REMOVED` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
 | `_queueTrack` gating a load on "an `hqControl` OBJECT exists" while `Control::send` no longer connects on demand; three `PROBLEM_OPENING` skips for one drop | **FIXED** 2026-09-25 — a knock-on of 1.0.22's send fix, found by review. `Control::up` (the sock-or-connecting test `send` itself makes) is the gate now; pinned in `t_control.pl` and `t_player.pl` | `A LOAD IN THE DROP WINDOW` |
@@ -91,7 +91,9 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `syncheck.pl` / the called-vs-defined sweep as cover for a NEW cross-module call | **MEASURED 2026-09-26 — IT IS NOT.** The sweep cannot see `$var->method`; only the suites guard those | `the sweep cannot see a method call on a variable` |
 | `%BENIGN`, `_dispatch`'s `$msg`, a benign `<Volume>` error logged at WARN | **FIXED** 2026-09-26 (round 2) — `/>([^<]*)</` matched the empty string after the XML declaration, so `%BENIGN` never fired and never had a test | `%BENIGN` never fired` |
 | `volume()` reading `Control::send`'s **1** as delivery; a level set during a reconnect HANDSHAKE (`up` = `sock \|\| connecting`); `volumeAsserted` releasing the hold on any first reply | **FIXED** 2026-09-26 (round 3) — `send` answers 1 for a command it has only QUEUED, and a failed connect drains that queue; `<Volume>` had no callback, so the hold was released and the level recorded as applied. Released by the command's OWN reply now (`_volumeDelivered`) | `THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1` |
-| the LMS slider dropping back to HQPlayer's startup level after a restart + a play from HQPlayer's OWN UI; reading it as the volume-hold fix failing | **CORRECT BEHAVIOUR** 2026-09-26, Simon's account — HQPlayer's **startup volume** lands when it plays, and LMS follows any level it did not set. Only a level LMS set during an outage is replayed | `HQPlayer's STARTUP VOLUME is not a failure of the hold` |
+| the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
+| the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone | `THE IDLE DIVERGENCE IS BY DESIGN` |
+| the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands | `An endpoint re-registering announces its own level` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -242,6 +244,14 @@ range:
 ```
 git -C /Users/simona/Documents/GitHub/LMS-HQPlayer-Bridge log main..dev --oneline
 ```
+
+**CARRY THIS ONE INTO THE NEXT MERGE:** `README.md`'s Volume section says *"The
+level you start with is **HQPlayer's own**, not one the plugin asserts."* That was
+true up to 1.0.27 and is **false from 1.0.28** — HQPlayer's startup level is no
+longer followed, and LMS re-asserts its own level at the first play (see
+`HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER`). The rest of that
+section still stands, including HQPlayer's fixed volume being a startup level
+rather than a lock. Not edited on a dev build, by the rule above.
 
 Group the result by what a user would notice (new features, fixes, behaviour
 changes), not commit by commit — intermediate dead ends and their reverts cancel
@@ -2020,7 +2030,7 @@ a dB, which survives both that and HQPlayer's 1/256 dB units exactly. The
 quantum is at most **half an LMS step**, which is what guarantees two
 consecutive slider positions can never land on the same level.
 
-### An endpoint re-registering announces its own level, LOUDLY — and we follow it anyway
+### An endpoint re-registering announces its own level, LOUDLY — and we still follow that
 
 When a network endpoint drops and comes back, HQPlayer re-splits the level
 between the endpoint's hardware volume and its own software attenuator, and the
@@ -2039,8 +2049,16 @@ and at the same moment hqplayerd's own log shows the split going from
 `hardware: 0  software: -27` to `hardware: -43  software: -4`. Nothing had
 asked for any of it. It was very loud.
 
-**0.2.31 added a guard for this. 0.2.32 removed it, and the removal is the
-current behaviour: a level that arrives from the endpoint is ALWAYS followed.**
+**0.2.31 added a guard for this. 0.2.32 removed it, and the removal is still the
+current behaviour for THIS event: a level that arrives from the endpoint
+mid-link is followed.**
+
+**Do not confuse it with the startup-volume latch added in 1.0.28.** That one
+suppresses exactly one thing — the level reported on a NEW CONTROL LINK — because
+HQPlayer applies a configured startup volume whenever it restarts. The +21 dB
+event above is an **NAA re-registering in the middle of a live control link**: no
+new link, so the latch is never armed and nothing about that case has changed.
+The two are different events on the same channel.
 
 The guard refused an increase beyond 3 dB inside a 10-second settling window and
 re-asserted LMS's own level to pull the endpoint back down. Its problem was the
@@ -2065,9 +2083,15 @@ worse than the noise it was protecting against.
 
 **If this is ever revisited, the trigger is the hard part, not the response.**
 It needs a signal that means "the endpoint re-registered" and nothing else.
-`transport_serial` is not that signal. Note the +21 dB event is also visible in
-hqplayerd's log as the hardware/software split changing — but that is only in
-its log, not on the control API.
+`transport_serial` is not that signal — it turns over at every track boundary.
+Note the +21 dB event is also visible in hqplayerd's log as the hardware/software
+split changing — but that is only in its log, not on the control API.
+
+**The startup-volume case DID find such a trigger, which is why it was fixable
+and this one still is not.** `Control::onProven` fires once per control link, at
+HQPlayer's first reply, and means "this is a new link" and nothing else; a track
+boundary cannot produce one. There is no equivalent signal for an NAA
+re-registering, so the trigger problem is solved for link-up and open for this.
 
 ### The snap, and the tolerance that fixes it
 
@@ -2190,6 +2214,54 @@ Two rules that fall out of it, both pinned in `t_player.pl`:
   held level wins**, because it is asserted ahead of the Status that would report
   the knob. With nothing held, a knob turn is followed as always — that is the
   rule in `_followVolume`, and it covers the case where LMS set no level at all.
+
+### HQPlayer's STARTUP VOLUME does not capture the LMS slider (1.0.28)
+
+HQPlayer applies a configured startup level on every restart — Simon's is
+**−36 dB**. It arrives on the same `<Status/>` channel as a knob turn, so
+`_followVolume` used to read it as the user's intent and write it into LMS's
+**stored** volume. That is the whole of "the slider drops back to HQPlayer's
+level after a restart": by the time the user pressed play, the level LMS had been
+holding was already overwritten, so LMS's own re-assert had nothing left to
+assert.
+
+**The level reported on a NEW LINK is latched (`hqVolStartup`) and ignored while
+it stands.** Suppressing a single push would achieve nothing — HQPlayer re-reports
+the same level about once a second while idle, so the next push would follow it.
+Any level that DIFFERS from the latch is a real change on HQPlayer's side (its own
+UI, the endpoint's knob) and is followed exactly as before, and the latch is then
+dropped for the rest of the link.
+
+`hqVolDb` is still written from every push, latched or not — it is "where HQPlayer
+actually is", which the anti-snap rule and `_learnFromClamp` both need. Only the
+`execute(['mixer','volume',…])` follow is suppressed.
+
+**Nothing new asserts the level at play, because LMS already does it.** It writes
+its stored volume at the start of every track that begins from stopped (Bug 10310
+— see `_volTol`), so once the stored level survives the reconnect, the next play
+sets HQPlayer to it. That is the whole "alter the volume when it plays" half, with
+no code in this plugin.
+
+**THE TRIGGER IS THE LINK, AND ONLY THE LINK.** `hqVolLinkNew` is armed in
+`Plugin::_onLinkState` on link-up and nowhere else. It is deliberately NOT armed
+from `_startPolling`, which **the track-load path also calls** (the `<Play/>`
+callback) — arming there would re-latch at every track boundary, which is exactly
+how the 0.2.31 guard went wrong on `transport_serial`. `_lmsOwnsVolume` disarms it
+the moment LMS asserts a level of its own, in `volume()` and in
+`assertPendingVolume`, so a level HQPlayer **clamped** is never mistaken for the
+startup level.
+
+**THE IDLE DIVERGENCE IS BY DESIGN**, Simon's call 2026-09-26: *"thats fine and
+what I would expect its behaviour to be."* Between the reconnect and the next
+play, the slider reads the user's level while HQPlayer is still at its startup
+level. The slider is the user's INTENT, and the play-time re-assert is what makes
+it true. **Do not report the gap as a bug, and do not "fix" it by asserting at
+link-up** — that was offered and declined, because it would override HQPlayer's
+startup volume even when HQPlayer is being used standalone.
+
+Scope, so this is not over-read: it covers HQPlayer restarting. An **NAA
+re-registering mid-link** announces its own level too, and that is still followed
+— see `An endpoint re-registering announces its own level`.
 
 
 ### TRAP: never send ReadyToStream while a track is playing
@@ -2433,11 +2505,11 @@ one; corrected the same day, with the reason in the code.)
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (1,000 assertions: `t_control` 101, `t_player`
-486, `t_stream` 64, `t_plugin` 190, `t_live` 159) plus the live page EXECUTED
+tree, runs the five Perl suites (1,015 assertions: `t_control` 101, `t_player`
+501, `t_stream` 64, `t_plugin` 190, `t_live` 159) plus the live page EXECUTED
 under osascript (17, run from `t_live.pl` and skipped out loud without it) and
 the helper's Python suite (162) and the installer run end to end (13), checks
-`install.sh` parses, and sweeps called-vs-defined subs. 1,192 in total. Counts
+`install.sh` parses, and sweeps called-vs-defined subs. 1,207 in total. Counts
 as of 2026-09-26; they move every round, and the run prints them. (The
 PowerShell parse check and the install.ps1 half of the installer suite went with
 Windows support.)
@@ -6242,7 +6314,8 @@ a send that 1.0.22 now drops.** Every `_send` call site in `Player.pm` was walke
 - **`hqWanted` (`pause`/`resume`/`stop`) - NOT A DEFECT.** It is written unconditionally after a
   send that may have been refused, which looks identical to the volume bug, and it also gates a
   suppression (`_send('<Pause/>') unless hqWanted eq 'pause'`) that a stale value could wedge.
-  It is healed: `_onStatus`'s HQP_PLAYING branch moves it to `play` when it reads `pause`, the
+  **hqWanted is healed by the Status stream**: `_onStatus`'s HQP_PLAYING branch moves it to
+  `play` when it reads `pause`, the
   HQP_PAUSED branch moves it to `pause` when it reads `play`, and `play()` sets it outright.
   `_startPolling` subscribes on every link-up, so the heal runs at every reconnect - which is
   precisely what volume lacked. **The difference is the re-assert, not the write.**
@@ -6295,7 +6368,28 @@ with the bridge's own **Restart HQPlayer** row, which answered `HQPlayer restart
 proves HQPlayer is at the matching level - the re-assert reached it. HQPlayer came back on SDM
 (DSD) with its saved settings, as the ledger says a full daemon restart does.
 
-#### HQPlayer's STARTUP VOLUME is not a failure of the hold
+#### HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER - reversed same day, fixed in 1.0.28
+
+**REVERSED THE SAME DAY, Simon's call, and built as 1.0.28.** The paragraph below is the morning's
+reading and it is kept because the OBSERVATION is right; the VERDICT was wrong. Simon: *"HQplayer
+has a startup volume this is set at -36db so when ever it restarts this will be set to it. The
+bridge I believe should remember its value and when played should alter volume to its level."*
+
+That reframes it. A startup level is a **restart artefact, not a user action**, and following it
+did not merely move the slider - it overwrote LMS's STORED volume, so LMS's own Bug-10310 re-assert
+had nothing of the user's left to assert at the next play. The level was not "remembered and then
+lost"; it was destroyed before play. Fixed by latching the level a NEW LINK reports and not
+following it (`hqVolStartup` / `hqVolLinkNew`), which leaves LMS's stored level intact for the
+re-assert LMS already performs. Scope: HQPlayer restarting. An NAA re-registering mid-link is a
+different event and is still followed.
+
+Measured before and after, `_followVolume(-36)` three times with the slider at 45 (-55 dB):
+
+```
+BEFORE (1.0.27): mixer volume 64 | mixer volume 64 | mixer volume 64   <- slider dragged to -36dB
+AFTER  (1.0.28): (none)                                                <- the user's level survives
+```
+
 
 Seven minutes after the test above, the slider read 40 again. It is not the bug coming back, and
 a future round must not read it as one. **Simon restarted HQPlayer manually** at 19:16:18
@@ -6477,9 +6571,33 @@ case. Comment narrowed at both sites, and the precedence is now pinned.
 
 **Suite: 1,192 assertions, all green** - `t_control.pl` 101, `t_player.pl` 486 (+17),
 `t_stream.pl` 64, `t_plugin.pl` 190, `t_live_page.js` 159 + 17 executed, `t_hqrestart.py` 162,
-`t_installers.py` 13, `perl -c` on every module, sweep clean. **Not installed on the rig, and the
-handshake window is not yet verified live** - it needs an outage against a host that does not
-answer (powered off), not a `hqrestart`, which refuses fast.
+`t_installers.py` 13, `perl -c` on every module, sweep clean. (1.0.28 takes `t_player.pl` to 501
+and the total to 1,207.)
+
+### 1.0.27 INSTALLED on the rig 2026-09-26 - steady state verified, the outage NOT
+
+`http://plex:9000/hqplive` reports `v1.0.27`; the player `HQPlayer (MacMini)`
+(`02:2e:32:97:3c:99`) is listed `connected=1`, which under `CONNECTED IS THE CONTROL LINK` means
+HQPlayer is answering on a proven link.
+
+**What was proven.** `volume()` was rewritten by this fix, so the ordinary path was re-checked
+end to end: with the player powered, stopped and at 45, `mixer volume 40` was sent and the level
+read back once a second for six seconds - **40 every time.** That is the assertion, not a
+formality: if HQPlayer had not taken the level, the `<Status/>` push (~1/s) would have carried 45
+and `_followVolume` would have pulled the slider back. It held, so the level reached the daemon
+and the hold was released rather than replayed. Restored to 45 afterwards.
+
+**No warn-level bridge line since the install** other than the expected `control link down -
+shutting down` from the plugin reload. For contrast, the same log holds the pre-fix evidence at
+`19:09:36` on 1.0.25: `<Volume> failed:` with the whole raw frame, in red, which is exactly the
+`%BENIGN` bug 1.0.26 fixed.
+
+**What was NOT proven, and why it could not be here.** The handshake window needs a connect that
+HANGS. Nothing reachable over HTTP produces one: a stopped `hqplayerd` and `tools/hqrestart` both
+RST at once (the already-covered down-link branch), and the live page shows **no Restart row and
+the log no helper probes**, so the Mac mini still has no helper and no outage can be induced
+remotely. Do not record this window as verified until an outage with the host powered off or
+unplugged has been run. `%BENIGN` is likewise unconfirmed - see Still unverified.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 
@@ -6636,12 +6754,27 @@ which is a diagnostic that did not exist when this class of bug was last chased.
 * **1.0.16's discovery timing is unverified live**: a second HQPlayer
   appearing within ~5s while the first is connected, and a switched-off one's
   player going ~5 min after it went quiet. Offline-tested only.
-* **The volume hold across a reconnect HANDSHAKE is unverified live** (1.0.27).
-  The down-link half was verified on the rig at 1.0.25. The handshake half needs
-  an outage where the connect HANGS rather than being refused — the HQPlayer host
-  powered off or unplugged, so each attempt burns the full 5s `CONNECT_TIMEOUT` —
-  because `tools/hqrestart` and a stopped `hqplayerd` both RST immediately and
-  land in the down-link branch that was already covered. Offline-tested only.
+* **The startup-volume latch (1.0.28) is unverified live.** BUILT, not installed —
+  the rig is on 1.0.27. It needs: restart HQPlayer so it applies its −36 dB
+  startup level, check the LMS slider does NOT move to it while idle, then play
+  and check HQPlayer is set to LMS's level. Offline-tested only, with the
+  before/after measured against `_followVolume` directly.
+* **The volume hold across a reconnect HANDSHAKE is unverified live** (1.0.27
+  INSTALLED 2026-09-26, steady state verified — see the live check below). The
+  down-link half was verified on the rig at 1.0.25. The handshake half needs an
+  outage where the connect HANGS rather than being refused — the HQPlayer host
+  powered off, or its network unplugged, so each attempt burns the full 5s
+  `CONNECT_TIMEOUT`. `tools/hqrestart` and a stopped `hqplayerd` both RST
+  immediately and land in the down-link branch that was already covered, and
+  **the Mac mini has no helper installed**, so no outage can be made remotely at
+  all. It needs Simon at the machine.
+* **`%BENIGN` (1.0.26) is still not CONFIRMED live.** No warn-level `<Volume>
+  failed` line has appeared since 1.0.27 was installed, where 1.0.25 produced one
+  in red on the same action — consistent with the fix, but not proof, because
+  HQPlayer's own playlist was not known to be empty at the time and the benign
+  error may simply not have been raised. Confirming it needs the debug logger on
+  for `plugin.hqplayerbridge` plus a `<Volume>` sent against an empty HQPlayer
+  playlist.
 * **The install-time `allow` prompt (2026-09-23) has never run on a real
   install.** The installer is RUN end to end offline (`t_installers.py`, the
   service managers stubbed), but the helper installed on the Mac predates the

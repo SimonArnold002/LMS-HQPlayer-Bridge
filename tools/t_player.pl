@@ -1510,6 +1510,114 @@ print "-- an endpoint knob turn during the outage is still followed --\n";
     $sp->client($c)->set('volume', 50);
 }
 
+# ---------------------------------------------------------------------------
+# HQPLAYER'S STARTUP VOLUME IS NOT A USER ACTION.
+#
+# HQPlayer applies a configured startup level on every restart - Simon's is
+# -36dB.  Following it overwrote LMS's STORED volume, so by the time the user
+# pressed play LMS had nothing of its own left to re-assert and the slider had
+# "dropped back to HQPlayer's level" for good.  The level reported on a new link
+# is latched and ignored while it stands; anything DIFFERENT is a real change on
+# HQPlayer's side and is followed as before.
+# ---------------------------------------------------------------------------
+print "-- HQPlayer's startup volume does not capture the LMS slider --\n";
+{
+    @sent = (); @sentCb = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-55); $c->hqVolSent(undef); $c->hqVolPending(undef);
+    $c->hqVolStartup(undef);
+    $sp->client($c)->set('volume', 45);          # the user's level: -55dB
+
+    # The link comes up. Plugin::_onLinkState arms the latch BEFORE anything can
+    # send a <Status/> - that call is asserted in t_plugin.pl.
+    $c->hqVolLinkNew(1);
+
+    # HQPlayer restarted, so it reports its startup level.
+    $c->_onStatus({ state => 0, position => 0, volume => -36 }, '');
+    is(scalar(grep { /^mixer volume/ } @ex), '0',
+       'the startup level is NOT followed into LMS');
+    is($sp->client($c)->get('volume'), '45',
+       "and the user's stored level survives - this is what used to be lost");
+    is($c->hqVolDb, '-36',
+       'but hqVolDb still says where HQPlayer actually is');
+    is($c->hqVolStartup, '-36', 'the level is latched as this link\'s startup level');
+
+    # ONE SUPPRESSED PUSH WOULD ACHIEVE NOTHING: HQPlayer re-reports the same
+    # level every second while it is idle.
+    $c->_onStatus({ state => 0, position => 0, volume => -36 }, '');
+    $c->_onStatus({ state => 0, position => 0, volume => -36 }, '');
+    is(scalar(grep { /^mixer volume/ } @ex), '0',
+       'and every repeat of it is ignored too, not just the first');
+
+    # LMS's own re-assert at the start of a track that begins from stopped
+    # (Bug 10310) is the "alter the volume when it plays" half.
+    @sent = ();
+    $c->volume(45);
+    is(join(',', @sent), '<Volume value="-55"/>',
+       'and at play LMS re-asserts ITS level, which is now what HQPlayer gets');
+    is($c->hqVolStartup, '(undef)',
+       'the latch is dropped once LMS owns the level');
+}
+
+# A level that MOVED off the startup level is somebody turning it - followed.
+{
+    @sent = (); @sentCb = (); @ex = ();
+    $c->hqVolDb(-55); $c->hqVolSent(undef); $c->hqVolPending(undef);
+    $c->hqVolStartup(undef);
+    $sp->client($c)->set('volume', 45);
+    $c->hqVolLinkNew(1);
+
+    $c->_onStatus({ state => 0, position => 0, volume => -36 }, '');
+    is(scalar(grep { /^mixer volume/ } @ex), '0', 'startup level ignored');
+
+    $c->_onStatus({ state => 0, position => 0, volume => -20 }, '');
+    is(join(',', @ex), 'mixer volume 80',
+       'but a level that MOVED is followed - HQPlayer\'s own UI still wins');
+    is($c->hqVolStartup, '(undef)', 'and the latch is gone for the rest of the link');
+
+    # Still following after that, with no latch left to re-arm.
+    @ex = ();
+    $c->_onStatus({ state => 0, position => 0, volume => -30 }, '');
+    is(join(',', @ex), 'mixer volume 70', 'and it keeps following');
+}
+
+# THE TRIGGER IS THE LINK AND NOTHING ELSE.  _startPolling is also called from
+# the track-load path, so arming there would re-latch at every track boundary -
+# which is exactly how the 0.2.31 guard went wrong on transport_serial.
+{
+    @ex = ();
+    $c->hqVolDb(-55); $c->hqVolStartup(undef); $c->hqVolLinkNew(0);
+    $sp->client($c)->set('volume', 45);
+
+    $c->_startPolling;                           # as a track load calls it
+    is($c->hqVolLinkNew ? 1 : 0, '0', '_startPolling does NOT arm the latch');
+
+    $c->_onStatus({ state => 0, position => 0, volume => -36 }, '');
+    is(join(',', @ex), 'mixer volume 64',
+       'so a level change mid-link is followed, track boundary or not');
+}
+
+# A CLAMPED reply to LMS's own assert must not be mistaken for the startup
+# level, or the range could never be learned on a fresh link.
+{
+    @sent = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-55); $c->hqVolSent(undef); $c->hqVolPending(-30);
+    $c->hqVolStartup(undef);
+    $c->hqVolLinkNew(1);                         # link up, latch armed
+    $sp->client($c)->set('volume', 45);
+
+    $c->assertPendingVolume;                     # LMS asserts the held -30
+    is($c->hqVolLinkNew ? 1 : 0, '0',
+       'an assert by LMS disarms the latch before any Status arrives');
+
+    $c->_onStatus({ state => 0, position => 0, volume => -25 }, '');
+    is(join(',', @ex), 'mixer volume 75',
+       'so HQPlayer clamping our level to -25 is followed, not ignored');
+    $c->hqVolPending(undef); $c->hqVolStartup(undef); $c->hqVolLinkNew(0);
+    $sp->client($c)->set('volume', 50);
+}
+
 # A hold that the slider itself makes moot.  Both early returns in volume()
 # have to drop it, or a stale level is asserted on some later link.
 print "-- a hold that is no longer wanted is dropped --\n";

@@ -1289,6 +1289,14 @@ sub _onLinkState {
         # The TCP accept only. Nothing LMS-facing happens here: hqplayerd also
         # accepts when it is about to drop the socket, so the player is not
         # reported connected until HQPlayer REPLIES - see _onLinkProven.
+        #
+        # ARM THE STARTUP LATCH FIRST, before anything can send a <Status/>.
+        # HQPlayer applies its configured startup volume on every restart, and
+        # that level is not a user action, so the first level this link reports
+        # must not overwrite LMS's own. See Player::_followVolume. This is the
+        # ONLY place it is armed: the link coming up, never a track load.
+        $client->hqVolLinkNew(1);
+
         $client->refreshInfo;
 
         # The status subscription is armed HERE, not at a track load.  It is
