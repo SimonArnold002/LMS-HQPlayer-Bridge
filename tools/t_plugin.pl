@@ -322,18 +322,21 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 0 );
     is(join(', ', @ev), 'refreshInfo, startPolling, stopPolling',
        'accepted then dropped with no reply: nothing announced, sync group untouched');
-    # AND no volumeAsserted: a link that never replied carried nothing, so a
-    # volume held over the outage must still be held. See
-    # Player::assertPendingVolume.
-    is(scalar(grep { $_ eq 'volumeAsserted' } @ev), '0',
-       'and a volume held over the outage is NOT released by an accept alone');
+    # AND NOTHING TOUCHES THE HELD VOLUME. _onLinkProven used to release it on
+    # any first reply, which is looser than the truth: a slider move made after
+    # the link came up queues its <Volume> behind refreshInfo's commands, so the
+    # first reply can be VolumeRange's while that <Volume> is still queued. The
+    # hold is released by its OWN reply - Player::_volumeDelivered, pinned in
+    # t_player.pl - so no volume hook may appear here at all.
+    is(scalar(grep { /volume/i } @ev), '0',
+       'and nothing here releases a volume held over the outage');
 
     # EVERY proof is a RECONNECT: `client new` came from LMS's own constructor,
     # and _create marked the player disconnected straight after. The
     # announcement goes out BEFORE playerActive, so nothing there can lose it.
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkProven('x');
-    is(join(', ', @ev), 'disconnected 0, notify reconnect, volumeAsserted, playerActive',
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
        'first proof, powered: announced as a reconnect, then made active');
 
     # a proven link going down: flagged and announced - and NOT playerInactive,
@@ -346,7 +349,7 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     # later proofs are RECONNECTS too
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkProven('x');
-    is(join(', ', @ev), 'disconnected 0, notify reconnect, volumeAsserted, playerActive',
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
        'a later proof is a reconnect');
 
     # playerActive DYING (it can run the whole _JumpToTime -> play() path) must
@@ -355,7 +358,7 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     @ev = ();
     my $ok = eval { Plugins::HQPlayerBridge::Plugin::_onLinkProven('x'); 1 };
     ok($ok, 'a playerActive that dies does not escape _onLinkProven');
-    is(join(', ', @ev), 'disconnected 0, notify reconnect, volumeAsserted, playerActive',
+    is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
        'and the reconnect was announced regardless');
     $ctrl->{die} = 0;
 
@@ -363,7 +366,7 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     $cl->{power} = 0;
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkProven('x');
-    is(join(', ', @ev), 'disconnected 0, notify reconnect, volumeAsserted',
+    is(join(', ', @ev), 'disconnected 0, notify reconnect',
        'proven, powered off: reconnected but NOT made active');
 
     # FORGOTTEN in LMS. The notification arrives AFTER forgetClient has deleted
@@ -450,7 +453,6 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     sub power        { $_[0]->{power} }
     sub disconnected { push @{ $_[0]->{ev} }, "disconnected $_[1]" }
     sub refreshInfo  { push @{ $_[0]->{ev} }, 'refreshInfo' }
-    sub volumeAsserted { push @{ $_[0]->{ev} }, 'volumeAsserted' }
     sub _startPolling { push @{ $_[0]->{ev} }, 'startPolling' }
     sub _stopPolling  { push @{ $_[0]->{ev} }, 'stopPolling' }
 

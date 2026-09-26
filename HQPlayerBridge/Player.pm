@@ -2168,14 +2168,37 @@ sub volume {
     # It clears the pending level as well: the slider has come back to where
     # HQPlayer already is, so a change made earlier in this outage has nothing
     # left to assert.
+    #
+    # UNLESS THE HOLD IS WHAT $at IS ECHOING.  hqVolDb is written optimistically
+    # the moment a level is queued, so during an outage it can be the held level
+    # rather than a level HQPlayer ever reported.  Setting that same level again
+    # would then land here and drop the hold on the strength of our own guess -
+    # losing it for good.  A hold that differs from $db really is superseded (the
+    # user has come back to where HQPlayer is), so only that one is cleared.
     if ( defined $at && abs( $db - $at ) <= $self->_volTol ) {
-        $self->hqVolPending(undef);
+        my $held = $self->hqVolPending;
+
+        $self->hqVolPending(undef)
+            if defined $held && abs( $held - $db ) > $self->_volTol;
+
         return $vol;
     }
 
-    # HOLD THE LEVEL IF THE LINK IS DOWN, AND DO NOT RECORD IT AS SENT.
-    # Control::send refuses a command on a down link (it no longer connects to
-    # push one through), so this level never reaches HQPlayer.  Writing
+    # PARK THE LEVEL FIRST, AND RELEASE IT ONLY ON PROOF OF DELIVERY.
+    #
+    # `send` ANSWERING 1 IS NOT DELIVERY.  It means "accepted onto the queue",
+    # and `Control::up` - the test it makes - is `sock || connecting`, so a
+    # whole reconnect handshake counts as live: the command is queued, nothing
+    # is written, and if that connect fails `_dropLink` drains the queue.
+    # <Volume> is the one send with no callback, so it vanished in silence.
+    # Measured: `up` 1, `send` 1, wbuf 0 bytes, queue emptied by the drop.
+    #
+    # Delivery is HQPlayer's own reply, and nothing else - see _volumeDelivered.
+    # That also covers the accept-then-drop (hqplayerd accepts a socket it is
+    # about to drop, and a command written to it dies unread).
+    $self->hqVolPending($db);
+
+    # THE LINK IS DOWN: refused outright, so do NOT record it as sent.  Writing
     # hqVolDb/hqVolSent anyway told two later lies:
     #
     #   - the first <Status/> after the reconnect carries HQPlayer's OLD level,
@@ -2185,32 +2208,72 @@ sub volume {
     #     never sent, so a reconnect inside CLAMP_WINDOW could read HQPlayer's
     #     own level as a clamp and collapse the range.
     #
-    # So the level is parked instead, and refreshInfo asserts it on the next
-    # link.  Only a level LMS asked for and lost is replayed: an endpoint knob
-    # turned during the outage is still followed, not overridden, which is the
-    # rule _followVolume settled on.
-    if ( !$self->_send( '<Volume value="' . _fmtDb($db) . '"/>' ) ) {
-        $self->hqVolPending($db);
-        return $vol;
-    }
+    # refreshInfo replays the hold on the next link.  Only a level LMS asked
+    # for and lost is replayed; where a held level and an endpoint knob turn
+    # meet in one outage, the held level is asserted first and wins - see
+    # assertPendingVolume.
+    return $vol
+        unless $self->_send( '<Volume value="' . _fmtDb($db) . '"/>',
+                             sub { $self->_volumeDelivered( $db, $_[1] ) } );
 
+    # Optimistic, and safe only because the hold outlives it: if this never
+    # lands, the replay on the next link corrects both figures.
     $self->hqVolDb($db);
     $self->hqVolSent($db);
     $self->hqVolSentAt( Time::HiRes::time() );
-    $self->hqVolPending(undef);
 
     return $vol;
+}
+
+# THE HOLD'S ONE RELEASE: HQPlayer answered this very <Volume>, so the level is
+# on the daemon.  Passed `Control::send`'s second callback argument, which is
+# the raw reply frame.
+#
+# `defined $raw` IS the delivery test, because every route by which a command
+# does NOT reach HQPlayer calls the callback with it undef - a refused verb, a
+# down link (`_failLater`), `cancelQueued`, and `_dropLink` failing both the
+# in-flight command and everything queued behind it (which is where a failed
+# connect and a reply timeout both land).  A reply is the only thing that
+# arrives with a frame attached.
+#
+# AN ERROR REPLY STILL COUNTS AS DELIVERED: with an empty playlist every
+# <Volume> answers result="Error" carrying `clPlaylist::GetAlbumGain(): trackn >
+# last`, and the level IS applied - verified against the live daemon with
+# GetVolumeDB to 1/256 dB (ledger 2026-08-27).  Treating that as a failure
+# would replay a level HQPlayer already has on every reconnect.
+sub _volumeDelivered {
+    my ( $self, $db, $raw ) = @_;
+
+    return unless defined $raw;
+
+    # Only if it is still the level being held.  A newer slider move has
+    # already replaced it, and that one is released by its own reply.
+    #
+    # EXACT, not within _volTol: $db and the held value are the same number
+    # written by the same call, and _volTol moves whenever _setRange learns a
+    # new range - so a tolerance here would make the match depend on something
+    # unrelated to which command just answered.
+    my $held = $self->hqVolPending;
+
+    $self->hqVolPending(undef) if defined $held && $held == $db;
+
+    return;
 }
 
 # Replay a level LMS set while the control link was down, as the FIRST command
 # on the new link.  See volume().
 #
-# Not cleared here: it is cleared when HQPlayer replies (_onLinkProven ->
-# volumeAsserted).  hqplayerd accepts a socket it is about to drop, and a
-# command queued on that socket dies with it - so the hold has to outlive the
-# send and be released by proof of delivery instead.  The control stream is
-# ordered and one command is in flight at a time, so ANY reply on this link
-# means this one was written and consumed.
+# Not cleared here: the hold is released by THIS command's own reply, through
+# the same _volumeDelivered that volume() uses.  hqplayerd accepts a socket it
+# is about to drop, and a command queued on that socket dies with it, so the
+# hold has to outlive the send.
+#
+# It is deliberately NOT released by "the link answered something", which is
+# what an earlier volumeAsserted hook in Plugin::_onLinkProven did: a slider
+# move made after this link came up queues its <Volume> BEHIND the commands
+# refreshInfo already sent, so the first reply on the link can be VolumeRange's
+# while that <Volume> is still only queued - and releasing there would lose it
+# if the link then died.  The command's own reply cannot be early.
 sub assertPendingVolume {
     my $self = shift;
 
@@ -2226,23 +2289,22 @@ sub assertPendingVolume {
     main::INFOLOG && $log->is_info && $log->info(
         $self->name . ": re-asserting ${db}dB set while the link was down" );
 
-    return unless $self->_send( '<Volume value="' . _fmtDb($db) . '"/>' );
+    return unless $self->_send( '<Volume value="' . _fmtDb($db) . '"/>',
+                                sub { $self->_volumeDelivered( $db, $_[1] ) } );
 
+    # PRECEDENCE, stated exactly.  This goes out ahead of the <Status/> that
+    # refreshInfo subscribes with, so where a held level and a knob turned on
+    # the endpoint meet in the SAME outage, the held level WINS - HQPlayer is
+    # moved to it and the Status that follows reports it.  That is the settled
+    # intent (only a level LMS set during an outage is replayed).  The rule that
+    # a knob turn is FOLLOWED, not overridden, covers the case where LMS set no
+    # level at all, which is the usual one and where nothing is held to assert.
+    #
     # Optimistic, exactly as in volume(): hqVolDb is what the anti-snap rule
     # and _followVolume compare against, and the level is on its way.
     $self->hqVolDb($db);
     $self->hqVolSent($db);
     $self->hqVolSentAt( Time::HiRes::time() );
-
-    return;
-}
-
-# HQPlayer has replied on this link, so the re-assert queued ahead of every
-# other command on it was delivered.  Called from Plugin::_onLinkProven.
-sub volumeAsserted {
-    my $self = shift;
-
-    $self->hqVolPending(undef);
 
     return;
 }
@@ -3367,8 +3429,9 @@ sub refreshInfo {
     # FIRST, ahead of everything else on this link: a level LMS set while the
     # link was down has to land before the <Status/> below subscribes, or the
     # push that answers it carries HQPlayer's old level and _followVolume
-    # undoes the user's change.  Being first is also what makes the release in
-    # volumeAsserted exact - see assertPendingVolume.  Usually a no-op.
+    # undoes the user's change.  Being first is what makes the held level win
+    # over an endpoint knob turned in the same outage - see
+    # assertPendingVolume.  Usually a no-op.
     $self->assertPendingVolume;
 
     # The volume range does not come from here - GetInfo does not carry one.

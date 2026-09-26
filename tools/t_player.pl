@@ -892,7 +892,14 @@ our $linkUp = 1;
 {
     no warnings 'redefine';
     *Plugins::HQPlayerBridge::Player::_send      = sub {
-        return 0 unless $linkUp;
+        if ( !$linkUp ) {
+            # Control::send FAILS the callback on a down link (next event-loop
+            # turn, via _failLater) - with $raw undef, because nothing replied.
+            # The stub has to do it too, or a hold that a failure released
+            # would look safe here.
+            $_[2]->( undef, undef ) if $_[2];
+            return 0;
+        }
         push @sent, $_[1];
         push @sentCb, $_[2] if $_[2];
         return 1;
@@ -1267,7 +1274,14 @@ $c->hqVolDb(undef);
 # carried HQPlayer's OLD level, that no longer matched LMS's stored volume, and
 # _followVolume dragged the slider back - the user's change silently undone.
 # The level is parked instead and re-asserted by refreshInfo.
+#
+# The hold is released by ONE thing: HQPlayer answering that very <Volume>.
+# Control::send calls the callback with the raw frame on a reply and with undef
+# on every route by which the command did not arrive, so `defined $raw` is the
+# delivery test - see Player::_volumeDelivered.
 # ---------------------------------------------------------------------------
+my $VOLOK = '<?xml version="1.0" encoding="utf-8"?><Volume result="OK"/>';
+
 print "-- a volume set while the link is down survives the reconnect --\n";
 {
     local $linkUp = 0;
@@ -1305,7 +1319,7 @@ is($c->hqVolMin, '-100',
 # subscribe, or the push that answers it undoes the change.
 print "-- the held level is re-asserted on the next link --\n";
 {
-    @sent = (); @ex = ();
+    @sent = (); @sentCb = (); @ex = ();
     $c->hqVolMin(-100); $c->hqVolMax(0);
     $c->hqVolDb(-50); $c->hqVolSent(undef);
     $c->hqVolPending(-30);
@@ -1318,9 +1332,10 @@ print "-- the held level is re-asserted on the next link --\n";
     is($c->hqVolPending, '-30',
        'the hold is NOT released by the send - only by proof the link carried it');
 
-    # Proof arrives: HQPlayer replied on this link.
-    $c->volumeAsserted;
-    is($c->hqVolPending, '(undef)', 'a reply on the link releases the hold');
+    # Proof arrives: HQPlayer answered THIS <Volume>.  $raw defined is the
+    # delivery test - every non-delivery route calls back with it undef.
+    $sentCb[0]->( {}, $VOLOK );
+    is($c->hqVolPending, '(undef)', 'the command\'s own reply releases the hold');
 
     @sent = ();
     $c->assertPendingVolume;
@@ -1344,28 +1359,123 @@ print "-- the held level is re-asserted on the next link --\n";
 # The hold has to outlive the send, or the change is lost a second time.
 print "-- an accept-then-drop does not consume the held level --\n";
 {
-    @sent = ();
+    @sent = (); @sentCb = ();
     $c->hqVolDb(-50); $c->hqVolPending(-30);
 
     $c->refreshInfo;                             # link 1: accepted, then dropped
     is(scalar(grep { $_ eq '<Volume value="-30"/>' } @sent), '1', 'link 1 asserted it');
     is($c->hqVolPending, '-30', 'and the hold survives, because nothing ever replied');
 
-    @sent = ();
+    # The drop: _dropLink fails the in-flight command and everything queued
+    # behind it, with no frame - which is NOT delivery.
+    $_->( undef, undef ) for @sentCb;
+    is($c->hqVolPending, '-30', 'and a failed callback does not release it either');
+
+    @sent = (); @sentCb = ();
     $c->refreshInfo;                             # link 2
     is(scalar(grep { $_ eq '<Volume value="-30"/>' } @sent), '1',
        'so the next link asserts it again');
-    $c->volumeAsserted;
+    $sentCb[0]->( {}, $VOLOK );
+    is($c->hqVolPending, '(undef)', 'and this time the reply releases it');
+}
+
+# THE RECONNECT HANDSHAKE, which `send` answering 1 does not distinguish from a
+# delivered command.  Control::up is `sock || connecting`, so all through a
+# connect attempt send() ACCEPTS and queues - and if that connect fails
+# _dropLink drains the queue.  Measured against the real Control.pm: up 1,
+# send 1, 0 bytes on the wire, queue emptied by the drop.  <Volume> carried no
+# callback, so volume() read the 1 as delivery, cleared the hold and recorded
+# the level as applied; the next link's <Status/> then dragged the slider back.
+print "-- a level set during a reconnect handshake is not lost --\n";
+{
+    @sent = (); @sentCb = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-50); $c->hqVolSent(undef); $c->hqVolPending(undef);
+
+    $c->volume(70);                              # queued on a handshake still open
+
+    is(join(',', @sent), '<Volume value="-30"/>', 'the level is queued');
+    is($c->hqVolPending, '-30',
+       'and HELD - a command merely QUEUED is not a command delivered');
+
+    # The connect fails.
+    $sentCb[0]->( undef, undef );
+    is($c->hqVolPending, '-30', 'a failed connect does NOT release the hold');
+
+    # The next link replays it, and this time HQPlayer answers.
+    @sent = (); @sentCb = ();
+    $c->refreshInfo;
+    is($sent[0], '<Volume value="-30"/>', 'so the next link asserts it');
+    $sentCb[0]->( {}, $VOLOK );
+    is($c->hqVolPending, '(undef)', 'and the reply releases it');
+}
+
+# AN ERROR REPLY IS STILL DELIVERY.  With an empty playlist every <Volume>
+# answers result="Error" and the level IS applied (ledger 2026-08-27, confirmed
+# with GetVolumeDB).  Reading that as a failure would replay a level HQPlayer
+# already has on every single reconnect.
+{
+    @sent = (); @sentCb = ();
+    $c->hqVolDb(-50); $c->hqVolPending(undef);
+    $c->volume(70);
+    $sentCb[0]->( undef, '<?xml version="1.0" encoding="utf-8"?>'
+        . '<Volume result="Error">clPlaylist::GetAlbumGain(): trackn > last</Volume>' );
+    is($c->hqVolPending, '(undef)',
+       'the empty-playlist error still counts as delivered - the level is applied');
+}
+
+# TWO MOVES IN FLIGHT: the older reply must not release the newer hold.
+{
+    @sent = (); @sentCb = ();
+    $c->hqVolDb(-50); $c->hqVolPending(undef);
+    $c->volume(70);                              # -30, queued
+    $c->volume(80);                              # -20, queued behind it
+    is($c->hqVolPending, '-20', 'the newer level is the one held');
+
+    $sentCb[0]->( {}, $VOLOK );                  # the -30 reply lands first
+    is($c->hqVolPending, '-20',
+       'the older command\'s reply does not release the newer hold');
+
+    $sentCb[1]->( {}, $VOLOK );
+    is($c->hqVolPending, '(undef)', 'its own reply does');
+}
+
+# THE ANTI-SNAP RETURN MUST NOT DROP A HOLD hqVolDb IS ONLY ECHOING.  hqVolDb is
+# written optimistically when a level is queued, so during an outage it can be
+# the held level rather than one HQPlayer ever reported.  Setting the same level
+# again lands on the anti-snap return, and clearing the hold there would lose it
+# on the strength of our own guess.
+{
+    @sent = (); @sentCb = ();
+    $c->hqVolDb(-50); $c->hqVolSent(undef); $c->hqVolPending(undef);
+
+    $c->volume(70);                              # -30 queued; hqVolDb now echoes it
+    $sentCb[0]->( undef, undef );                # ... and the link died
+    is($c->hqVolPending, '-30', 'held');
+    is($c->hqVolDb, '-30', 'and hqVolDb is the optimistic echo, not a reported level');
+
+    $c->volume(70);                              # the user sets the SAME level again
+    is($c->hqVolPending, '-30',
+       'the anti-snap return keeps the hold when it is the level being matched');
+
+    # A hold the slider really has superseded is still dropped.
+    $c->hqVolPending(-10);
+    $c->volume(70);
+    is($c->hqVolPending, '(undef)',
+       'but a hold that differs from where HQPlayer is IS dropped');
     $c->hqVolPending(undef);
 }
 
-# THE RULE THE HOLD MUST NOT BREAK: a knob turned on the endpoint during the
-# outage is still FOLLOWED, not overridden.  Only a level LMS asked for and
-# lost is replayed - see the note in _followVolume about the guard that was
-# removed for second-guessing the person holding the remote.
+# THE RULE THE HOLD MUST NOT BREAK, stated exactly: with NOTHING held, a knob
+# turned on the endpoint is FOLLOWED, not overridden - see the note in
+# _followVolume about the guard that was removed for second-guessing the person
+# holding the remote.  Where a held level and a knob turn meet in the SAME
+# outage the held level wins, because it is asserted ahead of the <Status/> that
+# would report the knob.  That is the settled intent ("only a level LMS set
+# during an outage is replayed"), and the second block pins the precedence.
 print "-- an endpoint knob turn during the outage is still followed --\n";
 {
-    @sent = (); @ex = ();
+    @sent = (); @sentCb = (); @ex = ();
     $c->hqVolDb(-50); $c->hqVolSent(undef); $c->hqVolPending(undef);
     $sp->client($c)->set('volume', 50);          # LMS believes -50dB
 
@@ -1376,6 +1486,28 @@ print "-- an endpoint knob turn during the outage is still followed --\n";
     $c->_onStatus({ state => 0, position => 0, volume => -20 }, '');
     is(join(',', @ex), 'mixer volume 80',
        'and HQPlayer\'s own level is followed into LMS, exactly as before');
+}
+
+# BOTH AT ONCE: LMS's held level is asserted first, so it wins over a knob the
+# user also turned during the outage.  Not a contradiction of the rule above -
+# the rule covers a level LMS never set.
+{
+    @sent = (); @sentCb = (); @ex = ();
+    $c->hqVolDb(-50); $c->hqVolSent(undef);
+    $c->hqVolPending(-30);                       # LMS set -30 during the outage
+    $sp->client($c)->set('volume', 70);
+
+    $c->refreshInfo;
+    is($sent[0], '<Volume value="-30"/>',
+       'the held level is asserted ahead of the Status subscribe');
+    $sentCb[0]->( {}, $VOLOK );
+
+    # HQPlayer now reports the level it was just given, not the old knob level.
+    $c->_onStatus({ state => 0, position => 0, volume => -30 }, '');
+    is(scalar(grep { /^mixer volume/ } @ex), '0',
+       'and the Status that follows agrees, so nothing drags the slider back');
+    $c->hqVolPending(undef);
+    $sp->client($c)->set('volume', 50);
 }
 
 # A hold that the slider itself makes moot.  Both early returns in volume()

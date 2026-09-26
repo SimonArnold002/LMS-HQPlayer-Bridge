@@ -90,6 +90,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `client forget` on a CONNECTED bridge player, `clientForgetCommand` returning without `setStatusDone()`, `_onForget` | **DISPROVEN 2026-09-26, MEASURED IN LMS SOURCE** — a REFUSED forget notifies nothing; the subscription cannot see it | `a REFUSED forget notifies nothing` |
 | `syncheck.pl` / the called-vs-defined sweep as cover for a NEW cross-module call | **MEASURED 2026-09-26 — IT IS NOT.** The sweep cannot see `$var->method`; only the suites guard those | `the sweep cannot see a method call on a variable` |
 | `%BENIGN`, `_dispatch`'s `$msg`, a benign `<Volume>` error logged at WARN | **FIXED** 2026-09-26 (round 2) — `/>([^<]*)</` matched the empty string after the XML declaration, so `%BENIGN` never fired and never had a test | `%BENIGN` never fired` |
+| `volume()` reading `Control::send`'s **1** as delivery; a level set during a reconnect HANDSHAKE (`up` = `sock \|\| connecting`); `volumeAsserted` releasing the hold on any first reply | **FIXED** 2026-09-26 (round 3) — `send` answers 1 for a command it has only QUEUED, and a failed connect drains that queue; `<Volume>` had no callback, so the hold was released and the level recorded as applied. Released by the command's OWN reply now (`_volumeDelivered`) | `THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1` |
 | the LMS slider dropping back to HQPlayer's startup level after a restart + a play from HQPlayer's OWN UI; reading it as the volume-hold fix failing | **CORRECT BEHAVIOUR** 2026-09-26, Simon's account — HQPlayer's **startup volume** lands when it plays, and LMS follows any level it did not set. Only a level LMS set during an outage is replayed | `HQPlayer's STARTUP VOLUME is not a failure of the hold` |
 
 **Two standing rules that kill most repeat findings:**
@@ -1919,8 +1920,9 @@ notified.
 The mapping is linear in dB across HQPlayer's **configured** range, which is
 read from the renderer rather than assumed. On this −100…0 instance that works
 out as `dB = LMS − 100`, one LMS step per dB, so the slider feels unchanged —
-but nothing depends on that. The four sections below cover the range, the
-resolution, the snap, and fixed volume; they are the whole design.
+but nothing depends on that. The sections below cover the range, the resolution,
+the snap, fixed volume, and what happens to a level set while the link is down;
+they are the whole design.
 
 ### TRAP: the second argument to `volume()` is `$temp`, not "force"
 
@@ -2138,16 +2140,56 @@ which this one is — and the same gate puts LMS's own **Volume Control:
 fixed / variable** radio on the player's Audio settings page, so the user gets a
 manual override for free.
 
-So `_setFixed(1)` writes the pref to 0, parks the slider at 100, and stops
-`volume()` sending. A manual 0 counts as fixed too and is **never** written back
-to 1 — only a 0 the plugin set is the plugin's to clear.
+**THE PLUGIN READS THAT PREF AND NEVER WRITES IT** (reversed 2026-09-05, Simon's
+call — see `should detect a non-attenuating HQPlayer`). `_volumeIsFixed` is the
+whole of it: one `get('digitalVolumeControl')`, and a 0 means LMS stops driving
+HQPlayer's level. The switch is the user's radio on the Audio settings page and
+nothing else.
 
-Detection, in order: a zero-width range from `GetVolumeDBRange`; failing that,
-`_watchForFixed` — three sends that ask for a genuinely different level and
-change nothing, one strike per send, cleared the moment any level change is
-seen so the state can never stick. **Unverified:** how HQPlayer actually
-presents fixed mode, which needs the setting flipped on a live instance. The
-passive rule does not depend on knowing.
+There is no detection, because there is nothing to detect: HQPlayer's "fixed
+volume" is a startup LEVEL, not a lock, and no HQPlayer-side state reports one
+(measured — `enabled` on `<VolumeRange/>` stays 1 and the range stays full
+width). `_setFixed`, `_watchForFixed`, `hqVolFixed`, `hqVolForced`, `hqVolMissed`,
+`FIXED_STRIKES` and `MISS_DELAY` were DELETED with that reversal, and
+`t_player.pl` asserts their absence plus that no `set('digitalVolumeControl'`
+survives in `Player.pm`, so a dormant writer cannot be quietly rewired.
+
+### A level set while the control link is DOWN is HELD, not lost
+
+Since 1.0.22 `Control::send` refuses a command on a down link instead of
+connecting on demand, so a slider move made during an outage never reaches
+HQPlayer. `volume()` used to record it as applied anyway, and the first
+`<Status/>` after the reconnect — carrying HQPlayer's OLD level — no longer
+matched LMS's stored volume, so `_followVolume` dragged the slider back and the
+user's change was silently undone.
+
+The level is parked in `hqVolPending` instead, and `refreshInfo` re-asserts it as
+the **FIRST** command on the next link (`assertPendingVolume`), ahead of the
+`<Status/>` subscribe — otherwise the push that answers the subscribe would undo
+it before it landed.
+
+**THE HOLD IS RELEASED BY ONE THING: HQPlayer answering that very `<Volume>`**
+(`_volumeDelivered`). Not by `send` returning 1 — that means "accepted onto the
+queue", and the test it makes (`Control::up`) is `sock || connecting`, so a whole
+reconnect handshake counts as live: the command is queued, nothing is written,
+and a failed connect drains the queue. Every route by which a command does not
+arrive calls its callback with the raw frame **undef**, so `defined $raw` is an
+exact delivery test. An **error** reply still counts as delivered — with an empty
+playlist every `<Volume>` answers `result="Error"` and the level is applied
+anyway.
+
+Two rules that fall out of it, both pinned in `t_player.pl`:
+
+* **`hqVolDb`/`hqVolSent` are written optimistically when the command is queued,
+  and that is safe only because the hold outlives them.** If it never lands, the
+  replay on the next link corrects both. It also means `hqVolDb` can be an echo
+  of the held level rather than one HQPlayer reported — so the anti-snap early
+  return clears only a hold that DIFFERS from the level being declined, or it
+  would drop the hold on the strength of our own guess.
+* **Where a held level and an endpoint knob turned in the SAME outage meet, the
+  held level wins**, because it is asserted ahead of the Status that would report
+  the knob. With nothing held, a knob turn is followed as always — that is the
+  rule in `_followVolume`, and it covers the case where LMS set no level at all.
 
 
 ### TRAP: never send ReadyToStream while a track is playing
@@ -2391,12 +2433,14 @@ one; corrected the same day, with the reason in the code.)
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (864 assertions) plus the live page EXECUTED
-under osascript (15, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (147) and the installer run end to end (13), checks
-`install.sh` parses, and sweeps called-vs-defined subs. Counts as of 2026-09-25;
-they move every round, and the run prints them. (The PowerShell parse check and
-the install.ps1 half of the installer suite went with Windows support.)
+tree, runs the five Perl suites (1,000 assertions: `t_control` 101, `t_player`
+486, `t_stream` 64, `t_plugin` 190, `t_live` 159) plus the live page EXECUTED
+under osascript (17, run from `t_live.pl` and skipped out loud without it) and
+the helper's Python suite (162) and the installer run end to end (13), checks
+`install.sh` parses, and sweeps called-vs-defined subs. 1,192 in total. Counts
+as of 2026-09-26; they move every round, and the run prints them. (The
+PowerShell parse check and the install.ps1 half of the installer suite went with
+Windows support.)
 
 | file | covers |
 |---|---|
@@ -6300,6 +6344,143 @@ since a restart ALWAYS leaves the playlist empty, the pairing is deterministic, 
 `t_plugin.pl` 190, `t_live_page.js` 159 + 17 executed, `t_hqrestart.py` 162, `t_installers.py` 13,
 `perl -c` on every module, sweep clean.
 
+## Review 2026-09-26 (round 3): the volume hold, finished - 1.0.27
+
+Scope `origin/dev..HEAD`, 12 commits `6ee1185`..`73a2fa5` (1.0.26), tree clean. The fix
+ships as **1.0.27**. Round 2's three
+fixes were the review target, because the entry that logs a fix never covers the code the fix
+wrote. One finding, plus one comment that overclaimed.
+
+### THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1 - FIXED (`Player::volume`)
+
+**Round 2 fixed the DOWN link and left the RECONNECT HANDSHAKE open.** `volume()` decided the
+level had reached HQPlayer by reading `Control::send`'s new return value. That value means
+"accepted onto the queue", and the test `send` makes is `Control::up` = `sock || connecting` - so
+all through a connect attempt it queues the command and answers 1 while nothing is written. If
+that connect fails, `_dropLink` drains the queue, firing each command's callback. **`<Volume>` was
+the one send with no callback**, so it vanished in silence while `volume()` took the success path:
+`hqVolDb`/`hqVolSent` recorded as applied and `hqVolPending` CLEARED. The next link then had
+nothing to replay, its first `<Status/>` carried HQPlayer's old level, and `_followVolume` dragged
+the slider back - the exact symptom round 2 set out to fix. Worse than a gap: a second slider move
+during the handshake **discarded a good hold** from the down window as well.
+
+Measured against the real `Control.pm` (not reasoned from it):
+
+```
+up() while merely connecting           : 1
+send() return (what volume() reads)    : 1
+queued commands                        : 1
+bytes actually on the wire (wbuf)      : 0
+queued after the failed connect        : 0    <- _dropLink drained it
+bytes ever written to the wire         : 0
+```
+
+**Window.** `connecting` is armed with a `CONNECT_TIMEOUT` (5s) timer, and `_scheduleReconnect`
+backs off 2→4→…→60s. Against a host that does not answer at all (powered off, unplugged, path
+down) the connect hangs the full 5s per attempt, so early in an outage the bridge is *connecting*
+for much of the time. Against a host that REFUSES (hqplayerd stopped, `tools/hqrestart`) the
+connect fails in milliseconds and round 2's down-link branch already covered it. **Writer:** LMS's
+`mixer volume` - Material's slider, the web UI, the live page, an IR remote, a sync group.
+
+**Why it was not caught.** Ledger `A LOAD IN THE DROP WINDOW` states the assumption in so many
+words - `up` is deliberately not `connected` because a reconnect is a state "on which `send` still
+queues and delivers". That is true only when the connect RESOLVES, and it was reasoned for
+`_queueTrack`, whose `PlaylistAdd` carries a callback and reports its own failure. And
+`t_player.pl`'s `_send` stub was `return 0 unless $linkUp` - up and down only, so **no test in the
+suite could reach the state**.
+
+**The fix: one release condition, and it is proof of delivery.** `volume()` parks the level
+BEFORE the send and passes a callback; `_volumeDelivered` releases the hold only when `$raw` is
+defined. That is exact, because every route by which a command does not arrive calls back with it
+undef - a refused verb, a down link (`_failLater`), `cancelQueued`, and `_dropLink` failing the
+in-flight command and everything queued behind it (where a failed connect AND a reply timeout both
+land). A reply is the only thing that arrives with a frame attached. An **error** reply still
+counts as delivered: with an empty playlist every `<Volume>` answers `result="Error"` and the level
+IS applied (`<Volume>` answers `result="Error"`), so treating it as failure would replay a level
+HQPlayer already has on every reconnect. The match is `$held == $db`, exact rather than within
+`_volTol`, because `_volTol` moves whenever `_setRange` learns a range.
+
+**`volumeAsserted` is DELETED, not kept as belt-and-braces** (`Player.pm`, and its call in
+`Plugin::_onLinkProven`). Releasing on "the link answered something" is strictly looser than the
+truth and wrong in a reachable case: a slider move made AFTER the link came up queues its
+`<Volume>` behind the commands `refreshInfo` already sent, so the first reply on the link can be
+`VolumeRange`'s while that `<Volume>` is still only queued - and releasing there loses it if the
+link then dies. A command's own reply cannot be early.
+
+**The anti-snap return also had to change.** `hqVolDb` is written optimistically when a level is
+queued, so during an outage it can be the held level rather than one HQPlayer ever reported.
+Setting that same level again lands on the anti-snap early return, which cleared the hold - dropping
+it on the strength of our own guess. It now clears only a hold that DIFFERS from the level being
+declined; a hold the slider has genuinely superseded is still dropped.
+
+**The optimistic `hqVolDb`/`hqVolSent` writes are kept, and are safe only because the hold now
+outlives them.** If the command never lands, the replay on the next link corrects both figures.
+`_learnFromClamp` cannot misfire off them either: the replay is queued ahead of the `<Status/>`
+subscribe on every link, so the Status that arms `CLAMP_WINDOW` carries the level just asserted.
+
+### Every carrier of the volume state, walked before and after
+
+- **Entry points into `volume()`:** LMS's `mixer volume` (Material, web UI, `Live.pm`'s slider and
+  step buttons, IR, sync-group propagation), mute (the persisted path - it still reaches HQPlayer),
+  LMS's fade ramps (short-circuited by `$temp`, so a fade can never touch a hold), and the two
+  re-entrant `execute(['mixer','volume',…])` calls in `_setRange` and `_followVolume`.
+- **`_followVolume` → `volume()`:** sets `hqVolDb` from the Status FIRST, so the re-entrant call
+  lands on the anti-snap return. Safe: the replay is queued ahead of the Status on every link, so
+  the hold is already released by its own reply before that Status arrives.
+- **`_setRange` → `volume()`:** `refreshVolumeRange` is queued AFTER the replay, so its reply - and
+  any `execute` it triggers - lands after the hold is released.
+- **Every cb-firing path in `Control.pm`** was enumerated to prove a hold cannot leak: `send`'s
+  refused-verb branch, `_failLater`, `cancelQueued`, `_dropLink` (inflight + queue drain, reached by
+  a failed connect, a reply timeout and `close`). `_teardown` calls `$ctl->close` BEFORE deleting
+  the closures, so the callbacks run. `<Volume>` carries no `scope`, so `cancelQueued('track')`
+  cannot touch it.
+- **`hqVolPending` lives on the client**, so a forgotten player takes it with it.
+
+### The stub carried the same drift as the code
+
+`t_player.pl`'s `_send` stub now fails the callback with `(undef, undef)` on a down link, as
+`Control::send` does via `_failLater` - otherwise a hold released by a FAILURE would look safe in
+the suite. Same class as `FAKECTL IS A REAL STUB`: when a send grows a contract, the stub grows it too.
+
+**The new tests fail against the pre-fix code** - checked in a scratch copy, not assumed. Same
+input, opposite answer:
+
+```
+PRE-FIX : queued <Volume value="-30"/>, callback passed NO,  hqVolPending (undef)  -> LOST
+WITH FIX: queued <Volume value="-30"/>, callback passed yes, hqVolPending -30      -> HELD
+```
+
+Pinned in `t_player.pl`: the handshake window, a failed callback not releasing, an error reply
+counting as delivery, two moves in flight (the older reply must not release the newer hold), the
+anti-snap return keeping a hold `hqVolDb` is only echoing, and the both-at-once precedence below.
+
+### A knob turn and a held level in ONE outage - the comment was the defect
+
+`assertPendingVolume`'s comment claimed *"an endpoint knob turned during the outage is still
+followed, not overridden"*. True only when nothing is held: the replay goes out ahead of the
+`<Status/>` that would report the knob, so where both happened the held level WINS. That is the
+settled intent (`only a level LMS set during an outage is replayed`) and the behaviour is right -
+the prose was wrong, and the suite's own heading reinforced it by only ever testing the no-hold
+case. Comment narrowed at both sites, and the precedence is now pinned.
+
+### Cleared on evidence, NOT reported
+
+- **An error reply to the replay losing the level.** `<Volume>` answers `result="Error"` on an
+  empty playlist and **the level is applied regardless** - `GetVolumeDB` confirms to 1/256 dB.
+- **`_learnFromClamp` collapsing the range off the optimistic `hqVolSent`.** Self-healing; see
+  above. The replay is always first on the link.
+- **`/>([^<]+)</` grabbing whitespace after the XML declaration** and disabling `%BENIGN` again.
+  No writer: every recorded frame, and `Control.pm`'s verified protocol note, have the declaration
+  immediately followed by the element - "No newline, no length prefix, nothing else".
+- **`write_config`'s fixed `path + '.new'` under concurrent writers.** The serving helper writes
+  the config only at first start, and `install.sh` orders `set_allow` before the restart.
+
+**Suite: 1,192 assertions, all green** - `t_control.pl` 101, `t_player.pl` 486 (+17),
+`t_stream.pl` 64, `t_plugin.pl` 190, `t_live_page.js` 159 + 17 executed, `t_hqrestart.py` 162,
+`t_installers.py` 13, `perl -c` on every module, sweep clean. **Not installed on the rig, and the
+handshake window is not yet verified live** - it needs an outage against a host that does not
+answer (powered off), not a `hqrestart`, which refuses fast.
+
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 
 No code change. The plugin description (`strings.txt`, and `repo.xml`'s `<desc>`) said "no external helper", which the optional `hqrestart` helper made untrue; it now says "no helper in the playback path". The same pass moved the helper's history out of a ledger table cell into the section above, and added `tools/hqrestart/` to Layout, `t_hqrestart.py` to Testing, and the helper's unrun paths to Still unverified. Suites unchanged: 863 Perl + 79 Python.
@@ -6455,6 +6636,12 @@ which is a diagnostic that did not exist when this class of bug was last chased.
 * **1.0.16's discovery timing is unverified live**: a second HQPlayer
   appearing within ~5s while the first is connected, and a switched-off one's
   player going ~5 min after it went quiet. Offline-tested only.
+* **The volume hold across a reconnect HANDSHAKE is unverified live** (1.0.27).
+  The down-link half was verified on the rig at 1.0.25. The handshake half needs
+  an outage where the connect HANGS rather than being refused — the HQPlayer host
+  powered off or unplugged, so each attempt burns the full 5s `CONNECT_TIMEOUT` —
+  because `tools/hqrestart` and a stopped `hqplayerd` both RST immediately and
+  land in the down-link branch that was already covered. Offline-tested only.
 * **The install-time `allow` prompt (2026-09-23) has never run on a real
   install.** The installer is RUN end to end offline (`t_installers.py`, the
   service managers stubbed), but the helper installed on the Mac predates the

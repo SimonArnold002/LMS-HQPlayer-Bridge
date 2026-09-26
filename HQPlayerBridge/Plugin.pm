@@ -1338,9 +1338,11 @@ sub _onLinkProven {
     $client->disconnected(0);
     Slim::Control::Request::notifyFromArray( $client, [ 'client', 'reconnect' ] );
 
-    # A reply proves the link carried what refreshInfo queued ahead of it,
-    # including a volume held over an outage. See Player::assertPendingVolume.
-    $client->volumeAsserted;
+    # NOTHING ABOUT THE HELD VOLUME HERE. A reply on the link does not prove
+    # THIS link carried the <Volume> refreshInfo queued: a slider move made
+    # after the link came up sits behind VolumeRange/GetInfo, so the first reply
+    # can arrive while it is still queued. It is released by its own reply -
+    # see Player::_volumeDelivered.
 
     # playerActive can run the whole _JumpToTime -> play() path when the group
     # is playing; a failure there is logged, not allowed to unwind the proof.
