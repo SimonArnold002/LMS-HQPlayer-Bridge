@@ -89,6 +89,8 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `hqrestart.py::main()`, a bare `--allow` with no config path | **FIXED** 2026-09-26 (round 2) — it fell through to serve mode and wrote a config file named `--allow` | `a bare --allow fell through to serve mode` |
 | `client forget` on a CONNECTED bridge player, `clientForgetCommand` returning without `setStatusDone()`, `_onForget` | **DISPROVEN 2026-09-26, MEASURED IN LMS SOURCE** — a REFUSED forget notifies nothing; the subscription cannot see it | `a REFUSED forget notifies nothing` |
 | `syncheck.pl` / the called-vs-defined sweep as cover for a NEW cross-module call | **MEASURED 2026-09-26 — IT IS NOT.** The sweep cannot see `$var->method`; only the suites guard those | `the sweep cannot see a method call on a variable` |
+| `%BENIGN`, `_dispatch`'s `$msg`, a benign `<Volume>` error logged at WARN | **FIXED** 2026-09-26 (round 2) — `/>([^<]*)</` matched the empty string after the XML declaration, so `%BENIGN` never fired and never had a test | `%BENIGN` never fired` |
+| the LMS slider dropping back to HQPlayer's startup level after a restart + a play from HQPlayer's OWN UI; reading it as the volume-hold fix failing | **CORRECT BEHAVIOUR** 2026-09-26, Simon's account — HQPlayer's **startup volume** lands when it plays, and LMS follows any level it did not set. Only a level LMS set during an outage is replayed | `HQPlayer's STARTUP VOLUME is not a failure of the hold` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -126,7 +128,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayer-verify-playback-not-state]]. |
 | A bare `<Status/>` is not a subscribe - the vendor's client always writes the attribute, so a missing one reads as `subscribe="0"`, no pushes ever arrive, the clock freezes and LMS is stranded in `play` (`Player.pm` `_startPolling` / `_statusWatchdog`) | **DECLINED** 2026-08-28 | Measured A/B against engine 6.0.4 on one connection each, 6s: bare `<Status/>` -> **2** pushes, `subscribe="1"` -> **2**, `subscribe="0"` -> **1**. Bare is equivalent to `subscribe="1"`; the "missing attribute reads as 0" step was flagged as unproven by the reporter and is the step that is false. The log pattern has a different cause: **HQPlayer stops pushing when it is not playing**. Watchdog firings during the healthy sweep 16:21-16:27 = **0**; continuous from 16:29:36, right after a pause at 16:29:06. Sending `subscribe="1"` explicitly is harmless and slightly clearer, but fixes nothing. THE REPORT'S SYMPTOM IS REAL WITH ANOTHER CAUSE - see the row below. |
 | LMS can be stranded in `mode=play` with a frozen clock, leaving the Eversolo screen on for ever | **ACCEPTED 2026-08-28, FIXED in 0.2.50** | `_endOfStream` opens `return unless $self->hqStarted`, and `hqStarted` is only set when HQPlayer REPORTS playing. So a `Play` that is acked but never becomes playback tells LMS nothing, for ever. That is the state every tier 4 bug fixed in 0.2.27 produced; the causes are gone but the gap is not. Fix: a start timeout - if HQPlayer has not reported playing ~10s after the Play ack, report the load as failed. Would have surfaced the 0.2.24-0.2.27 bugs in seconds. Note the screen plugin already has its own net (`_reconcile` spots a non-advancing clock and asks the device); it failed here only because the Eversolo was unreachable at that moment. **Built as specified**: `START_DEADLINE` (10s) armed where the Play ack sets `hqPlayAck`, cancelled at the `hqStarted` latch, in `stop()` and in `_newGeneration`; on expiry it reports `playerStreamingFailed('PROBLEM_OPENING')` once. Three things it deliberately does NOT fail: a load superseded by a newer one (generation check), a track paused inside the window (LMS can pause a track that has not started, and HQPlayer then correctly never reports playing), and one that started (belt-and-braces `hqStarted` guard on top of the cancel). |
-| `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` logs it at debug. |
+| `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` was written to log it at debug - **and did not, from 2026-08-27 until 2026-09-26.** `_dispatch` pulled the message with `/>([^<]*)</`, and since every reply carries the XML declaration that `*` matched the EMPTY string between `?>` and `<Volume`: `$msg` came back `""` for EVERY error on the wire, so the `%BENIGN` lookup could never match and the raw frame was logged at **warn** in its place. Nothing tested it. Found live 2026-09-26 off a real reconnect; `*` -> `+` and pinned. |
 | The volume curve should be tapered (a knee, or `denonavpcontrol`'s sqrt) rather than linear | **DECLINED** 2026-08-27 | Linear in dB **is** a logarithmic taper on the signal — equal dB per step. A bend would make a fixed skin increment (Material's volume step is 1, 3 or 5) worth a different number of dB depending on slider position, and it only pays off for a listener with one habitual level. It would also break agreement with HQPlayer's own 0-100 scale, which is linear over the range (`GetVolume` 61 at −39 dB on −100…0). |
 | An endpoint re-registering can jump the output +21 dB, so an increase just after a link-up should be refused and pulled back (`Player.pm`, `_followVolume`) | **REVERSED** 2026-08-30 | Shipped in 0.2.31, removed in 0.2.32. The event is real, but the guard's trigger was `transport_serial`, which **increments at every track boundary** (measured 4→5→6→7→8→9 across five boundaries of one album). So it armed for 10s after every track change and pulled back the user's own volume changes. Simon's call: the volume is the user's. Do not re-propose without a trigger that means "the endpoint re-registered" and nothing else. |
 | Tier 3 must go on the tier 4 player-stream endpoint, because that is the only unchunked route | **WRONG** 2026-08-30 | It is not the only one. `downloadMusicFile` chunks **only** when `$response->request->protocol eq 'HTTP/1.1'`; declaring the request `HTTP/1.0` gets LMS's own transcode with raw close-delimited framing. Routing tier 3 through the player stream fixed the framing and silently cost gapless, because that endpoint draws on the single per-player `$client->chunks`. Fixed in 0.2.32 with `/hqp3/`. **The lesson: "one player, one stream" was our own constraint, not LMS's** — check whether a limit is imposed or inherited before designing around it. |
@@ -6107,6 +6109,12 @@ Scope: the 10 unpushed commits plus the tree. The round BEFORE this one covered 
 minus `96ac1e5`; its cleared-on-evidence list was re-derived rather than trusted, and it held.
 Two findings, both fixed here, both pinned.
 
+**BUILT 1.0.26 (2026-09-26), Simon's call to bump** - the `%BENIGN` fix found by the live run
+below, on top of 1.0.25. `install.xml` and `repo.xml` at 1.0.26, `<sha>` redone
+(`28835ce6...`), zip manifest checked against the source tree and all six modules inside it
+diffed against the working copies. **1.0.25 is what was installed and verified live at 19:09**;
+1.0.26 adds only the log-level fix and is NOT installed.
+
 **BUILT 1.0.25 (2026-09-26), Simon's call to bump.** Unlike 1.0.24 this build DOES change the
 plugin code - `Player.pm`, `Control.pm` and `Plugin.pm` all carry the volume fix - so the bump is
 what lets LMS reinstall it at all. `install.xml` and `repo.xml` both at 1.0.25, `<sha>` redone
@@ -6227,7 +6235,68 @@ typo: `t_plugin.pl` at `_onLinkProven` (its `FakeClient` has no AUTOLOAD, so a w
 and `t_player.pl` where the method is called on a real Player. Adding a cross-module call means
 adding the stub AND exercising it - the sweep will not tell you.
 
-**Suite: 1,168 assertions, all green** - `t_control.pl` 94, `t_player.pl` 469, `t_stream.pl` 64,
+### VERIFIED LIVE 2026-09-26, and it found one more thing
+
+1.0.25 installed on the rig (`http://plex:9000/hqplive` reports `v1.0.25`). The outage was made
+with the bridge's own **Restart HQPlayer** row, which answered `HQPlayer restarted (7.2 s)`:
+
+    19:09:21  START                       volume=40  connected=1
+    19:09:22  LINK DOWN -> set volume 55             (the change that used to be lost)
+    19:09:34  RECONNECTED (proven)        volume=55
+    19:09:40  +6s                         volume=55  connected=1
+    19:09:48  +14s, several Status pushes volume=55
+
+**The slider stayed where it was put.** Pre-fix this is precisely where it snapped back to 40:
+`_followVolume` runs on every `<Status/>`, so LMS holding 55 across fourteen seconds of pushes
+proves HQPlayer is at the matching level - the re-assert reached it. HQPlayer came back on SDM
+(DSD) with its saved settings, as the ledger says a full daemon restart does.
+
+#### HQPlayer's STARTUP VOLUME is not a failure of the hold
+
+Seven minutes after the test above, the slider read 40 again. It is not the bug coming back, and
+a future round must not read it as one. **Simon restarted HQPlayer manually** at 19:16:18
+(`control link down - HQPlayer closed the link`) **and then started playback from HQPlayer's own
+UI**, so HQPlayer's configured startup volume - that level - is what it played at. LMS followed
+it to 40, which is the rule `_followVolume` has enforced since 2026-08-30: a level set outside
+LMS is followed, whatever it is. Driving HQPlayer's own UI is about as far outside LMS as an
+action gets.
+
+The two paths are different and both are right:
+
+- **a level LMS set during the outage** is replayed over the startup level, because the user asked
+  for it and it was lost (that is the 19:09 run, where 55 survived);
+- **no level held** means the startup volume stands and LMS mirrors it.
+
+So the empty playlist and the startup level are both HQPlayer's own behaviour on a restart
+(Simon, 2026-09-26), and the plugin neither causes nor works around either. The `%BENIGN` fix
+below changes one thing only: the LOG LEVEL the bridge gives an error HQPlayer legitimately
+returns.
+
+#### `%BENIGN` never fired - FIXED, and it had NO test
+
+The re-assert's reply exposed it. The restart leaves HQPlayer with an empty playlist, so the
+`<Volume>` came back `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last` - the
+error the 2026-08-27 entry DECLINED as benign, on the stated grounds that `%BENIGN` logs it at
+debug. It was logged in **red**, at warn, with the raw frame instead of the message:
+
+    19:09:36 Control::_dispatch (574) HQPlayer (MacMini): <Volume> failed:
+             <?xml version="1.0" encoding="utf-8"?><Volume result="Error">clPlaylist::GetAlbumGain(): trackn > last</Volume>
+
+`_dispatch` pulled the message with `/>([^<]*)</`. **Every reply carries the XML declaration**, so
+`*` matched the EMPTY string between `?>` and `<Volume`, `$msg` was `""` for every error on the
+wire, the `%BENIGN` lookup could never match, and `( $msg || $raw )` printed the frame. It has
+been broken since the feature was written and **nothing tested it**. `*` -> `+`; `>` inside the
+text is unaffected because `[^<]` spans it, so `trackn > last` survives whole.
+
+Pinned in `t_control.pl` (**101 passed**, was 94) with the exact frame off the wire. The three
+discriminators FAIL against the old regex; the four controls - any other `<Volume>` error, the
+same text on `<Play>`, an empty message, and the raw-frame fallback - pass either way.
+
+**Not a finding against the volume fix, but caused by it being exercised:** nothing used to send
+a `<Volume>` at link-up, so this warn had no routine trigger. The re-assert gives it one - and
+since a restart ALWAYS leaves the playlist empty, the pairing is deterministic, not a race.
+
+**Suite: 1,175 assertions, all green** - `t_control.pl` 101, `t_player.pl` 469, `t_stream.pl` 64,
 `t_plugin.pl` 190, `t_live_page.js` 159 + 17 executed, `t_hqrestart.py` 162, `t_installers.py` 13,
 `perl -c` on every module, sweep clean.
 

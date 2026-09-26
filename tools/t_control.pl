@@ -64,6 +64,69 @@ is($C->can('parseAttrs')->($err)->{result},'Error','error reply result=Error');
 my $gt = $C->can('parseAttrs')->('<?xml version="1.0" encoding="utf-8"?><GetTransport arg="" value="240"/>');
 is($gt->{value},'240','GetTransport is a numeric id, not a device name');
 
+# ---------------------------------------------------------------------------
+# %BENIGN - the one error HQPlayer answers that is NOT a failure.
+#
+# With an empty playlist every <Volume> comes back result="Error" carrying
+# `clPlaylist::GetAlbumGain(): trackn > last` - HQPlayer recomputing replaygain
+# over a playlist with no tracks. The level IS applied (ledger 2026-08-27), so
+# it is logged at debug rather than crying wolf.
+#
+# IT NEVER WORKED, AND NOTHING TESTED IT. `_dispatch` pulled the message with
+# `/>([^<]*)</`, and because every reply carries the XML declaration that `*`
+# matched the EMPTY string between `?>` and `<Volume`. $msg was "" for EVERY
+# error on the wire, so the %BENIGN lookup could never match and the raw frame
+# was printed in its place. Found live 2026-09-26, off a real reconnect.
+print "-- a benign error is logged at debug, not warn --\n";
+{
+    my (@warned, @debugged);
+    no warnings qw(redefine once);
+    local *Slim::Utils::Log::Obj::warn  = sub { push @warned,    $_[1] };
+    local *Slim::Utils::Log::Obj::debug = sub { push @debugged,  $_[1] };
+    Slim::Utils::Timers::_reset();
+
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->{connected} = 1;
+
+    # THE EXACT FRAME OFF THE WIRE, declaration and all - including the `>`
+    # inside the message text, which `[^<]` has to span.
+    my $benign = '<?xml version="1.0" encoding="utf-8"?>'
+               . '<Volume result="Error">clPlaylist::GetAlbumGain(): trackn > last</Volume>';
+
+    $c->{inflight} = { verb => 'Volume', cmd => '<Volume value="-45"/>' };
+    $c->_dispatch($benign);
+
+    is(scalar @warned, 0, 'the empty-playlist <Volume> error does NOT warn');
+    is(scalar @debugged >= 1 ? 1 : 0, 1, 'it is logged at debug instead');
+    is(( grep { /trackn > last/ } @debugged ) ? 1 : 0, 1,
+       'and the MESSAGE is logged, not the raw frame - `>` in the text survives');
+
+    # CONTROL: a real failure on the same verb still warns.
+    @warned = ();
+    $c->{inflight} = { verb => 'Volume', cmd => '<Volume value="-45"/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?>'
+                . '<Volume result="Error">Unknown command</Volume>');
+    is(scalar @warned, 1, 'CONTROL: any OTHER <Volume> error still warns');
+
+    # CONTROL: the benign text on a DIFFERENT verb is not excused - %BENIGN is
+    # keyed on the verb, and only Volume is listed.
+    @warned = ();
+    $c->{inflight} = { verb => 'Play', cmd => '<Play/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?>'
+                . '<Play result="Error">clPlaylist::GetAlbumGain(): trackn > last</Play>');
+    is(scalar @warned, 1, 'CONTROL: the same text on <Play> is NOT downgraded');
+
+    # CONTROL: an error with no message at all still reports the raw frame.
+    @warned = ();
+    $c->{inflight} = { verb => 'Play', cmd => '<Play/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><Play result="Error"></Play>');
+    is(scalar @warned, 1, 'CONTROL: an empty error message still warns');
+    is(( grep { /result="Error"/ } @warned ) ? 1 : 0, 1,
+       'and falls back to the raw frame, having no message to show');
+
+    Slim::Utils::Timers::_reset();
+}
+
 print "-- _extractMessage (framing a pushed Status stream) --\n";
 my $D  = '<?xml version="1.0" encoding="utf-8"?>';
 

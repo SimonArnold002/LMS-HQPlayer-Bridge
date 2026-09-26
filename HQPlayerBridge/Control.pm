@@ -566,7 +566,14 @@ sub _dispatch {
     Slim::Utils::Timers::killTimers( $self, \&_replyTimeout );
 
     if ($isErr) {
-        my ($msg) = $raw =~ />([^<]*)</;
+        # `+`, NOT `*`. Every reply carries the XML declaration, so `*` matched
+        # the EMPTY string between `?>` and `<Verb` and $msg came back "" for
+        # every error on the wire - which silently disabled %BENIGN below and
+        # printed the raw frame instead of the message. Measured live
+        # 2026-09-26 on `<Volume>` against an empty playlist, the one case
+        # %BENIGN exists for. `>` inside the text is fine: `[^<]` spans it, so
+        # `trackn > last` survives whole.
+        my ($msg) = $raw =~ />([^<]+)</;
 
         my $benign = $BENIGN{ $req->{verb} };
         my $lvl    = ( $benign && defined $msg && $msg =~ $benign ) ? 'debug' : 'warn';
