@@ -135,6 +135,37 @@ def run(argv, timeout=30):
 
 # ---------------------------------------------------------------- config / state
 
+def write_config(path, data):
+    """Replace the config file with `data`, ATOMICALLY.
+
+    Every write to this file has to survive being interrupted, because the file
+    holds the TOKEN and the `allow` list: opening the real path 'w' truncates it
+    first, so a short write leaves an unparseable config, and Config.__init__
+    answers that with SystemExit(2) - which the service manager turns into
+    RestartPreventExitStatus=2, i.e. the helper stays DOWN with no Restart row.
+    Write a sibling (same filesystem, so os.replace is atomic), chmod it BEFORE
+    it is in place so the token is never world-readable, then swap.
+    """
+    tmp = path + '.new'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)                     # it holds the token
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class Config:
     def __init__(self, path):
         self.path = path
@@ -161,12 +192,10 @@ class Config:
         if not self.c['token']:
             self.c['token'] = secrets.token_urlsafe(24)
             data['token'] = self.c['token']
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+            # Atomic, and for the same reason as every other write here: by the
+            # time the helper first starts, install.sh has already put the user's
+            # `allow` list in this file, so a truncating write can lose that too.
+            write_config(path, data)
             log('generated a token and saved it to %s' % path)
 
     def _coerce(self):
@@ -887,30 +916,7 @@ def set_allow(path, raw=None):
 
     data['allow'] = addrs
 
-    # ATOMIC, because the docstring above is a promise about the TOKEN: opening
-    # the real path 'w' truncates it first, so an interrupted or short write
-    # leaves exactly the unparseable config this is not allowed to produce -
-    # and Config.__init__ then exits 2, with the token gone.  Write a sibling
-    # (same filesystem, so os.replace is atomic), chmod it BEFORE it is in
-    # place so the token is never world-readable, then swap.
-    tmp = path + '.new'
-    try:
-        with open(tmp, 'w') as f:
-            json.dump(data, f, indent=2)
-            f.write('\n')
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.chmod(tmp, 0o600)                     # it holds the token
-        except OSError:
-            pass
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    write_config(path, data)                     # atomic; see write_config
     return addrs
 
 

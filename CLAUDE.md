@@ -78,6 +78,9 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | auto-RESUME after a control-link outage (remember the song + position on the drop, re-load with a seek on the next proven link); "the music does not come back after a config save or a restart" | **DECLINED** 2026-09-26, Simon's call — **HQPlayer has to be sent the WHOLE stream, so any re-load plays from the START; it has always done this.** A "resume" would be a track silently restarting, which is worse than the stop. Do not re-propose from the fact that `_queueTrack` accepts a `$seek` | `RESUME AFTER AN OUTAGE IS DECLINED` |
 | resuming at a position by handing LMS `playlist jump <idx>` with `{ timeOffset => N }` (`Commands.pm:1021` -> `controller->play`, resolved in `Song::open`) | **WRONG, MEASURED LIVE 2026-09-26** — it does NOT seek, and it makes LMS LIE: the clock froze at the claimed offset while the audio played from the track start, and hqplayerd logged NO `Seek to:` line. Do not re-propose from LMS's source | `THE SEEKDATA RESUME IS A DISPLAY LIE` |
 | `set_allow` truncating the TOKEN-bearing config in place (`open(path,'w')`), against its own docstring | **FIXED** 2026-09-25 — sibling + `os.replace`, chmod before the swap; a torn write is pinned in `t_hqrestart.py` | `THE CONFIG WRITE IS ATOMIC` |
+| the FIRST-START token write in `Config.__init__` truncating the same config in place, after `install.sh` has already written `allow` into it | **FIXED** 2026-09-26 — the second writer, missed when `set_allow` was fixed. Both now call one `write_config()`; the torn write is pinned | `THE SECOND WRITER OF THE CONFIG` |
+| `validate()` refusing a command to a bridge player while the control link is down, so `connected`/`proven` could produce `Request in error` | **WRONG, MEASURED** 2026-09-26 — `validate()` gates on `%clientHash`, never on `connected`; the client stays in the hash across an outage | `VALIDATE GATES ON CLIENTHASH` |
+| `$client->disconnected` set in `_create` / `_onLinkState` doing anything | **INERT, MEASURED** 2026-09-26 — written only by Slimproto, read nowhere this player reaches | `DISCONNECTED IS SLIMPROTO-ONLY` |
 | `FakeCtl` in `t_player.pl` being a bare `bless {}` with no package, so any new method call on the control link kills 20+ load tests | **FIXED** 2026-09-25 — it is a real stub of `Control`'s accessors (`up`/`connected`/`proven`). Keep it in step when one is added | `FAKECTL IS A REAL STUB` |
 
 **Two standing rules that kill most repeat findings:**
@@ -5725,7 +5728,8 @@ first. A torn write therefore produced exactly the unparseable config the docstr
 rules out, and `Config.__init__` then `SystemExit(2)`s - helper dead, token gone.
 Now: write `<path>.new`, `fsync`, `chmod 0600` **before** the swap so the token is
 never briefly world-readable, then `os.replace` (same directory, so it is atomic),
-and unlink the temp file on any failure.
+and unlink the temp file on any failure. **It had a second writer, fixed a day later -
+see `THE SECOND WRITER OF THE CONFIG`.**
 
 **A TEST-RIG TRAP THIS COST AN HOUR - `FAKECTL IS A REAL STUB`.** `t_player.pl`
 handed the player `bless {}, 'FakeCtl'` in 28 places with **no `package FakeCtl`
@@ -5897,6 +5901,80 @@ list twice.**
 **DIAGNOSTIC RULE EARNED HERE: a TCP accept is not evidence that something is listening until
 it is compared with a port known to be empty.** `curl -v` reporting `Connected to ... port 8090`
 sent a whole round of reasoning down the wrong path. Probe a control port in the same sweep.
+
+## REVIEW 2026-09-26 (origin/dev..HEAD, 9 commits): one fixed, the rest cleared on evidence
+
+Scope: `Control.pm`, `Discovery.pm`, `Player.pm`, `Plugin.pm`, `Live.pm`, the restart helper
+and its suites. Clean tree, 9 unpushed commits. One finding.
+
+**BUILT 1.0.24 (2026-09-26), Simon's call to bump.** Nothing in the ZIP changed this round -
+the fix is in `tools/hqrestart/`, which the zip does not carry - but the 1.0.23 zip on disk
+still predated the `up` gate committed in 132600f, so it was rebuilt from the current tree and
+the `repo.xml` `<sha>` redone (`1bc3bd55...`). The plugin code in this zip is what was
+installed and verified live at 23:5x on 2026-09-25. **The helper fix does not reach the
+HQPlayer host through a plugin update** - it needs `tools/hqrestart/install.sh` re-run there,
+and the Mac mini's helper still predates the install-time `allow` prompt.
+
+**THE SECOND WRITER OF THE CONFIG - FIXED (`hqrestart.py::Config.__init__`).** The
+2026-09-25 round fixed the in-place write in `set_allow` and **missed the other writer of
+the same file**: the first-start token write, six lines of `open(path, 'w')` + `json.dump`
+with `os.chmod(path, 0o600)` *after* the write - the exact ordering `set_allow` had just
+reversed. It was harmless while that file held nothing worth keeping, but the 2026-09-23
+helper change writes the user's `allow` list into it **before the helper ever starts**, so
+this write now truncates a file with content: torn, it loses `allow` as well as producing the
+unparseable config `Config.__init__` answers with `SystemExit(2)` - and
+`RestartPreventExitStatus=2` means the helper stays DOWN, with no Restart row and no reason
+shown. Fix: both writers now call one module-level `write_config(path, data)` (sibling +
+`fsync` + `chmod 0600` + `os.replace`, temp file unlinked on any failure), so there is one
+rule and not two copies to drift. `set_allow`'s inline copy is gone.
+
+Pinned in `t_hqrestart.py` (**155 passed**, was 151) at the layer the fix lives - a torn
+`json.dump` during `hq.Config(path)`, asserting the installer's `allow` list and the `port`
+survive and the file still parses, plus a CONTROL that an untorn write does generate the
+token and keep `allow`. **Confirmed to FAIL against the pre-fix module** (run the suite with
+the old file as `argv[1]`: `JSONDecodeError: Unterminated string`). The other three
+assertions are guards, true either way - the torn one is the discriminator.
+
+`save_state` writes with the same truncating `open(..., 'w')` and was left alone
+deliberately: it is a different file, holds no token, and `load_state` swallows `ValueError`
+and returns `{}`, so a torn write degrades to "never seen running" and the next successful
+restart rewrites it.
+
+**Cleared on evidence this round (LMS source at `/private/tmp/claude-502/ss`) - do not pay
+for these measurements again:**
+
+- **`VALIDATE GATES ON CLIENTHASH`, not on `connected`.** The worry that 1.0.17's
+  `connected`-is-the-control-link change could make commands to a bridge player fail with
+  Material's red `Request in error` is **wrong**: `validate()` tests membership of
+  `%clientHash`, and an outage never removes the client from it. Commands still dispatch
+  during a control-link outage, which is what the held-load path relies on.
+- **`DISCONNECTED IS SLIMPROTO-ONLY`.** `$client->disconnected` is written only by
+  Slimproto (`Slimproto.pm:269`, `1212`) and read nowhere any bridge player reaches, so
+  setting it in `_create` / `_onLinkState` is inert - neither a fix nor a leak.
+- `_failLater` timers are keyed on the Control object and survive `close()`, but the only
+  callback-bearing `send` reachable on a down link is `_handOver`'s `PlaylistAdd`, whose
+  `(undef, undef)` path is the intended demote-to-held-load. No misbehaviour to report.
+- `_canHandOver` / `_armNextTrack` still gate on "an `hqControl` object exists" rather than
+  `up` - the shape fixed in `_queueTrack` (`A LOAD IN THE DROP WINDOW`) - but both degrade
+  into the held-load path, costing one `warn`, not a stranded track.
+- Round-based `_liveOf`, the `%splitWarned` change-detector and the new "a connected player
+  outranks discovery" clause in `_onInstances` were walked through the DHCP-move,
+  established-pair, pair-shrinks-to-one, rename and TTL-expiry cases; each lands where its
+  comment claims.
+- `reconnectNow` makes an accept-then-reset instance re-probe the restart helper every
+  `COLD_PERIOD` instead of every `BACKOFF_MAX` (`_probeRestart`'s `$probedAt` throttle is
+  honoured only on the feed's call). Judged too small to be worth a finding.
+- The new `FakeCtl` / `DownCtl` / `LinkClient` stubs are real stubs (`LinkClient::connected`
+  calls the production `Player::connected`), and `t_installers.py`'s stub-wins-on-PATH
+  safety check holds.
+
+Suites green by their own exit codes: `t_control` 94, `t_player` 447, `t_plugin` 189,
+`t_live` 159, `t_hqrestart` **155**, `t_installers` 13.
+
+Gate hits dropped without report, per the index: `reconnectNow` bypassing the climbed
+backoff, `_onLinkState` not calling `playerInactive`, `playerActive` as a no-op on a
+reconnect, the address-qualified corpse held to `INSTANCE_TTL`, the helper's Windows
+removal, and the version / zip / `repo.xml` state.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 

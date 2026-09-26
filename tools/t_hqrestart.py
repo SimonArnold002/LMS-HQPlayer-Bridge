@@ -679,6 +679,46 @@ ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'],
 ok(lambda: oct(os.stat(CONF).st_mode & 0o777) == oct(0o600), 'and the config it lands is 0600 - it holds the token')
 
 # ---------------------------------------------------------------------------
+# The FIRST-START token write, which is the other writer of this file and had
+# its own truncating `open(path, 'w')`. install.sh now writes `allow` BEFORE
+# the helper first starts, so this write is no longer writing a file that holds
+# nothing worth keeping: torn, it loses the user's allow list, and the config it
+# leaves exits 2 - RestartPreventExitStatus=2, so the helper never comes back.
+# ---------------------------------------------------------------------------
+print('== the first-start token write is atomic too, and keeps what the installer wrote')
+TCONF = os.path.join(tmp, 'firststart.json')
+
+def first_start(dump=None):
+    json.dump({'port': 9999, 'allow': ['10.0.0.1']}, open(TCONF, 'w'))   # no token yet
+    if dump:
+        hq.json.dump = dump
+    try:
+        try:
+            return hq.Config(TCONF)
+        finally:
+            hq.json.dump = _realdump
+    except (IOError, OSError):
+        return None
+
+def token_torn():
+    first_start(_torndump)
+    was = json.load(open(TCONF))                     # raises if it no longer parses
+    return 'token' not in was and was.get('allow') == ['10.0.0.1'] and was.get('port') == 9999
+
+ok(token_torn, "a torn token write leaves the installer's allow list, parseable")
+ok(lambda: not os.path.exists(TCONF + '.new'), 'and leaves no temp file behind')
+
+def token_lands():
+    c = first_start()
+    on_disk = json.load(open(TCONF))
+    return (c['token'] and on_disk.get('token') == c['token']
+            and on_disk.get('allow') == ['10.0.0.1'])
+
+ok(token_lands, 'CONTROL: a write that does not fail generates the token and keeps allow')
+ok(lambda: oct(os.stat(TCONF).st_mode & 0o777) == oct(0o600),
+   'and that file is 0600 BEFORE it is in place - it now holds the token')
+
+# ---------------------------------------------------------------------------
 # The installer's closing report. `allow` is now written BEFORE the helper ever
 # starts, so the file EXISTS with no token in it - and both installers used to
 # treat "the file is there" as "the token has been generated".
