@@ -679,6 +679,37 @@ ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'],
 ok(lambda: oct(os.stat(CONF).st_mode & 0o777) == oct(0o600), 'and the config it lands is 0600 - it holds the token')
 
 # ---------------------------------------------------------------------------
+# `--allow` WITH NO CONFIG PATH.  main() matched the flag on `len(argv) > 2`,
+# so a bare `--allow` fell THROUGH to serve mode with sys.argv[1] as the config
+# path: it wrote a file literally named `--allow`, minted a token into it, and
+# went on to bind the port.  It must refuse instead, and touch nothing.
+# ---------------------------------------------------------------------------
+print('== --allow with no config path is refused, and writes nothing')
+
+def run_main(*args):
+    argv, err = sys.argv[:], sys.stderr
+    sys.argv = ['hqrestart.py'] + list(args)
+    sys.stderr = io.StringIO()
+    try:
+        return hq.main(), sys.stderr.getvalue()
+    finally:
+        sys.argv, sys.stderr = argv, err
+
+_here_before = set(os.listdir('.'))
+# NB: not `_said` - that name is the suite's own log buffer (hq.log appends to
+# it), and rebinding it to a string breaks every later test that calls logged().
+_code, _usage = run_main('--allow')
+ok(_code == 2, 'a bare --allow exits 2, not into serve mode (%r)' % (_code,))
+ok('usage' in _usage.lower(), 'and says how to call it (%r)' % _usage.strip())
+ok(not os.path.exists('--allow'), 'no config file named `--allow` is created')
+ok(set(os.listdir('.')) == _here_before, 'and nothing else is left behind either')
+
+# CONTROL: the installers' real call still works, on the same code path.
+ok(run_main('--allow', CONF, '10.0.0.7')[0] == 0, 'CONTROL: --allow <config> <addr> still returns 0')
+ok(lambda: hq.set_allow(CONF) == ['10.0.0.7'], 'and still writes the address')
+ok(run_main('--allow', CONF)[0] == 0, 'CONTROL: --allow <config> still reads back')
+
+# ---------------------------------------------------------------------------
 # The FIRST-START token write, which is the other writer of this file and had
 # its own truncating `open(path, 'w')`. install.sh now writes `allow` BEFORE
 # the helper first starts, so this write is no longer writing a file that holds

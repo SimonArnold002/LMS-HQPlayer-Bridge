@@ -188,6 +188,12 @@ sub up        { ( $_[0]->{sock} || $_[0]->{connecting} ) ? 1 : 0 }
 #        the link was already down when it was sent.
 #   $opts->{scope} groups commands which may be cancelled before they reach
 #        the wire; the player uses 'track' for generation-bound load work.
+#
+# RETURNS 1 if the command was accepted onto the queue, 0 if it was refused -
+# an unverified verb, or a link that is down. A caller which must know whether
+# its command actually left (Player::volume, whose level LMS would otherwise
+# believe had been applied) reads this; most do not care, because their $cb is
+# failed either way.
 # ---------------------------------------------------------------------------
 sub send {
     my ($self, $cmd, $cb, $opts) = @_;
@@ -198,7 +204,7 @@ sub send {
     if ( !$verb || !$KNOWN{$verb} ) {
         $log->error("refusing to send unverified command (would drop the link): $cmd");
         $cb->(undef, undef) if $cb;
-        return;
+        return 0;
     }
 
     # THE LINK IS DOWN: fail the command, and do NOT connect. A reconnect is
@@ -218,7 +224,7 @@ sub send {
     if ( !$self->{sock} && !$self->{connecting} ) {
         main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: link down, not sending <$verb>");
         Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_failLater, $cb ) if $cb;
-        return;
+        return 0;
     }
 
     push @{ $self->{queue} }, {
@@ -231,7 +237,7 @@ sub send {
 
     $self->_pump;
 
-    return;
+    return 1;
 }
 
 sub _failLater {

@@ -884,12 +884,18 @@ sub _answer {           # answer the oldest outstanding command, OK unless told
     $cb->( $ok ? { result => 'OK' } : undef, $raw );
     return 1;
 }
+# _send now REPORTS whether the command was accepted (Control::send returns 0
+# on a down link and never queues), and volume() acts on that answer.  The stub
+# has to carry the same contract or it tests a send that always succeeds:
+# $linkUp is the link, and the volume tests below flip it.
+our $linkUp = 1;
 {
     no warnings 'redefine';
     *Plugins::HQPlayerBridge::Player::_send      = sub {
+        return 0 unless $linkUp;
         push @sent, $_[1];
         push @sentCb, $_[2] if $_[2];
-        return;
+        return 1;
     };
     *Plugins::HQPlayerBridge::Player::_startPolling = sub {};
     *Plugins::HQPlayerBridge::Player::_stopPolling  = sub {};
@@ -1251,6 +1257,190 @@ is($sp->client($c)->get('digitalVolumeControl'), '1',
 is(join(',', @ex), join(',', ('mixer volume 50') x 5),
    'and keep mirroring HQPlayer\'s own level instead of parking the slider');
 $c->hqVolDb(undef);
+
+# ---------------------------------------------------------------------------
+# A VOLUME CHANGE MADE WHILE THE CONTROL LINK IS DOWN.
+#
+# Control::send stopped connecting on demand (1.0.22): on a down link it
+# refuses the command outright.  volume() went on recording hqVolDb/hqVolSent
+# as though the level had been applied, so on the next link the first <Status/>
+# carried HQPlayer's OLD level, that no longer matched LMS's stored volume, and
+# _followVolume dragged the slider back - the user's change silently undone.
+# The level is parked instead and re-asserted by refreshInfo.
+# ---------------------------------------------------------------------------
+print "-- a volume set while the link is down survives the reconnect --\n";
+{
+    local $linkUp = 0;
+
+    @sent = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-50);
+    $c->hqVolSent(undef);
+    $c->hqVolPending(undef);
+
+    $c->volume(70);                              # the user drags the slider to -30dB
+
+    is(scalar(@sent), '0', 'nothing reaches the wire on a down link');
+    is($c->hqVolPending, '-30', 'the level is HELD for the next link');
+    is($c->hqVolDb, '-50',
+       'and hqVolDb still says where HQPlayer actually is, not where we wished it were');
+    is($c->hqVolSent, '(undef)',
+       'hqVolSent is NOT armed - a clamp cannot be learned from a command never sent');
+}
+
+# THE CLAMP MISFIRE, which the old code made reachable: a held level at the
+# floor plus a reconnect inside CLAMP_WINDOW read HQPlayer's own level as a
+# clamped reply and collapsed the range.
+{
+    local $linkUp = 0;
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-50); $c->hqVolSent(undef); $c->hqVolPending(undef);
+    $c->volume(0);                               # asks for the floor, link is down
+}
+$c->_onStatus({ state => 0, position => 0, volume => -50 }, '');
+is($c->hqVolMin, '-100',
+   'a status arriving after a DROPPED floor request does not collapse the range');
+
+# The re-assert itself: first on the new link, ahead of the <Status/>
+# subscribe, or the push that answers it undoes the change.
+print "-- the held level is re-asserted on the next link --\n";
+{
+    @sent = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb(-50); $c->hqVolSent(undef);
+    $c->hqVolPending(-30);
+
+    $c->assertPendingVolume;
+
+    is(join(',', @sent), '<Volume value="-30"/>', 'the held level goes out');
+    is($c->hqVolDb, '-30', 'and is recorded optimistically, as a live send is');
+    is($c->hqVolSent, '-30', 'with the clamp window armed, this time for a real command');
+    is($c->hqVolPending, '-30',
+       'the hold is NOT released by the send - only by proof the link carried it');
+
+    # Proof arrives: HQPlayer replied on this link.
+    $c->volumeAsserted;
+    is($c->hqVolPending, '(undef)', 'a reply on the link releases the hold');
+
+    @sent = ();
+    $c->assertPendingVolume;
+    is(scalar(@sent), '0', 'and nothing is re-asserted on the link after that');
+}
+
+# refreshInfo is the caller, and ORDER IS THE POINT: the re-assert has to be
+# queued before the subscribe, on a stream that is ordered and one-deep.
+{
+    @sent = ();
+    $c->hqVolPending(-30);
+    $c->refreshInfo;
+    $c->hqVolPending(undef);
+
+    is($sent[0], '<Volume value="-30"/>',
+       'refreshInfo asserts the held level FIRST, ahead of VolumeRange and Status');
+}
+
+# ACCEPT-THEN-DROP.  hqplayerd accepts a socket it is about to drop (an expired
+# licence does exactly this), and a command queued on that socket dies with it.
+# The hold has to outlive the send, or the change is lost a second time.
+print "-- an accept-then-drop does not consume the held level --\n";
+{
+    @sent = ();
+    $c->hqVolDb(-50); $c->hqVolPending(-30);
+
+    $c->refreshInfo;                             # link 1: accepted, then dropped
+    is(scalar(grep { $_ eq '<Volume value="-30"/>' } @sent), '1', 'link 1 asserted it');
+    is($c->hqVolPending, '-30', 'and the hold survives, because nothing ever replied');
+
+    @sent = ();
+    $c->refreshInfo;                             # link 2
+    is(scalar(grep { $_ eq '<Volume value="-30"/>' } @sent), '1',
+       'so the next link asserts it again');
+    $c->volumeAsserted;
+    $c->hqVolPending(undef);
+}
+
+# THE RULE THE HOLD MUST NOT BREAK: a knob turned on the endpoint during the
+# outage is still FOLLOWED, not overridden.  Only a level LMS asked for and
+# lost is replayed - see the note in _followVolume about the guard that was
+# removed for second-guessing the person holding the remote.
+print "-- an endpoint knob turn during the outage is still followed --\n";
+{
+    @sent = (); @ex = ();
+    $c->hqVolDb(-50); $c->hqVolSent(undef); $c->hqVolPending(undef);
+    $sp->client($c)->set('volume', 50);          # LMS believes -50dB
+
+    $c->refreshInfo;
+    is(scalar(grep { /^<Volume / } @sent), '0',
+       'with nothing held, the reconnect asserts NO level of its own');
+
+    $c->_onStatus({ state => 0, position => 0, volume => -20 }, '');
+    is(join(',', @ex), 'mixer volume 80',
+       'and HQPlayer\'s own level is followed into LMS, exactly as before');
+}
+
+# A hold that the slider itself makes moot.  Both early returns in volume()
+# have to drop it, or a stale level is asserted on some later link.
+print "-- a hold that is no longer wanted is dropped --\n";
+{
+    local $linkUp = 0;
+    $c->hqVolDb(-50); $c->hqVolSent(undef);
+    $c->hqVolPending(-30);
+    $c->volume(50);                              # back to where HQPlayer already is
+    is($c->hqVolPending, '(undef)',
+       'the anti-snap return clears it - there is nothing left to assert');
+
+    $c->hqVolPending(-30);
+    $sp->client($c)->set('digitalVolumeControl', 0);
+    $c->volume(70);
+    is($c->hqVolPending, '(undef)',
+       'and so does a switch to fixed volume - the level is not ours to send');
+    $sp->client($c)->set('digitalVolumeControl', 1);
+}
+$c->hqVolDb(undef); $c->hqVolSent(undef); $c->hqVolPending(undef);
+$sp->client($c)->set('volume', 50);
+
+# THE WHOLE SYMPTOM, END TO END, in the terms the user reported it: turn the
+# volume up while HQPlayer is away, and watch LMS put it back.
+#
+# This one models HQPlayer rather than the plugin's own state - its level is
+# whatever the last <Volume> on the wire set it to - so it discriminates the
+# fix from the bug without naming a single new accessor.  It is the control
+# assertion for everything above: against the old code the last two lines fail.
+print "-- end to end: the slider stays where the user put it --\n";
+{
+    my $hqLevel = -50;                           # where HQPlayer is right now
+    @sent = (); @ex = ();
+    $c->hqVolMin(-100); $c->hqVolMax(0);
+    $c->hqVolDb($hqLevel);
+    $c->hqVolSent(undef);
+    $sp->client($c)->set('volume', 50);
+
+    # The link goes down, and the user turns it up to 70 (-30dB).  LMS persists
+    # the new level whatever the plugin does with it.
+    {
+        local $linkUp = 0;
+        $c->volume(70);
+        $sp->client($c)->set('volume', 70);
+    }
+    is(scalar(@sent), '0', 'the change cannot reach HQPlayer - the link is down');
+
+    # It comes back.  Everything the plugin re-asserts goes out here.
+    @sent = ();
+    $c->refreshInfo;
+
+    # HQPlayer applies whatever it was actually sent, in order.
+    for my $cmd (@sent) {
+        $hqLevel = $1 + 0 if $cmd =~ /^<Volume value="(-?[\d.]+)"\/>/;
+    }
+    is($hqLevel, '-30', 'the reconnect carries the level the user asked for');
+
+    # ...and then pushes its state, which is what used to undo the change.
+    @ex = ();
+    $c->_onStatus({ state => 0, position => 0, volume => $hqLevel }, '');
+    is(scalar(@ex), '0', 'so the first push agrees with LMS and moves nothing');
+}
+$c->hqVolDb(undef); $c->hqVolSent(undef); $c->hqVolPending(undef);
+$sp->client($c)->set('volume', 50);
 
 print "-- fade_volume --\n";
 my $fired = 0;

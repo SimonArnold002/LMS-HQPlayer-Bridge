@@ -82,6 +82,13 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `validate()` refusing a command to a bridge player while the control link is down, so `connected`/`proven` could produce `Request in error` | **WRONG, MEASURED** 2026-09-26 — `validate()` gates on `%clientHash`, never on `connected`; the client stays in the hash across an outage | `VALIDATE GATES ON CLIENTHASH` |
 | `$client->disconnected` set in `_create` / `_onLinkState` doing anything | **INERT, MEASURED** 2026-09-26 — written only by Slimproto, read nowhere this player reaches | `DISCONNECTED IS SLIMPROTO-ONLY` |
 | `FakeCtl` in `t_player.pl` being a bare `bless {}` with no package, so any new method call on the control link kills 20+ load tests | **FIXED** 2026-09-25 — it is a real stub of `Control`'s accessors (`up`/`connected`/`proven`). Keep it in step when one is added | `FAKECTL IS A REAL STUB` |
+| `HQP_FREEWHEEL`, `freewheel` / `start` written on every `PlaylistAdd`, "an older HQPlayer may not know the attribute" | **MEASURED 2026-09-26** — HQPlayer Embedded **5.17.2 parses the same six `PlaylistAdd` attributes as 6.x**; the whole v5 -> v6 command delta is `GetJunkFilters`, `SetJunkFilter`, `LibraryGetHash` and the `filter_junk` status attribute | `The v5 / v6 control-API delta, measured from the daemons` |
+| "`freewheel` never appears in the user's HQPlayer log", freewheel not taking effect | **NOT A VERSION DIFFERENCE, MEASURED 2026-09-26** — the line is written by the HTTP stream reader ONLY, and Desktop writes no log at all unless the user ticks it | `the freewheel line comes from clStreamReaderHTTP, and Desktop logs nothing by default` |
+| `volume()`, `hqVolDb`, `hqVolSent`, a slider move made while the control link is DOWN | **FIXED** 2026-09-26 (round 2) — the level was recorded as sent, never arrived, and the first `<Status/>` after the reconnect pulled the slider back. Held in `hqVolPending` and re-asserted by `refreshInfo` | `A LEVEL SET WHILE THE LINK IS DOWN` |
+| `hqWanted` written across a send that a down link dropped (the same class as the volume bug) | **NOT A DEFECT** 2026-09-26 — checked, not guessed: the Status stream heals it at every reconnect | `hqWanted is healed by the Status stream` |
+| `hqrestart.py::main()`, a bare `--allow` with no config path | **FIXED** 2026-09-26 (round 2) — it fell through to serve mode and wrote a config file named `--allow` | `a bare --allow fell through to serve mode` |
+| `client forget` on a CONNECTED bridge player, `clientForgetCommand` returning without `setStatusDone()`, `_onForget` | **DISPROVEN 2026-09-26, MEASURED IN LMS SOURCE** — a REFUSED forget notifies nothing; the subscription cannot see it | `a REFUSED forget notifies nothing` |
+| `syncheck.pl` / the called-vs-defined sweep as cover for a NEW cross-module call | **MEASURED 2026-09-26 — IT IS NOT.** The sweep cannot see `$var->method`; only the suites guard those | `the sweep cannot see a method call on a variable` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -2777,6 +2784,124 @@ What it settles that had been open or wrong:
 * **Session authentication is Ed25519** with a Signalyst-issued per-client key
   (`SessionAuthentication`, then `secure_uri`/`secure_value` ChaCha20Poly1305).
   Not available to a third party and not needed — plain `uri` works.
+
+### The v5 / v6 control-API delta, measured from the daemons
+
+**2026-09-26. Simon asked whether HQPlayer 5 has `freewheel`, since `Player.pm`
+writes `freewheel="1"` on every `PlaylistAdd` and never asks the daemon what
+version it is. IT DOES: HQPlayer Embedded 5.17.2 parses the same six
+`PlaylistAdd` attributes 6.x does, so `HQP_FREEWHEEL => 1` is safe on a v5
+install and no version gate is needed.**
+
+The rig itself is v6, so none of this is testable live here —
+`<GetInfo/>` on 192.168.1.248 answers
+`engine="6.0.4" name="MacMini" platform="Mac" product="Signalyst HQPlayer Embedded" version="6"`,
+and discovery reports `Signalyst HQPlayer Embedded 6`.
+
+**The vendor source cannot answer a version question, and this is why.** Signalyst
+publish exactly ONE SDK drop — the downloads page says *"Source code for the
+control API implementation and command line utility is available here (re engine
+version 6.0.1)"*, which is the copy committed in `hqp-control-601-src/`. There is
+no v5-era drop anywhere, archived or live, and in the apt/rpm repo **only the
+newest build of each line is served**: every 5.x deb and rpm below 5.17.2 answers
+`403`, as does `hqplayerd-5.0.0`. So the two things that CAN be had are 5.17.2 and
+6.0.0 as binaries, plus one much older client source from the Wayback Machine.
+
+**That old client dates the attribute.** `hqp-control-4361-src.zip` (re engine
+4.36.1, captured 2020-12-30) has `playlistAdd(uri, queued, clear)` — no `start`,
+no `freewheel`, no metadata body — against the 6.0.1 client's
+`playlistAdd(uri, queued, clear, metadata, startStream, freeWheel)`. So the
+attribute arrived between 4.36.1 and 5.17.2. Signalyst's own release notes put
+freewheel MODE earlier still: *"Freewheel mode is now default on new
+installations"* (4 Desktop 4.19.3, 2022-09-01) and *"Freewheel mode is now
+supported also on local library"* (5 Desktop 5.8.2, 2024-10-21).
+
+**HOW THE BINARIES WERE READ — the trap first.** `hqplayerd` is a stripped,
+**non-PIE, large-code-model** ELF64: its strings live in `.rodata`/`.lrodata` and
+are reached by **32-bit absolute immediates**, NOT by rip-relative `lea` and not
+by `movabs`. A PIE-shaped xref scan finds zero references to every literal in the
+file and looks like a clean negative result — it was one, for two rounds. Scan
+`.text` for the literal's 4-byte little-endian address instead.
+
+Then the attribute names cluster by function, and that is what identifies the
+handler: in **both** builds one xref site for `freewheel` sits in a ~0x200 window
+that also references `uri`, `clear`, `queued`, `start`, `metadata`, `file://` and
+`http` — 5.17.2 at `0xdbb6a5`, 6.0.0 at `0xdc0ff9`. Both files hold 7 xrefs to
+the literal; the others are the UPnP renderer and the `upnp` config path
+(`upnp_freewheel` is the web-UI field, `HQPLAYER_STREAM_FREEWHEEL` the env var).
+
+**The delta, over all 69 commands the 6.0.1 client writes.** Present and
+code-referenced in 6.0.0, absent from 5.17.2:
+
+| new in v6 | what it is |
+|---|---|
+| `GetJunkFilters`, `SetJunkFilter` | the v6 announcement's *"new set of source content cleanup filters"* |
+| `LibraryGetHash` | library hash |
+| `filter_junk` (status attribute) | the same feature, reported on the push |
+
+**Everything else is identical, including every field the bridge touches**:
+`freewheel`, `start`, `queued`, `clear`, `uri`, `metadata`, `subscribe`, `last`,
+`track_serial`, `album_gain`/`track_gain`, `input_fill`/`output_fill`/`process_speed`,
+`active_filter`/`active_shaper`/`active_rate`/`active_bits`/`active_channels`,
+`correction`, `adaptive`/`enabled` on `<VolumeRange/>`, and `secure_uri`/`secure_value`
+for the Ed25519 session auth. One loose end, NOT a v5 regression: `LibraryLoad` has
+no literal in either binary although the client writes it, so the daemon reaches it by
+some other route.
+
+**What this does NOT establish.** 5.17.2 is the only v5 obtainable, so 5.0-5.16 are
+untested and the attribute could have arrived anywhere in that range — a user on an
+early 5.x is unproven, not proven broken. And a cluster of literals in one code window
+is a strong argument, not a read of the handler: it says the `PlaylistAdd` parser
+references `freewheel`, not what it does with the value. Neither gap is worth a live
+test until someone actually reports a v5 install, and the answer to Simon's question
+does not turn on either.
+
+**DESKTOP 5.17.2 KNOWS THE ATTRIBUTE TOO, and this is the build users actually
+run.** `HQPlayer5Desktop-arm64-5172.dmg` downloads straight from
+`signalyst.com/bins/` (no form). Its executable is Mach-O arm64, 8 MB, and its
+literal table is in SOURCE ORDER rather than linker-scrambled, so the control
+command list reads straight off it: `PlaylistAdd`, `secure_uri`, `clear`,
+`queued`, **`freewheel`**, `PlaylistRemove`, `index`, `PlaylistMoveUp`… So a
+Desktop 5 user is in the same position as an Embedded one.
+
+### `the freewheel line comes from clStreamReaderHTTP, and Desktop logs nothing by default`
+
+**2026-09-26, field reports that users do not see freewheel in their HQPlayer
+logs. That is not a version or API difference — it is WHERE the message is
+written and WHETHER a log exists.**
+
+* **The message belongs to ONE reader class.** `Stream reader freewheel mode `
+  (+ `enabled` / `disabled`) has exactly one xref in each daemon, and the code
+  window around it holds `HQPLAYER_STREAM_FREEWHEEL` twice and
+  `clStreamReaderHTTP::StartNL(): ` — 5.17.2 at `0xf14a65`, 6.0.0 at `0xf22ab5`,
+  identical. There is a separate `clStreamReaderFile`, which logs no such line,
+  so **anything played from HQPlayer's own library or a local path says nothing
+  about freewheel at all.** Every bridge tier is an `http://` URL, so the bridge's
+  own playback is always the HTTP reader.
+* **Desktop writes no log unless the user turns it on.** Its strings are
+  `Log file is not enabled.`, `Is logging enabled in settings?`, `checkBoxLogFile`
+  and `HQPlayer5Desktop.log` — a settings checkbox, off by default. Embedded is
+  the opposite: `:8088/log` always exists.
+* **So the useful ask is a measurement, not a guess:** have the user enable the
+  log file, play ONE track through the bridge, and grep `Stream reader freewheel
+  mode`. Absent = they are not on the HTTP reader (or the log is off);
+  `disabled` while the bridge sent `freewheel="1"` IS a real finding and the
+  first evidence that the attribute is not honoured — note that HQPlayer already
+  turns it off ITSELF for a live stream (see `Stream reader freewheel mode
+  disabled` in 0.2.74's BBC case), so judge it on a normal file-backed track.
+* **What is still unmeasured:** whether the per-item attribute reaches that
+  reader at all, in either version. The env var is read right beside the message;
+  the attribute's path there cannot be seen from literals. The one piece of live
+  evidence that it is not env-only is that the rig logs `enabled` for file-backed
+  tiers and `disabled` for the BBC stream in the same session, with no env var set.
+
+**The material is kept** in `/Users/simona/Documents/HQPlayer-API-refs/` (~940 MB,
+deliberately outside `~/Documents/GitHub`): both rpms, both extracted daemons, the
+4.36.1 client source, the 2022 `hqp-control2` deb, and `tools/` with the xref
+scripts (`cmds.py` for the command sweep, `ctx.py` for a literal's neighbourhood)
+plus its own README. Re-running the sweep takes seconds; re-downloading a 5.x does
+not work at all any more.
+
 
 ## Gapless
 
@@ -5975,6 +6100,136 @@ Gate hits dropped without report, per the index: `reconnectNow` bypassing the cl
 backoff, `_onLinkState` not calling `playerInactive`, `playerActive` as a no-op on a
 reconnect, the address-qualified corpse held to `INSTANCE_TTL`, the helper's Windows
 removal, and the version / zip / `repo.xml` state.
+
+## REVIEW 2026-09-26 (round 2, origin/dev..HEAD, 10 commits): both findings fixed
+
+Scope: the 10 unpushed commits plus the tree. The round BEFORE this one covered the same range
+minus `96ac1e5`; its cleared-on-evidence list was re-derived rather than trusted, and it held.
+Two findings, both fixed here, both pinned.
+
+**BUILT 1.0.25 (2026-09-26), Simon's call to bump.** Unlike 1.0.24 this build DOES change the
+plugin code - `Player.pm`, `Control.pm` and `Plugin.pm` all carry the volume fix - so the bump is
+what lets LMS reinstall it at all. `install.xml` and `repo.xml` both at 1.0.25, `<sha>` redone
+(`1c31d91b...`), zip manifest checked against the source tree and the three modules inside it
+diffed against the working copies. The dev `<url>` is untouched. `CHANGELOG.md`, `README.md` and
+`README.html` deliberately left behind - they are merge-to-main artifacts. **Not installed on the
+rig yet, and not pushed.** The helper fix still needs `tools/hqrestart/install.sh` re-run on the
+HQPlayer host; it does not travel in the zip.
+
+### A LEVEL SET WHILE THE LINK IS DOWN - FIXED (`Player::volume`)
+
+**The knock-on 1.0.22 left behind, on the one carrier the previous round did not walk.** That
+round audited the callback-bearing sends after `Control::send` stopped connecting on demand;
+`<Volume>` carries no callback, so it was not in the sweep.
+
+`volume()` wrote `hqVolDb`/`hqVolSent` and then called `_send`. Since 1.0.22 `send` REFUSES a
+command on a down link (it no longer connects to push one through), so the level never left -
+but the player now believed it had. Two things followed, and the second is the one the user sees:
+
+1. `refreshInfo` re-asserts `VolumeRange`, `SetRepeat`, `GetInfo`, `GetTransport` and `Status`
+   on a new link and **never the level**, so the first `<Status/>` after the reconnect carried
+   HQPlayer's OLD volume. That no longer matched LMS's stored volume, so `_followVolume` did
+   exactly what it is built to do and ran `mixer volume` - **dragging the user's change back**.
+2. `hqVolSent` armed `_learnFromClamp` against a reply to a command that was never sent. A
+   reconnect inside `CLAMP_WINDOW` (3s) with the held level at the floor reads HQPlayer's own
+   level as a clamped reply and **collapses the range**. Reachable, and now pinned shut.
+
+**Fix.** `Control::send` returns 1 when the command reached the queue and 0 when it was refused
+(its return was unused everywhere - checked before changing it), `Player::_send` passes that
+through, and `volume()` acts on the answer: on a refusal the level is parked in `hqVolPending`
+and **nothing is recorded as sent**. `refreshInfo` asserts it FIRST on the next link, ahead of
+the `<Status/>` subscribe, or the push answering that subscribe would undo it again.
+
+**The hold is released by PROOF, not by the send** (`Plugin::_onLinkProven` -> `volumeAsserted`).
+hqplayerd accepts a socket it is about to drop - an expired licence does exactly this - and a
+command queued on that socket dies with it. Because the re-assert is first on a stream that is
+ordered and one command deep, ANY reply on that link means it was written and consumed. An
+accept-then-drop therefore keeps the hold and the next link asserts it again.
+
+**What the fix deliberately does NOT do:** it never asserts a level of its own. Only a level LMS
+asked for and lost is replayed, so a knob turned on the endpoint during the outage is still
+FOLLOWED - the rule `_followVolume` settled on in 2026-08-30 when the re-registration guard was
+removed for second-guessing the person holding the remote. Pinned as its own assertion.
+
+Both early returns in `volume()` drop the hold: the anti-snap return (the slider has come back to
+where HQPlayer already is) and the fixed-volume return (the level is not ours to send).
+
+**Pinned in `t_player.pl` (469 passed, was 445+2).** The discriminator is an end-to-end test that
+models HQPlayer rather than the plugin - its level is whatever the last `<Volume>` on the wire set
+it to - so it names no new accessor and **runs against the pre-fix build**. It does, and it FAILS
+there, twice, with exactly the reported symptom:
+
+    FAIL the reconnect carries the level the user asked for    got: -50  want: -30
+    FAIL so the first push agrees with LMS and moves nothing    got: 1    want: 0
+
+The mechanism tests above it (the hold, the clamp misfire, the accept-then-drop, the release on
+proof) are guards; that pair is the control.
+
+**`_send`'s stub had to change with it.** `t_player.pl`'s `_send` returned nothing, so once
+`volume()` read the return every send looked refused and two long-standing assertions failed. The
+stub now carries the real contract behind an `our $linkUp`, which is what the down-link tests
+flip. Same lesson as `FAKECTL IS A REAL STUB`: a stub that does not model the contract tests a
+send that always succeeds.
+
+### a bare --allow fell through to serve mode - FIXED (`hqrestart.py::main`)
+
+`main()` matched the installers' entry point on `len(sys.argv) > 2`, so `--allow` with no config
+path fell THROUGH to serve mode with `sys.argv[1]` as the path: it created a config file
+**literally named `--allow`**, minted a token into it, and went on to bind 8090. Verified by
+running it. It now matches on the flag and exits 2 with a usage line, touching nothing.
+
+Pinned in `t_hqrestart.py` (**162 passed**, was 155): the exit code, the usage text, that no file
+named `--allow` appears, that the directory is unchanged, and three CONTROLS that the installers'
+real calls (write, read-back, bad address) still work on the same path.
+
+### Checked and cleared on evidence - the carrier sweep
+
+The volume bug is one instance of a class: **state written as though a send had happened, across
+a send that 1.0.22 now drops.** Every `_send` call site in `Player.pm` was walked for it.
+
+- **`hqWanted` (`pause`/`resume`/`stop`) - NOT A DEFECT.** It is written unconditionally after a
+  send that may have been refused, which looks identical to the volume bug, and it also gates a
+  suppression (`_send('<Pause/>') unless hqWanted eq 'pause'`) that a stale value could wedge.
+  It is healed: `_onStatus`'s HQP_PLAYING branch moves it to `play` when it reads `pause`, the
+  HQP_PAUSED branch moves it to `pause` when it reads `play`, and `play()` sets it outright.
+  `_startPolling` subscribes on every link-up, so the heal runs at every reconnect - which is
+  precisely what volume lacked. **The difference is the re-assert, not the write.**
+- **The load path (`_queueTrack`, `PlaylistClear`, `Stop`, `PlaylistAdd`, `Play`) - already
+  gated.** 1.0.22 added the guard that fails a load ONCE when the link is down.
+- **`hqSeekOffset` (`<Seek>`) - not live.** It sits inside the `<Play/>` reply callback, so the
+  link was up one turn earlier; a drop in that window tears the track down anyway and LMS
+  reloads.
+- **`stop()`'s `hqExpectStop`/`hqStarted`/`hqPlayAck`/`bufferReady`** survive a dropped `<Stop/>`
+  harmlessly: the reconnect reads STOPPED, `hqExpectStop` makes that our own stop, and the
+  playlist is not advanced.
+
+### a REFUSED forget notifies nothing - DISPROVEN, DO NOT RE-DERIVE
+
+The plugin's own comment on `forgetClient` makes this belief almost irresistible, so a review
+re-derives it from scratch every round: *the new `client forget` subscription must defeat LMS's
+own refusal, because `clientForgetCommand` returns early without calling `setStatusDone()`.*
+
+**It does not.** `Request::executeDone` pops the request back off `@notificationQueue` when
+`!isStatusDone()`, so a refused forget notifies nothing and `_onForget` never runs. Measured in
+the LMS source, not reasoned from the plugin: `Slim/Control/Request.pm:1892` and
+`Slim/Control/Commands.pm:355`. Re-raise only by disproving those two lines.
+
+### the sweep cannot see a method call on a variable - MEASURED
+
+`run_checks.sh`'s called-vs-defined sweep is quoted as the thing `perl -c` misses, and it is easy
+to read it as cover for a new cross-module call. It is not. A deliberate typo in
+`$client->volumeAsserted` (Plugin.pm) and in `sub volumeAsserted` (Player.pm) was introduced in a
+scratch copy: **`syncheck.pl` reported `OK` for all three modules both times.** It resolves
+package-qualified calls, not `$var->method`.
+
+What actually guards a call like this is the pair of suites, and both were checked to die on the
+typo: `t_plugin.pl` at `_onLinkProven` (its `FakeClient` has no AUTOLOAD, so a wrong name is fatal)
+and `t_player.pl` where the method is called on a real Player. Adding a cross-module call means
+adding the stub AND exercising it - the sweep will not tell you.
+
+**Suite: 1,168 assertions, all green** - `t_control.pl` 94, `t_player.pl` 469, `t_stream.pl` 64,
+`t_plugin.pl` 190, `t_live_page.js` 159 + 17 executed, `t_hqrestart.py` 162, `t_installers.py` 13,
+`perl -c` on every module, sweep clean.
 
 ## 1.0.14 (2026-09-21): docs only - a stale-reference pass
 

@@ -923,7 +923,16 @@ def set_allow(path, raw=None):
 def main():
     # `--allow <config> [addresses]` is the installers' entry point, not a way
     # to run the helper: it reads or writes one key and exits.
-    if len(sys.argv) > 2 and sys.argv[1] == '--allow':
+    #
+    # Matched on the FLAG, not on the argument count. `--allow` with no config
+    # path used to fall through to serve mode, where sys.argv[1] became the
+    # config path: it wrote a file literally named `--allow`, minted a token
+    # into it, and bound the port. Say what is missing instead.
+    if len(sys.argv) > 1 and sys.argv[1] == '--allow':
+        if len(sys.argv) < 3:
+            sys.stderr.write('usage: %s --allow <config> [addresses]\n'
+                             % os.path.basename(sys.argv[0]))
+            return 2
         try:
             got = set_allow(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
         except (ValueError, OSError) as e:
