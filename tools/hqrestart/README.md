@@ -26,6 +26,23 @@ pins one, otherwise from the last launch it saw.
 service, and all of Linux - is written and covered by automated tests, but has not
 been run on a real machine yet. See [Tested](#tested).
 
+## Requirements
+
+**Python 3.7 or later** (3.7 for `ThreadingHTTPServer`), standard library only - nothing to
+`pip install`. **The installer does not install Python**: if `python3` is missing it exits 1 with
+`python3 not found - install Python 3.7 or newer first` and changes nothing.
+
+**macOS: Apple's own prompt, not ours.** macOS ships no Python; `/usr/bin/python3` is a stub
+hard-linked to the same binary as `/usr/bin/git` and `/usr/bin/clang`. The first time anything
+invokes it - here, the installer's version check - macOS offers to install the **Command Line
+Tools**, which is where its Python 3.9 comes from. Accept it, or click *Not Now* and install
+Python yourself (python.org installer, or Homebrew) before re-running `./install.sh`. The helper
+only needs some `python3` >= 3.7 on `PATH`.
+
+**Linux: nothing is offered and nothing is installed.** Python 3 is already present on
+essentially every distribution; if not, install it with the package manager. There is no
+equivalent of Apple's prompt, so no toolchain is ever pulled in implicitly.
+
 ## Install
 
 Install it the same way HQPlayer runs. For a system service the webhook needs root. For

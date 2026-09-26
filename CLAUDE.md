@@ -91,6 +91,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `syncheck.pl` / the called-vs-defined sweep as cover for a NEW cross-module call | **MEASURED 2026-09-26 — IT IS NOT.** The sweep cannot see `$var->method`; only the suites guard those | `the sweep cannot see a method call on a variable` |
 | `%BENIGN`, `_dispatch`'s `$msg`, a benign `<Volume>` error logged at WARN | **FIXED** 2026-09-26 (round 2) — `/>([^<]*)</` matched the empty string after the XML declaration, so `%BENIGN` never fired and never had a test | `%BENIGN` never fired` |
 | `volume()` reading `Control::send`'s **1** as delivery; a level set during a reconnect HANDSHAKE (`up` = `sock \|\| connecting`); `volumeAsserted` releasing the hold on any first reply | **FIXED** 2026-09-26 (round 3) — `send` answers 1 for a command it has only QUEUED, and a failed connect drains that queue; `<Volume>` had no callback, so the hold was released and the level recorded as applied. Released by the command's OWN reply now (`_volumeDelivered`) | `THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1` |
+| the helper's installer "installing Python" on macOS; treating Apple's Command Line Tools prompt as something `install.sh` does | **MEASURED 2026-09-26 — IT IS APPLE'S PROMPT, NOT OURS.** `install.sh` never installs anything: no `python3` means exit 1 and an untouched system. macOS ships no Python; `/usr/bin/python3` is a STUB sharing one inode with `/usr/bin/git` and `/usr/bin/clang`, and invoking it is what makes macOS offer the Command Line Tools. Linux has no equivalent | `THE PYTHON PROMPT IS APPLE'S, NOT THE INSTALLER'S` |
 | the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
 | the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone | `THE IDLE DIVERGENCE IS BY DESIGN` |
 | the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands | `An endpoint re-registering announces its own level` |
@@ -128,7 +129,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `install.sh --allow` / `install.ps1 -Allow` (via `hqrestart.py --allow`, `set_allow`) REPLACE the whole `allow` list rather than append, so following the helper's refusal hint (`./install.sh --allow <ip>`) drops any second Lyrion server already listed | **BY DESIGN** 2026-09-23, Simon's call | **ONE LYRION SERVER PER HQPLAYER.** Only one Lyrion server should be talking to an HQPlayer, so `allow` naming the one current server is the intended state; replace is correct and append would be the bug. Raised as a minor aside in the 2026-09-23 review of 5775983..6ee1185 and declined there. Do not re-report. |
 | The restart helper should support Windows (`install.ps1`, a scheduled task, `Restart-Service` / `taskkill` / `tasklist`, SID owner checks) | **REMOVED** 2026-09-25, Simon's call | **WINDOWS SUPPORT REMOVED.** Simon: *"remove all support for windows on the helper its causing too many problems."* It had never run on a real Windows install - only in a harness - and in the 2026-09-25 review 4 of 9 findings were Windows installer defects, after four earlier rounds of the same. Deleted: `install.ps1`, `tools/t_powershell.py`, the install.ps1 half of `t_installers.py`, the Windows cases in `t_hqrestart.py`, and every `win32` branch in `hqrestart.py` (`detect_win32`, `win32_owner_sids`, `powershell()`, the tasklist/taskkill paths, `creationflags`, the `pythonw` stderr-to-file fallback). `main()` now exits 2 with "hqrestart runs on macOS and Linux only" on any other OS, before a config or token is written (pinned in `t_hqrestart.py`, fails 2 against the old helper). The plugin side never had Windows code - the Restart row only calls `/ping` and `/restart`. The historical rounds below that discuss Windows are kept as history, not live guidance. |
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
-| Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayer-verify-playback-not-state]]. |
+| Tier 3 (transcoded local files) is verified working - `state=2`, `process_speed` 3.298, `input_fill` 0.73, position advancing | **WRONG** 2026-08-28, corrected same day | The audio was GARBLED for every build tier 3 shipped in. HQPlayer's decoder was throwing `ReadFLACErrorCB(): lost sync` / `CRC error` on every frame because LMS serves a transcode `Transfer-Encoding: chunked` and HQPlayer does not de-chunk. **None of the numbers above can see that** - the DSP runs at full speed on whatever it decodes. Nor does downloading the file prove anything: curl de-chunks silently, so the copy is a perfect FLAC (0.9998 envelope correlation vs the original m4a). Judge playback by hqplayerd's log at `:8088/log`, never by the control API. See [[hqplayerd-health]]. |
 | A bare `<Status/>` is not a subscribe - the vendor's client always writes the attribute, so a missing one reads as `subscribe="0"`, no pushes ever arrive, the clock freezes and LMS is stranded in `play` (`Player.pm` `_startPolling` / `_statusWatchdog`) | **DECLINED** 2026-08-28 | Measured A/B against engine 6.0.4 on one connection each, 6s: bare `<Status/>` -> **2** pushes, `subscribe="1"` -> **2**, `subscribe="0"` -> **1**. Bare is equivalent to `subscribe="1"`; the "missing attribute reads as 0" step was flagged as unproven by the reporter and is the step that is false. The log pattern has a different cause: **HQPlayer stops pushing when it is not playing**. Watchdog firings during the healthy sweep 16:21-16:27 = **0**; continuous from 16:29:36, right after a pause at 16:29:06. Sending `subscribe="1"` explicitly is harmless and slightly clearer, but fixes nothing. THE REPORT'S SYMPTOM IS REAL WITH ANOTHER CAUSE - see the row below. |
 | LMS can be stranded in `mode=play` with a frozen clock, leaving the Eversolo screen on for ever | **ACCEPTED 2026-08-28, FIXED in 0.2.50** | `_endOfStream` opens `return unless $self->hqStarted`, and `hqStarted` is only set when HQPlayer REPORTS playing. So a `Play` that is acked but never becomes playback tells LMS nothing, for ever. That is the state every tier 4 bug fixed in 0.2.27 produced; the causes are gone but the gap is not. Fix: a start timeout - if HQPlayer has not reported playing ~10s after the Play ack, report the load as failed. Would have surfaced the 0.2.24-0.2.27 bugs in seconds. Note the screen plugin already has its own net (`_reconcile` spots a non-advancing clock and asks the device); it failed here only because the Eversolo was unreachable at that moment. **Built as specified**: `START_DEADLINE` (10s) armed where the Play ack sets `hqPlayAck`, cancelled at the `hqStarted` latch, in `stop()` and in `_newGeneration`; on expiry it reports `playerStreamingFailed('PROBLEM_OPENING')` once. Three things it deliberately does NOT fail: a load superseded by a newer one (generation check), a track paused inside the window (LMS can pause a track that has not started, and HQPlayer then correctly never reports playing), and one that started (belt-and-braces `hqStarted` guard on top of the cancel). |
 | `<Volume>` answers `result="Error"` — the command is wrong or unsupported | **DECLINED** 2026-08-27 | The level is applied regardless. With an **empty playlist** every `<Volume>` returns `result="Error"` carrying `clPlaylist::GetAlbumGain(): trackn > last`, which is HQPlayer recomputing replaygain over a playlist with no tracks. Verified against the live daemon: `GetVolumeDB` confirms the new level to 1/256 dB. `Control.pm`'s `%BENIGN` was written to log it at debug - **and did not, from 2026-08-27 until 2026-09-26.** `_dispatch` pulled the message with `/>([^<]*)</`, and since every reply carries the XML declaration that `*` matched the EMPTY string between `?>` and `<Volume`: `$msg` came back `""` for EVERY error on the wire, so the `%BENIGN` lookup could never match and the raw frame was logged at **warn** in its place. Nothing tested it. Found live 2026-09-26 off a real reconnect; `*` -> `+` and pinned. |
@@ -203,6 +204,35 @@ then plays it.
 | `tools/` | Stub LMS tree + checks, runnable without an LMS install |
 | `tools/hqrestart/` | The OPTIONAL restart helper (`hqrestart.py`, `install.sh`, its own README). Runs on the HQPlayer host - macOS or Linux only, Windows REMOVED 2026-09-25; NOT in the zip. Build history: `## 1.0.10-1.0.13`; the install-time `allow` prompt, `hqrestart.py --allow` and rounds 26-27: `## HELPER 2026-09-23` |
 
+### THE PYTHON PROMPT IS APPLE'S, NOT THE INSTALLER'S
+
+Simon hit a prompt offering to install Python while installing the helper, and asked whether Linux
+does the same. **It is macOS, and only macOS.**
+
+`tools/hqrestart/install.sh` does not install anything. It is
+`PY="$(command -v python3 || true)"` and then, if that is empty, `python3 not found - install
+Python 3.7 or newer first` and **exit 1** - nothing written, nothing changed. The 3.7 floor is
+`ThreadingHTTPServer`.
+
+What produces the prompt: **macOS ships no Python of its own.** `/usr/bin/python3` is one of
+Apple's `xcrun` stubs - measured on this Mac, `/usr/bin/python3`, `/usr/bin/git` and
+`/usr/bin/clang` all report **the same inode** (`1152921500312571562`, link count 78, a 118 KB
+binary), and the real interpreter is
+`/Library/Developer/CommandLineTools/usr/bin/python3` -> Python **3.9.6**. So `command -v python3`
+SUCCEEDS even with no Python installed, and the installer's version check then executes the stub,
+which is what makes macOS offer the Command Line Tools. Accepting installs CLT (and its 3.9);
+declining leaves the user to install Python themselves, which also works - any `python3` >= 3.7 on
+`PATH` will do.
+
+**Linux: no stub, no prompt, no implicit install.** `command -v python3` simply fails and the
+installer refuses with the message above. Python 3 is present on essentially every distribution
+anyway. A distro `command-not-found` hook may SUGGEST a package, but it is not reached here
+(`command -v` does not trigger it) and it never installs.
+
+Documented for users in `README.md` (**What the helper needs**) and
+`tools/hqrestart/README.md` (**Requirements**), both of which state that the installer never
+installs Python and that the macOS dialog is Apple's, with the decline-and-install-yourself route.
+
 ## Branches and releasing
 
 Work happens on **`dev`**. `main` is the release branch, and the two differ only
@@ -235,6 +265,13 @@ build updates `CLAUDE.md`, `docs/*.md` and the memory notes only — a CHANGELOG
 whose newest entry is several versions behind `install.xml` is CORRECT on `dev`,
 not a defect.
 
+**EXCEPTION, 2026-09-26, Simon's instruction ("we can update readme now"):**
+`README.md`, `README.html` and `tools/hqrestart/README.md` were refreshed ON DEV
+at 1.0.28 — the Volume section (a restart no longer moves the slider) and a new
+**What the helper needs** section on Python. So at the next merge the README is
+already current for 1.0.28; check it rather than assuming it is behind.
+`CHANGELOG.md` is still untouched and still correct at 1.0.2.
+
 **What the merge writes.** One new CHANGELOG entry, headed with the version being
 released, listing **every change since the last commit on `main`** — not just
 those from the final dev build. A release usually spans many dev versions, and
@@ -244,14 +281,6 @@ range:
 ```
 git -C /Users/simona/Documents/GitHub/LMS-HQPlayer-Bridge log main..dev --oneline
 ```
-
-**CARRY THIS ONE INTO THE NEXT MERGE:** `README.md`'s Volume section says *"The
-level you start with is **HQPlayer's own**, not one the plugin asserts."* That was
-true up to 1.0.27 and is **false from 1.0.28** — HQPlayer's startup level is no
-longer followed, and LMS re-asserts its own level at the first play (see
-`HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER`). The rest of that
-section still stands, including HQPlayer's fixed volume being a startup level
-rather than a lock. Not edited on a dev build, by the rule above.
 
 Group the result by what a user would notice (new features, fixes, behaviour
 changes), not commit by commit — intermediate dead ends and their reverts cancel
@@ -1011,7 +1040,7 @@ wrong.** Simon said twice that the levels are visible in the desktop client's
 meters and therefore available; the sweep that "disproved" it only ever looked
 for an XML command name on 4321. **The metering channel is a SECOND SOCKET
 carrying PACKED BINARY, so no command sweep could ever have found it** —
-[[exhaust-the-api-reference]], read the client's classes, not just its verbs.
+[[hqplayer-protocol]], read the client's classes, not just its verbs.
 
 `clMeterInterface` in Signalyst's own `ControlInterface.cpp`:
 
@@ -3936,7 +3965,7 @@ identical to 0.2.60. Its own condition names the escape hatch: it skips hrefs
 starting with `#`. Material's `openWebLink` splits the same way - a RELATIVE
 weblink goes to the iframe dialog, an absolute `http://` one to `window.open`.
 An absolute URL is not available to us: `IPDetect::IP()` answers `127.0.0.1` on
-this server ([[lms-server-ip-is-loopback]]).
+this server ([[lms-test-rig]]).
 
 **VERIFIED WORKING by Simon on 0.2.61**, opened directly at
 `http://plex:9000/hqplive`: *"it refreshes as I loaded the page works well"*.
@@ -4104,7 +4133,7 @@ and `SetFilter` carries TWO values, because HQPlayer keeps separate filters for
 **The live lists are UNPROBED.** Confirming what Simon's daemon actually offers
 needs `GetModes`/`GetFilters`/`GetShapers`/`ConfigurationList` on 4321, and a
 bare read-only probe once preceded a control-thread wedge - so it must not be
-run while he is listening. See [[hqplayerd-control-thread-wedge]].
+run while he is listening. See [[hqplayerd-health]].
 
 ## 0.2.67 (2026-09-06): the Home tile opens INLINE
 
@@ -4649,7 +4678,7 @@ Shipped as a strong hypothesis that could not be proven from the logs - Material
 CometD connection can also drop on its own, so the plan was to watch for a
 recurrence with the live page CLOSED. **Simon confirmed the fix worked**, so the
 starvation was the cause. The rule generalises beyond this repo and is recorded
-in memory as [[plugin-page-shares-material-connection-pool]]: a plugin's own
+in memory as [[material-settings-page]]: a plugin's own
 polling page runs in Material's connection pool - and a Home tile makes it an
 IFRAME INSIDE Material - so an unguarded poller starves the subscription its Now
 Playing runs on.
@@ -5745,7 +5774,7 @@ The Apps feed gains a **Restart *name*** row per HQPlayer whose host runs `tools
 
 **REVIEW ROUND 23 (2026-09-21, /code-review over the 24 unpushed commits), 2 findings, both VERIFIED then FIXED, helper only.** (1) **My round-22 fix stopped at the POSIX platforms:** `same_owner` returned True on Windows, so a `-System` (SYSTEM) helper against a user's desktop HQPlayer still stopped it and started it again as SYSTEM - session 0, no window, SYSTEM's profile instead of the user's saved settings - and the Bridge said "restarted". Now `win32_owner_sids` asks PowerShell for the process's `GetOwnerSid` and this helper's own SID (`WindowsIdentity::GetCurrent()`), and a mismatch refuses before the stop; anything unreadable is not a refusal. The PowerShell text is checked by eye only (no PowerShell on the Mac): Windows remains HARNESS-ONLY. (2) **Not running + never restarted = cannot start, whatever the config pins:** the not-running path read only the state file, which is written only by a restart that FOUND HQPlayer running, and its error told the user to set `mode`/`service`/`start_command` - which changed nothing. Now `pinned_how(cfg)` builds the recipe from a pinned `service` (not with mode `app`) or `start_command` (not with mode `service`) FIRST, as `detect()` already lets pins win, then falls back to the saved state; the error now names only what works (`service` or `start_command`). Reachable from the token bookmark (`GET /restart`) more than from the Bridge. `launchd_domain()` factored out so both paths build the same macOS target. 8 assertions added (111 Python), incl. controls (same SID restarts, unreadable owner restarts, a saved recipe still starts it with nothing pinned); 5 FAIL against round 22. README: "can also start HQPlayer when it is not running" now says from what.
 
-**PowerShell is now PARSED, not just read (2026-09-21, after round 23).** Simon installed `pwsh` 7.6.6 on the Mac. `tools/t_powershell.py` (in `run_checks.sh`) captures every command `hqrestart.py` builds - by calling the real functions with `run` stubbed - and parses them and `install.ps1` with `pwsh`'s own parser: 18 checks, all pass. **Mutation-checked:** with the `'` -> `''` escaping removed from `restart_service` and `start_argv`, both fail ("The string is missing the terminator"). **The first cut missed one of the two:** its sample path held TWO quotes (`O'Brien's`), which pair up into `'...O' Brien 's...'` - a string, a bareword, a string - and PARSE; a single quote cannot. Also fixed: the helper's docstring said Windows uses `Stop-Process`; it uses `taskkill`. **What this does NOT prove:** that any of it WORKS on Windows - macOS pwsh has no `Get-CimInstance`, `Win32_Process` or `Restart-Service`. Windows stays harness-only for behaviour; it is no longer eye-only for syntax.
+**PowerShell is now PARSED, not just read (2026-09-21, after round 23) - SUPERSEDED: `install.ps1` and `tools/t_powershell.py` were DELETED 2026-09-25, see `WINDOWS SUPPORT REMOVED`. History only.** Simon installed `pwsh` 7.6.6 on the Mac. `tools/t_powershell.py` (in `run_checks.sh`) captures every command `hqrestart.py` builds - by calling the real functions with `run` stubbed - and parses them and `install.ps1` with `pwsh`'s own parser: 18 checks, all pass. **Mutation-checked:** with the `'` -> `''` escaping removed from `restart_service` and `start_argv`, both fail ("The string is missing the terminator"). **The first cut missed one of the two:** its sample path held TWO quotes (`O'Brien's`), which pair up into `'...O' Brien 's...'` - a string, a bareword, a string - and PARSE; a single quote cannot. Also fixed: the helper's docstring said Windows uses `Stop-Process`; it uses `taskkill`. **What this does NOT prove:** that any of it WORKS on Windows - macOS pwsh has no `Get-CimInstance`, `Win32_Process` or `Restart-Service`. Windows stays harness-only for behaviour; it is no longer eye-only for syntax.
 
 **REVIEW ROUND 24 (2026-09-21, /code-review over the 25 unpushed commits), 2 findings, both VERIFIED then FIXED, helper only.** (1) **Nothing checked the forced kill WORKED, so a restart could start a SECOND HQPlayer.** `stop_app` sent `taskkill /F` / SIGKILL, slept 1s and returned, and `restart()` then started a new copy regardless. Windows reaches it outright: `taskkill /F` answers Access denied for an elevated HQPlayer, and the owner check does not refuse an owner it cannot read. Windows had a second route: `alive()` read a FAILED `tasklist` (rc 127, empty output since round 20) as "gone". POSIX reaches it only via a process stuck in the kernel. Two copies both want port 4321. Now `stop_app` polls for up to `KILL_WAIT` (3s) after the kill and, if the process is still there, raises "HQPlayer (pid N) would not stop, so it was left running rather than started a second time"; a failed `tasklist` reads as ALIVE. `may_signal`'s comment ("taskkill reports its own failure") was the defect in prose - nothing read that report - and now says where it is checked. (2) **Pinning `service` switched off the user/system detection:** `detect_linux` only read the cgroup inside `if not unit:`, so a pinned user unit with `user_service` unset got a system `systemctl restart` ("Unit not found" every time; fails closed). The cgroup is now read regardless, and `/user@` decides `user` whenever `user_service` is unset; an explicit `user_service` still wins. The not-running path (`pinned_how`) has no process to read, so the README row now says to set `user_service` for a user unit. 8 assertions (119 Python), incl. controls (a stop that worked returns; an explicit `user_service` wins); 4 FAIL against round 23. `REAL_STOP_APP` pinned in the suite: `setup()` stubs `stop_app` and never restores it - the round-8 leak class again, caught before it bit this time.
 
@@ -5858,7 +5887,8 @@ control run. Every check in that section is a lambda now.
 
 **Windows remains harness-only for behaviour.** `install.ps1` parses under `pwsh` and uses no
 PowerShell-7-only syntax (both asserted), and it now calls the same validator, but nothing here
-has run it on Windows.
+has run it on Windows. **SUPERSEDED 2026-09-25: Windows support and both files are DELETED - see
+`WINDOWS SUPPORT REMOVED`. There is no `install.ps1` and no `t_powershell.py` in the tree.**
 
 **REVIEW ROUND 26 (2026-09-23, /code-review over the uncommitted helper change), 6 findings, all VERIFIED then FIXED. Four of them are ONE mistake, and it is the mistake this change made possible.** Writing `allow` at install time means **the config file now exists BEFORE the helper has ever run** - and both installers still used the file's EXISTENCE as the proxy for "the token has been generated". (1) `install.sh`'s `while [ ! -s "$CONF" ]` returned at once, so a first install printed `token:` with nothing after it and `curl -H 'Authorization: Bearer '` - reproduced exactly. It now waits for the TOKEN, and says plainly when there is not one yet instead of printing an empty line and a broken command. (2) `install.ps1` had the same wait on `Test-Path $cfg` with the same result, so **every good first install ended on the "has not written its config yet / check Python is on PATH" warning**. (3) The "not set" hint printed `$0 --allow <ip>` with no `--system`/`sudo`: following it on a system install writes a config in the OTHER location, which that helper never reads, and starts a second helper that dies on EADDRINUSE. Both installers now echo back the way they were invoked. (4) `install.ps1` had no non-interactive guard where `install.sh` has `[ -t 0 ]` - and **`Read-Host` THROWS under `-NonInteractive`** (measured), *after* line 21 has already unregistered the scheduled task, so a provisioning run would be left with no helper at all. Now caught, and it says it is skipping. (5) The refusal advice hard-coded `install.sh --allow`, telling a Windows user to run a script they do not have; it reads `PLATFORM` now and names the service flag too. (6) `Handler.SAID` was never pruned - the throttle bounds the LOG, as its comment said, but nothing bounded the MAP, so one entry per distinct address accumulated for ever on a host anything scans. Entries older than the throttle have nothing left to suppress and are dropped.
 

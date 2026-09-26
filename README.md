@@ -27,7 +27,7 @@ Tested on LMS 9.x against **HQPlayer Embedded 6** feeding an NAA endpoint.
 | **Pause from either end** | Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second | Nothing |
 | **Stable player identity** | Prefs, playlist and sync group survive HQPlayer changing IP address | Nothing |
 | **Live view** | A page of its own: what's playing, transport, volume and the signal path, updating every second in your Material theme | Nothing |
-| **Restart HQPlayer from LMS** | One tap in Apps restarts HQPlayer, with your saved settings, e.g. after power-cycling your NAA endpoint | The optional restart helper on the HQPlayer machine |
+| **Restart HQPlayer from LMS** | One tap in Apps restarts HQPlayer, with your saved settings, e.g. after power-cycling your NAA endpoint | The optional restart helper on the HQPlayer machine, which needs **Python 3.7+** there |
 
 ---
 
@@ -73,9 +73,36 @@ sudo systemctl restart lyrionmusicserver
 
 **Using it.** Once the helper is running, **Apps → HQPlayer Bridge** shows a **Restart *name*** row under HQPlayer Live View. Tap it, then **Restart *name* now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.
 
+### What the helper needs
+
+**Python 3.7 or later, on the HQPlayer machine.** The helper is a single Python script and uses
+only the standard library — nothing to `pip install`. **The installer never installs Python for
+you**; if it can't find `python3` it stops and says so, leaving your system untouched.
+
+**On macOS, expect a prompt from Apple — not from this installer.** macOS ships no Python of its
+own. `/usr/bin/python3` is a stub, so the first time anything runs it, macOS itself offers to
+install the **Command Line Tools**:
+
+> The "python3" command requires the command line developer tools. Would you like to install the
+> tools now?
+
+That dialog is Apple's. Accepting it installs the Command Line Tools (a developer package of a
+few hundred MB, which includes Python 3.9) and the helper then installs normally. **If you would
+rather not have that**, click *Not Now* and install Python another way first — the
+[python.org installer](https://www.python.org/downloads/macos/) or `brew install python` — then
+run `./install.sh` again. Either is fine; the helper only needs *a* `python3` of 3.7 or later on
+your `PATH`.
+
+**On Linux, nothing is offered and nothing is installed.** Practically every distribution ships
+Python 3 already, so there is usually nothing to do. If it is genuinely missing the installer
+stops with `python3 not found - install Python 3.7 or newer first`, and you install it with your
+package manager (`sudo apt install python3`, `sudo dnf install python3`, and so on). No
+equivalent of Apple's prompt exists, so a Linux install will never pull in a toolchain behind
+your back.
+
 ### Install the helper
 
-On the **HQPlayer machine**, with **Python 3.7 or later**:
+On the **HQPlayer machine**, with **Python 3.7 or later** (see above):
 
 **Step 1.** Download this repository (**Code → Download ZIP** on GitHub) and open the `tools/hqrestart/` folder in a terminal.
 
@@ -154,7 +181,9 @@ HQPlayer holds the real level in dB and decides how to split it between the endp
 
 **One LMS step is one dB, with LMS 100 being 0 dB.** The range is read from HQPlayer at connect, so a ceiling below 0 dB is handled.
 
-The level you start with is **HQPlayer's own**, not one the plugin asserts. To stop Lyrion driving the volume at all, set **Volume Control: fixed** on the player's Audio settings page; the plugin honours that and never changes it for you. HQPlayer's own "fixed volume" is a *startup level*, not a lock.
+**A restart of HQPlayer no longer moves your slider.** HQPlayer applies its own configured startup volume whenever it restarts. The bridge does not treat that as something you did, so it leaves the LMS slider alone and re-applies *your* level to HQPlayer the next time you play something. Between the restart and that first play the two differ on purpose: the slider shows the level you chose, and HQPlayer is still at its startup level. A level you change on HQPlayer's own interface, or on the endpoint's remote, is still followed into LMS as it always was.
+
+To stop Lyrion driving the volume at all, set **Volume Control: fixed** on the player's Audio settings page; the plugin honours that and never changes it for you. HQPlayer's own "fixed volume" is a *startup level*, not a lock.
 
 ---
 
