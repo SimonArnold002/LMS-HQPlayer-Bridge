@@ -172,18 +172,23 @@ ok(scalar($SENT =~ /removeChild\(back\)/),
 ok(scalar($SENT !~ /window\.top\.location\.href\s*=/),
    'so it never navigates the top window - that was destructive once the tile opened inline');
 
-print "-- there is no settings page left to link to --\n";
-# Nothing in this plugin is configurable. The settings page existed only to
-# read numbers off, could not keep them current, and put a link inside a link
-# on the way to the one page that works.
-ok(scalar(!-e '../HQPlayerBridge/Settings.pm'), 'Settings.pm is gone');
-ok(scalar(!-e '../HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/settings/basic.html'),
-   'and so is its template');
+print "-- the settings page is settings only, never the live reading --\n";
+# THE SETTINGS PAGE CAME BACK ON 2026-09-27 - but ONLY for the typed HQPlayer
+# addresses and the discovery switch. The old one existed to read numbers off,
+# could not keep them current, and put a link inside a link on the way to the
+# one page that works. That must not return: the live reading is Live.pm's.
 {
-    open my $fh, '<', 'Plugins/HQPlayerBridge/Plugin.pm' or die $!;
-    my $mod = do { local $/; <$fh> }; close $fh;
-    ok(scalar($mod !~ /HQPlayerBridge::Settings/),
-       'and Plugin.pm no longer registers one');
+    my $slurp = sub { open my $fh, '<', $_[0] or return ''; local $/; <$fh> };
+    my $mod  = $slurp->('../HQPlayerBridge/Settings.pm');
+    my $tmpl = $slurp->('../HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/settings/basic.html');
+    ok(scalar($mod =~ /sub prefs/ && $mod =~ /addresses/ && $mod =~ /autodiscover/),
+       'the settings page holds the addresses and the discovery switch');
+    ok(scalar($mod !~ /signalPath|nowPlaying|bridges\(/),
+       'and reads nothing of the signal path or the players - that is the live view');
+    # A <script> is allowed since 2026-09-27 (the "checking" line on save);
+    # what must never come back is a poller or a link to the live page.
+    ok(scalar($tmpl !~ /setInterval|setTimeout|XMLHttpRequest|fetch\(|jsonrpc|hqplive/),
+       'and its template polls nothing and links to no live page');
 }
 
 print "-- it follows MATERIAL's theme, by LMS's own recipe --\n";
@@ -516,6 +521,10 @@ ok(scalar($SENT !~ /no bridges_loop in reply/),
    'a missing bridges_loop is no longer reported as a bad reply');
 ok(scalar($SENT =~ /var loop = r\.bridges_loop \|\| \[\];/),
    'it is read as an empty list - the poll answered, there is just no player yet');
+ok(scalar($SENT =~ /if \(typeof r\.waiting === 'string'\) \{ WAIT = r\.waiting; \}/),
+   'what it waits for is re-read from every poll - the mode can change under the page');
+ok(scalar($SENT =~ /esc\(WAIT\)/ && $SENT !~ /esc\(L\.waiting\)/),
+   'and the empty card draws THAT, not the fixed label');
 ok(scalar($SENT =~ /if \(!r\) \{ throw new Error\('no result in reply'\)/),
    'a genuinely malformed reply is still an error');
 ok(scalar($SENT !~ /No HQPlayer instances found/),

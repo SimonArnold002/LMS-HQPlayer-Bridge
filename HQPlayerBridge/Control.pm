@@ -56,7 +56,12 @@ use constant CONNECT_TIMEOUT => 5;
 # the reply window has to cover a slow origin, not just a round trip.
 use constant REPLY_TIMEOUT   => 30;
 use constant BACKOFF_MIN     => 2;
-use constant BACKOFF_MAX     => 60;
+# The link keeps ITSELF alive, and this is how far apart its attempts get.
+# 10s, not the 60s it was: until 2026-09-27 discovery poked a down link every
+# 10s round (reconnectNow), and that poke was the real return time after a
+# long outage. The link now owns it, on its own ladder, and discovery is out
+# of the loop - docs/discovery-simplification-plan.md.
+use constant BACKOFF_MAX     => 10;
 use constant SLOW_COMMAND    => 1;
 
 # The complete verified command vocabulary, extracted from the hqplayerd
@@ -143,6 +148,9 @@ sub new {
                                           # EVERY Status message, pushed or not
         onProven  => $args{onProven},     # called as $cb->($self) ONCE per link,
                                           # at HQPlayer's first reply - see proven
+        # One command and done: never reconnects, and logs only at debug -
+        # the caller reports. See identify.
+        oneShot   => $args{oneShot} ? 1 : 0,
         queue     => [],
         wbuf      => '',
         rbuf      => '',
@@ -190,10 +198,9 @@ sub up        { ( $_[0]->{sock} || $_[0]->{connecting} ) ? 1 : 0 }
 #        the wire; the player uses 'track' for generation-bound load work.
 #
 # RETURNS 1 if the command was accepted onto the queue, 0 if it was refused -
-# an unverified verb, or a link that is down. A caller which must know whether
-# its command actually left (Player::volume, whose level LMS would otherwise
-# believe had been applied) reads this; most do not care, because their $cb is
-# failed either way.
+# an unverified verb, or a link that is down. No caller reads it today (the
+# volume hold that did was reverted to the release behaviour, 2026-09-27):
+# every caller is driven by its $cb, which is failed either way.
 # ---------------------------------------------------------------------------
 sub send {
     my ($self, $cmd, $cb, $opts) = @_;
@@ -356,7 +363,12 @@ sub _connectResolved {
     # _dispatch, which only runs when HQPlayer has actually said something.
     $self->{proven} = 0;
 
-    main::INFOLOG && $log->is_info && $log->info("$self->{name}: control link up ($self->{ip})");
+    if ( $self->{oneShot} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: connected to identify it");
+    }
+    else {
+        main::INFOLOG && $log->is_info && $log->info("$self->{name}: control link up ($self->{ip})");
+    }
 
     Slim::Networking::Select::addRead( $sock, sub { $self->_readable } );
 
@@ -651,7 +663,7 @@ sub _dropLink {
 
     # A link that had been ANSWERING going down is always worth a line. A
     # failed attempt during an outage is not - see _outage.
-    if ($wasProven) {
+    if ( $wasProven && !$self->{oneShot} ) {
         $log->warn("$self->{name}: control link down - $why");
         $self->{quiet} = 1;
     }
@@ -692,16 +704,19 @@ sub _dropLink {
 
 # ONE warning per outage, not one per retry. While HQPlayer is off, restarting,
 # or accepting and then resetting the socket, every retry fails the same way,
-# and discovery now prompts a retry every round (reconnectNow): at WARN that
-# was a line every ~11s for as long as it lasted - 401 of the bridge's 414
-# lines in a 6.5-hour log (2026-09-25, one instance that accepts and resets).
+# and the link retries every BACKOFF_MAX (10s) at most: at WARN that was a line
+# every ~11s for as long as it lasted - 401 of the bridge's 414 lines in a
+# 6.5-hour log (2026-09-25, one instance that accepts and resets).
+#
+# A one-shot identify logs nothing above debug: it is a new object each round,
+# so its own `quiet` could never hold, and its caller reports once per outage.
 # The first failure is reported; the rest go to debug until HQPlayer answers
 # again (_dispatch clears `quiet`), and a working link that drops is always
 # reported (_dropLink).
 sub _outage {
     my ( $self, $msg ) = @_;
 
-    if ( $self->{quiet} ) {
+    if ( $self->{quiet} || $self->{oneShot} ) {
         main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: $msg");
         return;
     }
@@ -715,7 +730,7 @@ sub _outage {
 sub _scheduleReconnect {
     my $self = shift;
 
-    return if $self->{closing};
+    return if $self->{closing} || $self->{oneShot};
 
     my $delay = $self->{backoff};
     $self->{backoff} = $self->{backoff} * 2 > BACKOFF_MAX ? BACKOFF_MAX : $self->{backoff} * 2;
@@ -733,39 +748,6 @@ sub _reconnect {
     $self->connect;
 }
 
-# Discovery has just heard this HQPlayer answer, so try now rather than wait
-# out the backoff - up to BACKOFF_MAX after a long outage, and Control::send no
-# longer connects on a command.
-#
-# WHAT IT DOES AND DOES NOT DO - corrected 2026-09-27, the comment was the
-# defect.  The PACE is as intended: an HQPlayer that answers discovery but
-# refuses the link costs one attempt per discovery round
-# (Discovery::COLD_PERIOD) and not a faster ladder, because the pending
-# _reconnect timer is KILLED here rather than added to.
-#
-# But this used to claim "the backoff itself is left where it is", and it is
-# not.  A connect started here that fails goes _dropLink -> _scheduleReconnect
-# like any other, which DOUBLES {backoff} - so a refusing instance saturates at
-# BACKOFF_MAX within a handful of rounds.  That is invisible while discovery
-# keeps seeing the instance, because reconnectNow sets the pace; it shows only
-# once discovery STOPS seeing it (Discovery::INSTANCE_TTL), when the fallback
-# ladder is at BACKOFF_MAX rather than where the outage left it.
-#
-# Deliberately NOT "fixed": a slow ladder after a long outage is the behaviour
-# we want, and restoring the backoff here would need a rule for which failures
-# count, which is a tuning question nobody has asked for.  Pinned in
-# t_control.pl so the prose and the code cannot drift apart again.
-sub reconnectNow {
-    my $self = shift;
-
-    return if $self->{sock} || $self->{connecting} || $self->{closing};
-
-    Slim::Utils::Timers::killTimers( $self, \&_reconnect );
-    $self->connect;
-
-    return;
-}
-
 sub close {
     my $self = shift;
 
@@ -775,6 +757,42 @@ sub close {
 
     return;
 }
+
+# ---------------------------------------------------------------------------
+# Who is at this address? One connection, one <GetInfo/>, closed again.
+#
+# For an address typed into the settings, which has no discovery reply to
+# name it. <GetInfo/>'s `name` IS the name discovery reports - measured on
+# Embedded across a rename (HQPlayerEmbedded, then ManCave) and on Desktop
+# 6.2.3 (`name="Mac"` both ways), 2026-09-20 and 2026-09-27 - so an instance
+# reached this way gets the SAME player id discovery would have given it, and
+# no player is ever re-keyed.
+#
+# $cb->($attrs) with GetInfo's attributes, or $cb->(undef) when nothing
+# answered: refused, timed out, closed, or an error reply. A oneShot link
+# never reconnects, so a dead host costs exactly this one attempt.
+# ---------------------------------------------------------------------------
+sub identify {
+    my ( $class, $ip, $cb ) = @_;
+
+    my $self = $class->new( ip => $ip, name => "HQPlayer at $ip", oneShot => 1 );
+
+    $self->connect;
+
+    $self->send( '<GetInfo/>', sub {
+        my ($attrs) = @_;
+
+        # Closed on the NEXT turn: this runs inside _dispatch or _dropLink,
+        # and closing from in there would tear the link down under them.
+        Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_closeOneShot );
+
+        $cb->($attrs) if $cb;
+    } );
+
+    return $self;
+}
+
+sub _closeOneShot { $_[0]->close }
 
 # ---------------------------------------------------------------------------
 # Tiny XML helpers.  These payloads are small, flat and machine-generated, so

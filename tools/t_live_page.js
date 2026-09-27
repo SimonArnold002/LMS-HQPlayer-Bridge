@@ -111,11 +111,13 @@ function bridge(id, name, playing, title) {
 }
 var LOOP3 = [ bridge(1, 'Lounge', false), bridge(2, 'ManCave', true, 'A Song'), bridge(3, 'Study', false) ];
 
-function answer(loop) {
+function answer(loop, extra) {
     var x = null;
     for (var i = XHRS.length - 1; i >= 0; i--) { if (XHRS[i].url === '/jsonrpc.js') { x = XHRS[i]; break; } }
     if (!x) { ok(false, 'a signalpath poll went out'); return; }
-    x.responseText = JSON.stringify({ result: { bridges_loop: loop } });
+    var result = { bridges_loop: loop };
+    for (var k in (extra || {})) { result[k] = extra[k]; }
+    x.responseText = JSON.stringify({ result: result });
     x.onload();
 }
 function pickEl()  { return document.getElementById('pick'); }
@@ -179,6 +181,34 @@ print('== one instance: no chooser at all');
 answer([ bridge(2, 'ManCave', true, 'A Song') ]);
 ok(pickEl().className.indexOf('hidden') >= 0, 'the chooser is hidden');
 ok(pickEl().innerHTML === '', 'and empty');
+
+print('== no player yet: the card says what it waits for, TRUE TO THE MODE, and follows it');
+// signalpath omits bridges_loop when it is empty - so no loop at all here.
+var WADDR = 'Waiting for HQPlayer at 10.0.0.9 - it appears here as soon as it connects.';
+var WAUTO = 'Looking for HQPlayer on this network - it appears here as soon as it answers.';
+answer(undefined, { waiting: WADDR });
+ok(cardsHtml().indexOf(WADDR) >= 0, 'addresses only: it names the addresses it waits at');
+answer(undefined, { waiting: WAUTO });
+ok(cardsHtml().indexOf(WAUTO) >= 0 && cardsHtml().indexOf(WADDR) < 0,
+   'the mode changed in Settings: the next poll says so, with no reload');
+// Automatically, once one is found, the server waits for nothing: ''.
+answer([ bridge(2, 'ManCave', true, 'A Song') ], { waiting: '' });
+ok(cardsHtml().indexOf(WAUTO) < 0 && /Connected - 10\.0\.0\.2:4321/.test(cardsHtml()),
+   'HQPlayer connects: its card REPLACES the waiting line on the next poll');
+answer(undefined, { waiting: WADDR });
+ok(cardsHtml().indexOf(WADDR) >= 0, 'and it goes: the waiting line is back');
+answer(undefined, {});
+ok(cardsHtml().indexOf(WADDR) >= 0, 'a reply without `waiting` keeps the last line rather than blanking it');
+
+print('== typed addresses: one connected, one still waiting - BOTH shown');
+var WB = 'Waiting for HQPlayer at 10.0.0.8 - it appears here as soon as it connects.';
+answer([ bridge(2, 'ManCave', true, 'A Song') ], { waiting: WB });
+ok(/Connected - 10\.0\.0\.2:4321/.test(cardsHtml()) && cardsHtml().indexOf(WB) >= 0,
+   'the connected card AND the address it still waits at');
+ok(cardsHtml().indexOf(WB) > cardsHtml().indexOf('10.0.0.2:4321'), 'the waiting line BELOW the connected card');
+answer([ bridge(2, 'ManCave', true, 'A Song') ], { waiting: '' });
+ok(cardsHtml().indexOf(WB) < 0 && /Connected - 10\.0\.0\.2:4321/.test(cardsHtml()),
+   'waiting for nothing (an EMPTY `waiting`): the line goes, the card stays');
 
 } catch (e) { ok(false, 'the page threw: ' + (e && e.message)); }
 

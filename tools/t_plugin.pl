@@ -501,7 +501,7 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     sub isQuery       { 1 }
     sub client        { undef }
     sub addResultLoop { $_[0]->{loop}{ $_[2] }{ $_[3] } = $_[4] }
-    sub addResult     {}
+    sub addResult     { $_[0]->{res}{ $_[1] } = $_[2] }
     sub setStatusDone {}
 
     package CloseCtl;
@@ -543,148 +543,605 @@ for my $f (glob '../HQPlayerBridge/*.pm') {
 }
 ok(!@copies, 'no module keeps its own copy of the version'.(@copies ? " (@copies)" : ''));
 
-print "-- discovery: the cold start must not cost a whole round --\n";
-{
-    # One lost multicast datagram used to cost a full minute of the plugin
-    # looking broken: with nothing found there is no player at all, and the
-    # retry was the same 60s as the steady-state round. Observed live -
-    # the probe went out at 09:48:49 while hqplayerd happened to be
-    # restarting, and the player did not appear until 09:49:49.
-    require Plugins::HQPlayerBridge::Discovery;
-    use IO::Socket::INET;
+# ---------------------------------------------------------------------------
+# DISCOVERY FINDS, AND ANSWERS NOTHING ELSE (docs/discovery-simplification-
+# plan.md, 2026-09-27). Every pin in its section 8, driven through the REAL
+# Discovery, Addresses and Plugin subs. The only thing stubbed on the network
+# side is the one send() (Discovery::_sendTo), so no datagram leaves this box.
+# ---------------------------------------------------------------------------
+use Socket qw(unpack_sockaddr_in inet_ntoa);
+require Plugins::HQPlayerBridge::Discovery;
+require Plugins::HQPlayerBridge::Addresses;
 
-    no warnings 'redefine';
-    # never touch the network from a unit test
-    local *Plugins::HQPlayerBridge::Discovery::_round = sub { };
+my $D = 'Plugins::HQPlayerBridge::Discovery';
+my $A = 'Plugins::HQPlayerBridge::Addresses';
+my $prefs = Slim::Utils::Prefs::preferences('plugin.hqplayerbridge');
+
+my $XML = sub {
+    '<?xml version="1.0" encoding="UTF-8"?><discover name="' . $_[0]
+  . '" result="OK" version="Signalyst HQPlayer Embedded 6">hqplayer</discover>' };
+
+# A real reply, on loopback, to discovery's own long-lived socket.
+my $answer = sub {
+    my $name = shift;
+    my $s = Plugins::HQPlayerBridge::Discovery::_socket() or return 0;
+    my $tx = IO::Socket::INET->new( Proto => 'udp', PeerAddr => '127.0.0.1', PeerPort => $s->sockport ) or return 0;
+    $tx->send( $XML->($name) );
+    select( undef, undef, undef, 0.1 );
+    Plugins::HQPlayerBridge::Discovery::_reply();
+    return 1;
+};
+
+my $nextWait = sub {
+    Slim::Utils::Timers::_reset();
+    my $t0 = Time::HiRes::time();
+    Plugins::HQPlayerBridge::Discovery::_roundDone();
+    my ($t) = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Discovery::_round } @{ Slim::Utils::Timers::_timers() };
+    return $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
+};
+
+my $dest = sub { inet_ntoa( ( unpack_sockaddr_in( $_[0] ) )[1] ) };
+
+# A WHOLE round: its start (the round hook - the typed addresses are checked
+# there) and its end (the complete list judged). $nextWait alone is only the end.
+my $fullRound = sub { Plugins::HQPlayerBridge::Discovery::_round(); $nextWait->() };
+
+print "-- discovery: one socket, one multicast datagram a round, its own pace --\n";
+{
+    no warnings qw(redefine once);
+    my @sent;
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { push @sent, $_[0]; 1 };
 
     Slim::Utils::Timers::_reset();
-    Plugins::HQPlayerBridge::Discovery->start( sub { } );
+    my ( @rounds, @lists );
+    $D->start( sub { push @lists, $_[1] ? 'partial' : 'full' }, onRound => sub { push @rounds, $_[0] } );
 
-    my @waits;
-    for ( 1 .. 7 ) {
-        Slim::Utils::Timers::_reset();
-        my $t0 = Time::HiRes::time();
-        Plugins::HQPlayerBridge::Discovery::_roundDone();
-        my $t = Slim::Utils::Timers::_timers()->[0];
-        push @waits, $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
-    }
+    is( scalar @sent, 1, 'a round sends ONE datagram' );
+    is( @sent ? $dest->( $sent[0] ) : 'none', '239.192.0.199', 'to the multicast group' );
+    is( scalar @rounds, 1, 'and runs the round hook once, as it starts' );
 
-    is(join(',', @waits), '2,4,8,10,10,10,10',
-       'with nothing found it looks again at 2, 4, 8, then every 10s');
+    is( join( ',', map { $nextWait->() } 1 .. 6 ), '2,4,8,10,10,10',
+        'with nothing found it looks again at 2, 4, 8, then every 10s' );
 
-    # ...and once an instance answers it settles down. Seed %found the way a
-    # real round does, by handing _reply an actual datagram on loopback.
-    my $rx = IO::Socket::INET->new( Proto => 'udp', LocalAddr => '127.0.0.1', LocalPort => 0 );
-    if ($rx) {
-        my $tx = IO::Socket::INET->new( Proto => 'udp',
-            PeerAddr => '127.0.0.1', PeerPort => $rx->sockport );
-        $tx->send('<?xml version="1.0" encoding="UTF-8"?><discover name="HQPlayerEmbedded"'
-                . ' result="OK" version="Signalyst HQPlayer Embedded 6">hqplayer</discover>');
-        select( undef, undef, undef, 0.1 );
-        Plugins::HQPlayerBridge::Discovery::_reply($rx);
+    my $sock = Plugins::HQPlayerBridge::Discovery::_socket();
+    ok( $sock, 'the socket is open between rounds' );
 
-        is(scalar @{ Plugins::HQPlayerBridge::Discovery::instances() }, '1',
-           'the seeded reply is recorded as an instance');
+    # A reply arriving AFTER the round was judged - the old per-round socket was
+    # closed by then and threw it away.
+    ok( $answer->('HQPlayerEmbedded'), 'a reply after LISTEN_TIME reaches the socket' );
+    is( scalar @{ $D->instances }, 1, 'and is accepted' );
+    is( $lists[-1], 'partial', 'announced at once, and flagged partial' );
+    is( ( $D->instances->[0] || {} )->{round}, Plugins::HQPlayerBridge::Discovery::round(),
+        'carrying the round it arrived in' );
 
-        Slim::Utils::Timers::_reset();
-        my $t0 = Time::HiRes::time();
-        Plugins::HQPlayerBridge::Discovery::_roundDone();
-        my $t = Slim::Utils::Timers::_timers()->[0];
-        is($t ? sprintf('%.0f', $t->{when} - $t0) : 'none', '10',
-           'an instance known but no way to ask whether it is connected - 10s, never idle');
-    }
+    @sent = ();
+    Plugins::HQPlayerBridge::Discovery::_round();
+    is( scalar @sent, 1, 'with an instance KNOWN, a round still sends exactly one datagram' );
+    is( @sent ? $dest->( $sent[0] ) : 'none', '239.192.0.199', 'and it is the multicast one - no unicast to the known address' );
 
-    Plugins::HQPlayerBridge::Discovery->stop;
+    is( $nextWait->(), '15', 'anything found: every 15s' );
+    ok( Plugins::HQPlayerBridge::Discovery::_socket() && Plugins::HQPlayerBridge::Discovery::_socket() == $sock,
+        'the SAME socket survives the rounds' );
+
+    # probeNow: one probe, however many links drop.
+    @sent = ();
+    Slim::Utils::Timers::_reset();
+    $D->probeNow;
+    $D->probeNow;
+    $D->probeNow;
+    is( scalar @sent, 1, 'three links dropping at once cost ONE probe' );
+    $nextWait->();
+    $D->probeNow;
+    is( scalar @sent, 2, 'CONTROL: once that round is over, a later drop probes again' );
+
+    $D->stop;
+    ok( !Plugins::HQPlayerBridge::Discovery::_socket(), 'stop closes the socket' );
     Slim::Utils::Timers::_reset();
 }
 
-print "-- discovery: how often to look is decided by the CONTROL LINK --\n";
+print "-- discovery OFF: no socket, no datagram, but the rounds still run --\n";
 {
-    # An instance that is connected needs no finding, and one that is not -
-    # powered off, asleep, moved - has to be found again quickly. Once every
-    # known one is connected only a NEW HQPlayer is left to find, so it looks
-    # every IDLE_PERIOD (15s). It was ten minutes until 2026-09-23, which hid a
-    # second HQPlayer for that long, then a flat 5s, which filled HQPlayer's
-    # log with discovery lines.
-    require Plugins::HQPlayerBridge::Discovery;
+    no warnings qw(redefine once);
+    my @sent;
+    my $opens = 0;
+    my $realOpen = \&Plugins::HQPlayerBridge::Discovery::_openSocket;
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo     = sub { push @sent, $_[0]; 1 };
+    local *Plugins::HQPlayerBridge::Discovery::_openSocket = sub { $opens++; $realOpen->() };
 
-    no warnings 'redefine';
-    local *Plugins::HQPlayerBridge::Discovery::_round = sub { };
+    Slim::Utils::Timers::_reset();
+    my @rounds;
+    $D->start( sub { }, onRound => sub { push @rounds, $_[0] }, udp => 0 );
 
-    my $up = 1;
-    my $seen;
+    is( $opens, 0, 'no socket is opened' );
+    is( scalar @sent, 0, 'no datagram is sent' );
+    is( scalar @rounds, 1, 'but the round hook runs - the typed addresses are checked on it' );
+    is( $D->listening, 0, 'and it says it is not listening' );
+    is( $nextWait->(), '15', 'every 15s, even with nothing found - no cold ladder of TCP attempts' );
 
-    my $wait = sub {
-        Slim::Utils::Timers::_reset();
-        my $t0 = Time::HiRes::time();
-        Plugins::HQPlayerBridge::Discovery::_roundDone();
-        my $t = Slim::Utils::Timers::_timers()->[0];
-        return $t ? sprintf( '%.0f', $t->{when} - $t0 ) : 'none';
+    $D->probeNow;
+    is( scalar @sent + $opens, 0, 'probeNow sends nothing' );
+
+    $D->stop;
+
+    # CONTROL: the same calls with discovery ON do open and send.
+    $D->start( sub { } );
+    ok( $opens == 1 && @sent == 1, 'CONTROL: with it on, the same start opens a socket and sends' );
+    $D->stop;
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- STARTUP: discovery runs only when it is on --\n";
+# Simon, 2026-09-27: auto discovery must not run at startup unless it is on.
+# This is the call initPlugin makes, with the pref as each kind of install
+# has it.
+{
+    no warnings qw(redefine once);
+    my @sent;
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { push @sent, $_[0]; 1 };
+    my %was = map { $_ => $prefs->get($_) } qw(addresses autodiscover);
+    my $start = sub {
+        $D->stop; @sent = ();
+        $prefs->set( autodiscover => $_[0] ); $prefs->set( addresses => $_[1] );
+        $A->can('reset')->(); Slim::Utils::Timers::_reset();
+        Plugins::HQPlayerBridge::Plugin::_startDiscovery();
     };
 
-    Slim::Utils::Timers::_reset();
-    Plugins::HQPlayerBridge::Discovery->start(
-        sub { $seen = $_[1] ? 'partial' : 'full' },
-        sub { $up },
-    );
-
-    # Seed one instance the way a real round does.
-    my $rx = IO::Socket::INET->new( Proto => 'udp', LocalAddr => '127.0.0.1', LocalPort => 0 );
-    if ($rx) {
-        my $tx = IO::Socket::INET->new( Proto => 'udp',
-            PeerAddr => '127.0.0.1', PeerPort => $rx->sockport );
-        $tx->send('<?xml version="1.0" encoding="UTF-8"?><discover name="HQPlayerEmbedded"'
-                . ' result="OK" version="Signalyst HQPlayer Embedded 6">hqplayer</discover>');
-        select( undef, undef, undef, 0.1 );
-        Plugins::HQPlayerBridge::Discovery::_reply($rx);
-
-        is($seen, 'partial',
-           'a NEW instance is announced the moment it answers, not at the end of the round');
-        is($seen eq 'partial' ? 1 : 0, 1,
-           'and it is flagged partial, so the caller must not remove anyone on it');
-
-        $up = 1;
-        is($wait->(), '15', 'every known instance connected - every 15s, not ten minutes');
-
-        $up = 0;
-        is($wait->(), '10', 'a link that is down puts it straight back on 10s');
-
-        $up = 1;
-        is($wait->(), '15', 'and back to 15s once the link is up again');
+    # A user who chose addresses only - stored 0, with or without a list.
+    for my $box ( '10.0.0.1', '' ) {
+        $start->( 0, $box );
+        my $what = length $box ? 'stored OFF with an address' : 'stored OFF with an EMPTY box';
+        ok( !Plugins::HQPlayerBridge::Discovery::_socket(), "$what: no socket is opened" );
+        is( scalar @sent, 0, "$what: no datagram is sent" );
+        is( Plugins::HQPlayerBridge::Discovery::listening(), 0, "$what: discovery is not listening" );
+        is( $nextWait->(), 15, "$what: only the round clock runs, every 15s, for the typed addresses" );
+        is( scalar @sent, 0, "$what: and a round later still nothing has been sent" );
     }
 
-    Plugins::HQPlayerBridge::Discovery->stop;
+    # A new install, or an update from a release without the pref: never stored.
+    $start->( undef, '' );
+    is( scalar @sent . '/' . ( Plugins::HQPlayerBridge::Discovery::_socket() ? 1 : 0 ), '1/1',
+        'NEVER STORED (a new install or an update from main): discovers, as before - the default is on' );
+
+    # CONTROL: stored on.
+    $start->( 1, '' );
+    is( scalar @sent . '/' . ( Plugins::HQPlayerBridge::Discovery::_socket() ? 1 : 0 ), '1/1',
+        'CONTROL: stored ON, the same call opens the socket and probes' );
+
+    $D->stop;
+    $prefs->set( $_ => $was{$_} ) for keys %was;
     Slim::Utils::Timers::_reset();
 }
 
-print "-- discovery hearing a disconnected HQPlayer reconnects it now --\n";
+print "-- the pace is discovery's own: a link up or down changes nothing --\n";
 {
-    package PokeCtl;
-    sub new { bless { pokes => 0 }, shift } sub reconnectNow { $_[0]->{pokes}++ }
-    sub connected { 0 } sub proven { 0 }
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { 1 };
+    local *Plugins::HQPlayerBridge::Plugin::_create    = sub { };
+    local *Plugins::HQPlayerBridge::Plugin::_teardown  = sub { };
+
+    my $reg  = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+
+    # AUTOMATICALLY, explicitly: the default is off, and with no socket the
+    # reply below never lands and this passes on 15/15 regardless (review 5).
+    my $was = $prefs->get('autodiscover');
+    $prefs->set( autodiscover => 1 );
+    Slim::Utils::Timers::_reset();
+    Plugins::HQPlayerBridge::Plugin::_startDiscovery();
+    ok( $answer->('PaceTest') && scalar @{ Plugins::HQPlayerBridge::Discovery::instances() },
+        'discovery is on and the reply landed - so the pace below is measured with an instance found' );
+
+    my $id = Plugins::HQPlayerBridge::Plugin::_idFor('PaceTest');
+    %$reg = ( $id => { instance => { ip => '127.0.0.1', name => 'PaceTest' }, name => 'HQ', link_of(1) } );
+    my $up = $nextWait->();
+    %$reg = ( $id => { instance => { ip => '127.0.0.1', name => 'PaceTest' }, name => 'HQ', link_of(0) } );
+    my $down = $nextWait->();
+
+    is( "$up/$down", '15/15', 'the next round is 15s whether the link is up or down' );
+
+    $D->stop;
+    %$reg = %keep;
+    $prefs->set( autodiscover => $was );
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- a PROVEN link dropping asks for one probe now --\n";
+{
+    package ProbeClient;
+    sub new { bless { ev => [] }, shift }
+    sub _stopPolling {} sub disconnected {} sub controller { undef }
     package main;
 
     no warnings qw(redefine once);
-    local *Plugins::HQPlayerBridge::Plugin::_create   = sub { };
-    local *Plugins::HQPlayerBridge::Plugin::_teardown = sub { };
-    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    my $probes = 0;
+    local *Plugins::HQPlayerBridge::Discovery::probeNow = sub { $probes++ };
+    local *Slim::Control::Request::notifyFromArray = sub { };
+
+    my $reg  = Plugins::HQPlayerBridge::Plugin::bridges();
     my %keep = %$reg;
-    my $id   = Plugins::HQPlayerBridge::Plugin::_idFor('PokeTest');
-    my $ctl  = PokeCtl->new;
-    %$reg = ( $id => { instance => { ip => '10.7.0.5', name => 'PokeTest' }, name => 'HQ',
-                       control => $ctl, client => LinkClient->new($ctl) } );
-    my $now = Plugins::HQPlayerBridge::Discovery::round();
+    %$reg = ( 'p1' => { client => ProbeClient->new, name => 'P', instance => { ip => '10.3.3.3' } } );
 
-    Plugins::HQPlayerBridge::Plugin::_onInstances(
-        [ { ip => '10.7.0.5', name => 'PokeTest', round => $now } ] );
-    is($ctl->{pokes}, 1, 'an instance that answered THIS round has its link retried now');
-
-    Plugins::HQPlayerBridge::Plugin::_onInstances(
-        [ { ip => '10.7.0.5', name => 'PokeTest', round => $now - 1 } ] );
-    is($ctl->{pokes}, 1, 'CONTROL: one only remembered from an earlier round is not');
+    Plugins::HQPlayerBridge::Plugin::_onLinkState( 'p1', 0, 1 );
+    is( $probes, 1, 'a link that had been answering drops: one probe' );
+    Plugins::HQPlayerBridge::Plugin::_onLinkState( 'p1', 0, 0 );
+    is( $probes, 1, 'CONTROL: an accept-then-drop (never proven) asks for nothing - it retries every 10s' );
 
     %$reg = %keep;
 }
+
+# ---------------------------------------------------------------------------
+# Addresses typed into the settings (plan 4.5-4.6). HQPlayer is stubbed at
+# Control::identify - the one TCP <GetInfo/> - and answers with the name each
+# address is given in %who. Everything else is the real code.
+# ---------------------------------------------------------------------------
+
+sub with_rig {
+    my ( $who, $body ) = @_;
+
+    no warnings qw(redefine once);
+    my @ev;
+    my @asked;
+    my $reg  = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+    %$reg = ();
+
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { 1 };
+    local *Plugins::HQPlayerBridge::Control::identify  = sub {
+        my ( $class, $ip, $cb ) = @_;
+        push @asked, $ip;
+        my $n = $who->{$ip};
+        $cb->( defined $n ? { name => $n, product => 'Signalyst HQPlayer Embedded', version => '6' } : undef );
+    };
+    local *Plugins::HQPlayerBridge::Plugin::_create = sub {
+        my ( $id, $inst, $name ) = @_;
+        push @ev, "create $id $inst->{ip}";
+        $reg->{$id} = { instance => $inst, name => $name, link_of(1) };
+    };
+    local *Plugins::HQPlayerBridge::Plugin::_teardown = sub {
+        push @ev, "teardown $_[0]";
+        delete $reg->{ $_[0] };
+    };
+
+    Slim::Utils::Timers::_reset();
+    $A->reset;
+    $A->can('init')->( sub { Plugins::HQPlayerBridge::Plugin::_onInstances( Plugins::HQPlayerBridge::Plugin::_table(), 1 ) },
+                       \&Plugins::HQPlayerBridge::Plugin::_linkStateAt );
+
+    $body->( \@ev, \@asked, $reg );
+
+    $D->stop;
+    $A->reset;
+    %$reg = %keep;
+    Slim::Utils::Timers::_reset();
+}
+
+sub save { my (%p) = @_; $prefs->set( $_, $p{$_} ) for keys %p; Plugins::HQPlayerBridge::Plugin::_applySettings() }
+
+print "-- nothing found: the diagnostic matches what is running --\n";
+{
+    no warnings qw(redefine once);
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg; %$reg = ();
+    my $diag = sub {
+        my $feed; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        my ($d) = grep { /NONE_DESC/ } map { $_->{name} } @{ $feed->{items} };
+        return $d // 'none';
+    };
+    # The rows under the settings row: what it waits for, then the diagnostic.
+    my $rows = sub {
+        my $feed; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        return join ' | ', map { $_->{name} } grep { ( $_->{type} // '' ) eq 'text' } @{ $feed->{items} };
+    };
+    # The real %s, so the addresses can be seen going in.
+    local *Plugins::HQPlayerBridge::Plugin::cstring = sub { $_[1] eq 'PLUGIN_HQPLAYER_WAIT_ADDR' ? 'waiting at %s' : $_[1] };
+
+    local *Plugins::HQPlayerBridge::Discovery::listening = sub { 1 };
+    is( $diag->(), 'PLUGIN_HQPLAYER_NONE_DESC', 'discovery on: it names the probe that went unanswered' );
+    is( $rows->(), 'PLUGIN_HQPLAYER_WAIT_AUTO | PLUGIN_HQPLAYER_NONE_DESC',
+        'AUTOMATICALLY: looking on the network, then the probe diagnostic' );
+    local *Plugins::HQPlayerBridge::Discovery::listening = sub { 0 };
+    $A->can('set')->( [ '10.0.0.1', '10.0.0.2' ] );
+    is( $diag->(), 'PLUGIN_HQPLAYER_NONE_DESC_OFF', 'discovery off: it says so, and names the typed addresses - no probe was sent' );
+    is( $rows->(), 'waiting at 10.0.0.1, 10.0.0.2 | PLUGIN_HQPLAYER_NONE_DESC_OFF',
+        'ADDRESSES ONLY: waiting at the typed addresses, named, then the discovery-off diagnostic' );
+    $A->can('set')->( [] );
+    is( $diag->(), 'PLUGIN_HQPLAYER_NONE_DESC_EMPTY', 'discovery off and NO address typed: it says to enter one' );
+    is( $rows->(), 'PLUGIN_HQPLAYER_NONE_DESC_EMPTY', 'NONE TYPED: that one row, and nothing claiming to wait' );
+
+    # The live page's poll carries the SAME line, so the two never disagree.
+    for my $mode ( [ 1, [], 'automatically' ], [ 0, ['10.0.0.3'], 'addresses only' ], [ 0, [], 'none typed' ] ) {
+        my ( $on, $ips, $what ) = @$mode;
+        local *Plugins::HQPlayerBridge::Discovery::listening = sub { $on };
+        $A->can('set')->($ips);
+        my $rq = LoopReq->new;
+        Plugins::HQPlayerBridge::Plugin::_signalPathQuery($rq);
+        my ($first) = split / \| /, $rows->();
+        is( $rq->{res}{waiting} // '(absent)', $first, "$what: the poll's `waiting` is the Apps feed's line" );
+    }
+
+    # Typed addresses with one CONNECTED: the other is still named (review 6 -
+    # one off at an LMS restart was shown nowhere while another was up).
+    $A->can('set')->( [ '10.0.0.1', '10.0.0.2' ] );
+    local *Plugins::HQPlayerBridge::Plugin::signalPathFor = sub { {} };
+    local *Plugins::HQPlayerBridge::Plugin::nowPlayingFor = sub { {} };
+    %$reg = ( 'c1' => { name => 'C', instance => { ip => '10.0.0.1', name => 'C' }, feed_link(1, 1) } );
+    is( Plugins::HQPlayerBridge::Plugin::waitingText(), 'waiting at 10.0.0.2',
+        'ADDRESSES ONLY, one connected: it names only the address with no player' );
+    my $rq = LoopReq->new;
+    Plugins::HQPlayerBridge::Plugin::_signalPathQuery($rq);
+    is( $rq->{res}{waiting}, 'waiting at 10.0.0.2', 'and the poll carries it beside the connected one' );
+    {
+        my $feed; Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
+        my @names = map { $_->{name} // '' } @{ $feed->{items} };
+        is( $names[-1], 'waiting at 10.0.0.2', 'the Apps feed shows it too, LAST - no positional row moves' );
+        ok( !grep( { /NONE_DESC/ } @names ), 'with no "nothing answered" diagnostic - one has' );
+    }
+    %$reg = ( %$reg, 'c2' => { name => 'D', instance => { ip => '10.0.0.2', name => 'D' }, feed_link(0, 0) } );
+    is( Plugins::HQPlayerBridge::Plugin::waitingText(), '',
+        'every typed address has a player (one of them down): waiting for nothing - an EMPTY line' );
+    $rq = LoopReq->new;
+    Plugins::HQPlayerBridge::Plugin::_signalPathQuery($rq);
+    is( defined $rq->{res}{waiting} ? "'$rq->{res}{waiting}'" : '(absent)', "''",
+        'and the poll SENDS the empty line, so the page drops the old one' );
+    local *Plugins::HQPlayerBridge::Discovery::listening = sub { 1 };
+    is( Plugins::HQPlayerBridge::Plugin::waitingText(), '',
+        'AUTOMATICALLY with players: nothing - there is no list of HQPlayers to expect' );
+
+    $A->can('set')->( [] );
+    %$reg = %keep;
+
+    my $x = do { local ( @ARGV, $/ ) = ('../HQPlayerBridge/install.xml'); <> };
+    my ($opt) = $x =~ m{<optionsURL>([^<]+)</optionsURL>};
+    is( '/' . ( $opt // '' ), Plugins::HQPlayerBridge::Plugin::SETTINGS_PATH(),
+        'install.xml carries optionsURL, so LMS\'s plugin list links the settings page - the same path' );
+}
+
+print "-- the default mode, and OFF IS OFF --\n";
+{
+    my %was = map { $_ => $prefs->get($_) } qw(addresses autodiscover);
+    my $default = Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
+    is( $default, 1, 'the default is ON - a new install or an update from main finds HQPlayer as before (Simon, 2026-09-27)' );
+    $prefs->set( autodiscover => undef );
+    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), $default, 'never set means AUTO_DEFAULT' );
+    $prefs->set( autodiscover => 1 );
+    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 1, 'an explicit 1 is on' );
+    $prefs->set( addresses => '10.0.0.1' );
+    $prefs->set( autodiscover => 0 );
+    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 0, 'an explicit 0 with an address is off' );
+    $prefs->set( addresses => '' );
+    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 0,
+        'and with an EMPTY box STILL off (Simon: no player without an IP added) - it never falls back to discovering' );
+    my $src = do { local ( @ARGV, $/ ) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
+    ok( scalar( $src =~ /\$prefs->init\(\s*\{[^}]*autodiscover\s*=>\s*Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT\(\)/ ),
+        'and the pref is initialised from AUTO_DEFAULT - the one place the default lives' );
+
+    # AN UPDATE NEVER OVERRIDES A USER'S CHOICE (Simon, 2026-09-27). init only
+    # fills a pref never stored; so NOTHING ELSE may write these two - no set,
+    # no remove, no migrate - outside the settings page's own save (the base
+    # class, from pref_<name>). Comments stripped: they explain the rule.
+    my @writes;
+    for my $f ( map { "Plugins/HQPlayerBridge/$_.pm" } qw(Plugin Addresses Discovery Control Player Live Stream Settings) ) {
+        my $code = do { local ( @ARGV, $/ ) = ($f); <> } // next;
+        $code =~ s/^\s*#.*$//mg;
+        push @writes, "$f: $1" while $code =~ /((?:->set|->remove|->delete)\s*\(\s*['"](?:autodiscover|addresses)['"]|->migrate\b)/g;
+    }
+    is( join( '; ', @writes ) || 'none', 'none',
+        'nothing in the plugin writes autodiscover or addresses - only the settings page saves them, so an update keeps a user\'s mode and list' );
+    my ($init) = $src =~ /(\$prefs->init\([^;]*\);)/s;
+    is( scalar( () = $src =~ /\$prefs->init\(/g ), 1, 'and init is called ONCE - one place a default can come from' );
+    ok( scalar( ( $init // '' ) !~ /\bset\b/ ), 'CONTROL: that one init is an init, not a set' );
+    $prefs->set( $_ => $was{$_} ) for keys %was;
+}
+
+print "-- a save is applied ONCE, after both prefs are stored --\n";
+{
+    no warnings qw(redefine once);
+    my $applied = 0;
+    local *Plugins::HQPlayerBridge::Plugin::_applySettings = sub { $applied++ };
+    Slim::Utils::Timers::_reset();
+    Plugins::HQPlayerBridge::Plugin::_settingsChanged();    # addresses stored
+    Plugins::HQPlayerBridge::Plugin::_settingsChanged();    # autodiscover stored
+    is( $applied, 0, 'not in the middle of the save - LMS fires once per pref, and the first sees half of it' );
+    Slim::Utils::Timers::_fireAll();
+    is( $applied, 1, 'but once, on the next turn, with both stored' );
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- discovery ON: the box is not used --\n";
+with_rig( { '10.5.0.8' => 'Ignored' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.8', autodiscover => 1 );
+    is( scalar @$asked, 0, 'an address left in the pref is never asked - two modes, never both' );
+    is( join( '|', @$ev ), '', 'and makes no player' );
+    is( scalar @{ $A->list }, 0, 'the typed list is empty' );
+} );
+
+print "-- a typed address is keyed exactly as a discovery reply --\n";
+with_rig( { '10.5.0.1' => 'MacMini' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.1', autodiscover => 0 );
+
+    my $want = $ids->( [ { ip => '10.5.0.1', name => 'MacMini' } ] )->{'10.5.0.1'}{id};
+    is( join( '|', @$ev ), "create $want 10.5.0.1",
+        'identified over TCP, it gets the id discovery gives the same name - one id, the same one' );
+    is( $want, Plugins::HQPlayerBridge::Plugin::_idFor('MacMini'), 'which is the plain name-derived id' );
+    is( scalar @$asked, 1, 'and it cost one GetInfo' );
+
+    # It is never expired: rounds pass, it answers nothing more, it stays.
+    @$ev = ();
+    $reg->{$want}{client}{ctl}{up} = 0;  $reg->{$want}{client}{ctl}{proven} = 0;
+    $fullRound->() for 1 .. 5;
+    is( join( '|', @$ev ), '', 'a typed address is never expired - five silent rounds remove nothing' );
+    is( scalar @$asked, 1, 'and while its player exists, its own link is left to reconnect - no extra GetInfo' );
+} );
+
+print "-- removing an address takes its player AT ONCE; adding it back returns the same one --\n";
+with_rig( { '10.5.0.2' => 'Study' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.2, 10.5.0.12', autodiscover => 0 );
+    my $id = Plugins::HQPlayerBridge::Plugin::_idFor('Study');
+    ok( $reg->{$id} && $reg->{$id}{client}->connected, 'a connected player at the typed address' );
+
+    @$ev = ();
+    save( addresses => '10.5.0.12' );
+    is( join( '|', @$ev ), "teardown $id", 'deleted from the box: its player goes on save, connected or not' );
+
+    @$ev = ();
+    save( addresses => '10.5.0.2, 10.5.0.12' );
+    is( join( '|', @$ev ), "create $id 10.5.0.2", 'added back: the SAME id - its prefs and playlist are still there' );
+} );
+
+with_rig( { '10.5.0.3' => 'Moved', '10.5.0.4' => 'Moved' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.3', autodiscover => 0 );
+    my ($id) = keys %$reg;
+    @$ev = ();
+    save( addresses => '10.5.0.4' );
+    is( join( '|', @$ev ), "teardown $id|create $id 10.5.0.4",
+        'HQPlayer moved: replacing the address in the box brings the same player back' );
+} );
+
+print "-- switching discovery OFF cleans out discovery's players --\n";
+with_rig( {}, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    no warnings qw(redefine once);
+    my @sent;
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { push @sent, $_[0]; 1 };
+
+    save( addresses => '', autodiscover => 1 );
+
+    # Two discovered players; one of them is at the address about to be typed.
+    my $kept  = Plugins::HQPlayerBridge::Plugin::_idFor('Kept');
+    my $other = Plugins::HQPlayerBridge::Plugin::_idFor('Elsewhere');
+    $reg->{$kept}  = { instance => { ip => '10.5.0.5', name => 'Kept' },      name => 'K', link_of(1) };
+    $reg->{$other} = { instance => { ip => '10.5.0.9', name => 'Elsewhere' }, name => 'E', link_of(1) };
+
+    @$ev = ();
+    @sent = ();
+    save( addresses => '10.5.0.5', autodiscover => 0 );
+    is( join( '|', @$ev ), "teardown $other",
+        'every player whose address is not in the box goes on save - connected or not' );
+    ok( $reg->{$kept}, 'the one in the box stays' );
+    is( scalar @$asked, 0,
+        'and is keyed from the player that holds it - NO second control connection to an HQPlayer already connected' );
+    is( ( Plugins::HQPlayerBridge::Addresses::entry('10.5.0.5') || {} )->{name}, 'Kept', 'under that player\'s name' );
+    is( scalar @sent, 0, 'switching off sent nothing' );
+    is( Plugins::HQPlayerBridge::Discovery::listening(), 0, 'discovery is not listening' );
+    ok( !Plugins::HQPlayerBridge::Discovery::_socket(), 'and holds no socket' );
+
+    # Rounds pass: it stays, keyed as it was.
+    @$ev = ();
+    $fullRound->() for 1 .. 2;
+    is( join( '|', @$ev ), '', 'and rounds later it is still the same player' );
+} );
+
+print "-- the settings page's answer keys the address - no second GetInfo --\n";
+with_rig( { '10.5.0.30' => 'Told', '10.5.0.31' => 'Told2' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    # Switching off: the round the restart runs keys it.
+    $A->can('answered')->( '10.5.0.30', { name => 'Told' } );
+    save( addresses => '10.5.0.30', autodiscover => 0 );
+    my $id = Plugins::HQPlayerBridge::Plugin::_idFor('Told');
+    is( join( '|', @$ev ), "create $id 10.5.0.30", 'switching off: the player is made from the page\'s answer' );
+    is( scalar @$asked, 0, 'with no GetInfo of its own' );
+
+    # Already off: the apply's own verify keys it.
+    @$ev = ();
+    $A->can('answered')->( '10.5.0.31', { name => 'Told2' } );
+    save( addresses => '10.5.0.30, 10.5.0.31' );
+    is( join( '|', @$ev ), 'create ' . Plugins::HQPlayerBridge::Plugin::_idFor('Told2') . ' 10.5.0.31',
+        'already off: the same' );
+    is( scalar @$asked, 0, 'again with no GetInfo' );
+
+    # held() - what the page asks before it connects.
+    is( $A->can('held')->('10.5.0.30'), 'Told', 'held(): a CONNECTED player at the address names it' );
+    $reg->{$id}{client}{ctl}{up} = 0;  $reg->{$id}{client}{ctl}{proven} = 0;
+    is( $A->can('held')->('10.5.0.30'), undef, 'held(): CONTROL - its link down, it proves nothing' );
+    is( $A->can('held')->('10.5.0.99'), undef, 'held(): no player there, nothing' );
+} );
+
+print "-- switching discovery OFF with an EMPTY box: every player goes, nothing is found --\n";
+with_rig( {}, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    no warnings qw(redefine once);
+    my @sent;
+    local *Plugins::HQPlayerBridge::Discovery::_sendTo = sub { push @sent, $_[0]; 1 };
+
+    save( addresses => '', autodiscover => 1 );
+    my $x = Plugins::HQPlayerBridge::Plugin::_idFor('X');
+    my $y = Plugins::HQPlayerBridge::Plugin::_idFor('Y');
+    $reg->{$x} = { instance => { ip => '10.5.0.40', name => 'X' }, name => 'X', link_of(1) };
+    $reg->{$y} = { instance => { ip => '10.5.0.41', name => 'Y' }, name => 'Y', link_of(0) };
+
+    @$ev = (); @sent = ();
+    save( addresses => '', autodiscover => 0 );
+    is( join( '|', sort @$ev ), join( '|', sort "teardown $x", "teardown $y" ),
+        'every player goes on save, connected or not' );
+    is( Plugins::HQPlayerBridge::Discovery::listening(), 0, 'discovery is OFF - not kept on for an empty box' );
+
+    @$ev = ();
+    $answer->('X');
+    $fullRound->() for 1 .. 3;
+    is( join( '|', @$ev ), '', 'and rounds later nothing has been found or made' );
+    is( scalar @sent . '/' . scalar @$asked, '0/0', 'with no datagram and no GetInfo' );
+} );
+
+print "-- switching discovery ON cleans out the typed players --\n";
+with_rig( { '10.5.0.10' => 'Typed' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.10', autodiscover => 0 );
+    my $id = Plugins::HQPlayerBridge::Plugin::_idFor('Typed');
+    ok( $reg->{$id} && $reg->{$id}{client}->connected, 'a connected typed player' );
+
+    @$ev = ();
+    save( addresses => '', autodiscover => 1 );     # what the page saves: the box cleared
+    is( join( '|', @$ev ), "teardown $id", 'it goes at once, connected or not - discovery finds again what it can reach' );
+    is( scalar @{ $A->list }, 0, 'and the typed list is empty' );
+    is( Plugins::HQPlayerBridge::Discovery::listening(), 1, 'discovery is listening' );
+} );
+
+print "-- a rename while discovery is on is picked up when it is switched off --\n";
+with_rig( { '127.0.0.1' => 'OldName' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    # Discovery on; HQPlayer is renamed, and discovery hears the new name -
+    # which makes NewName's player, as it always has (a rename is a new id:
+    # `the discovery name is a SETTING`).
+    save( addresses => '', autodiscover => 1 );
+    $answer->('NewName');
+    $fullRound->();
+    my $new = Plugins::HQPlayerBridge::Plugin::_idFor('NewName');
+    ok( $reg->{$new}, 'discovery hearing the new name makes that player' );
+
+    # Switching off with that address typed must not bring an older name back
+    # (found in review 2026-09-27, when both modes could run at once).
+    @$ev = ();
+    save( addresses => '127.0.0.1', autodiscover => 0 );
+    $fullRound->();
+    my $old = Plugins::HQPlayerBridge::Plugin::_idFor('OldName');
+    ok( !grep( { /^create \Q$old\E/ } @$ev ), 'switching discovery off does NOT bring an old name back' );
+    ok( $reg->{$new} && !grep( { $_ eq "teardown $new" } @$ev ), 'the player it is now stays' );
+} );
+
+print "-- two typed addresses answering to one name: the live one keeps the plain id --\n";
+with_rig( { '10.5.0.20' => 'Twin', '10.5.0.21' => 'Twin' }, sub {
+    my ( $ev, $asked, $reg ) = @_;
+
+    save( addresses => '10.5.0.20, 10.5.0.21', autodiscover => 0 );
+    $fullRound->();
+    my @ids = sort keys %$reg;
+    is( scalar @ids, 2, 'two HQPlayers answering to one name are two players, told apart by address' );
+    ok( !$reg->{ Plugins::HQPlayerBridge::Plugin::_idFor('Twin') }, 'neither holds the plain id' );
+} );
+
 
 print "-- one connected test: Player::connected, nowhere else --\n";
 {
@@ -696,34 +1153,6 @@ print "-- one connected test: Player::connected, nowhere else --\n";
     $src =~ s/^\s*#.*$//mg;
     my @copies = $src =~ /(->proven\b)/g;
     is(scalar @copies, 0, 'Plugin.pm has no copy of the connected test of its own');
-}
-
-print "-- discovery: the connected answer is the player's own --\n";
-{
-    # Discovery goes quiet (IDLE_PERIOD) only on this answer, so it must be the
-    # one Material shows - Player::connected - and nothing else.
-    package FakeConn; sub new { bless { c => $_[1] }, $_[0] } sub connected { $_[0]->{c} }
-    package main;
-
-    my $br = Plugins::HQPlayerBridge::Plugin::bridges();
-    local $br->{'02:00:00:00:00:99'} = { instance => { ip => '10.9.9.9' }, client => FakeConn->new(1) };
-
-    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.9'), 1,
-       'a connected player at that address reads connected');
-    $br->{'02:00:00:00:00:99'}->{client} = FakeConn->new(0);
-    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.9'), 0,
-       'a disconnected one does not');
-    is(Plugins::HQPlayerBridge::Plugin::_linkUpFor('10.9.9.8'), 0,
-       'an address with no player yet does not');
-
-    my $src = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
-    ok(scalar( $src =~ /Discovery->start\(\s*\\&_onInstances,\s*\\&_linkUpFor\s*\)/ ),
-       'and it is what the plugin hands discovery');
-
-    # One probe a round: nothing reschedules _probe inside a round.
-    my $dsrc = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Discovery.pm'); <> };
-    $dsrc =~ s/^\s*#.*$//mg;
-    ok(scalar( $dsrc !~ /setTimer\([^;]*\\&_probe/ ), 'a round sends one probe, not a burst');
 }
 
 print "-- reconcile: a partial list must never remove a player --\n";
@@ -823,15 +1252,21 @@ is($i[0]->{weblink}, Plugins::HQPlayerBridge::Live::PATH(),
 # THE ROWS SIMON DID NOT ASK FOR AND MUST NOT COME BACK.
 is(scalar( grep { ($_->{nextWindow} // '') eq 'refresh' } @i ), '0',
    'there is NO manual Refresh row - a live view was asked for, not a button');
-is(scalar( grep { ($_->{weblink} // '') =~ /settings/ } @i ), '0',
-   'and nothing links to a settings page - there is not one any more');
+# THE SETTINGS PAGE CAME BACK (2026-09-27): typed addresses and the discovery
+# switch. Its row is SECOND and always there, so it never moves a positional
+# Restart row within a run.
+is($i[1]->{name}, 'PLUGIN_HQPLAYER_SETTINGS', 'the settings row is SECOND');
+is($i[1]->{weblink}, Plugins::HQPlayerBridge::Plugin::SETTINGS_PATH(),
+   'and weblinks to the page Settings.pm registers');
+my ($spage) = do { local (@ARGV,$/) = ('Plugins/HQPlayerBridge/Settings.pm'); <> } =~ /protectURI\('([^']+)'\)/;
+is('/' . ($spage // ''), $i[1]->{weblink}, 'the same path, not a copy that can drift');
 
 # WITH A BRIDGE PRESENT there is nothing to say about waiting - the waiting rows
 # below must not appear here as well.
 is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_LIVE_WAITING' } @i ), '0',
    'a discovered bridge draws no waiting row');
 
-my @status = @i[1 .. $#i];
+my @status = @i[2 .. $#i];
 is(scalar( grep { ($_->{type} // '') ne 'text' } @status ), '0',
    'every status row is type=text - a non-playable row with no action gets one FORCED on by XMLBrowser');
 
@@ -980,15 +1415,18 @@ print "-- nothing discovered yet SAYS so, in the same words as the live page --\
 {
     my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
     %$reg = ();
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Discovery::listening = sub { 1 };   # discovery on, as by default
     my $feed;
     Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
     my @i = @{ $feed->{items} || [] };
     is($i[0]->{type}, 'link', 'the live-view row is still first');
-    is($i[1]->{name}, 'PLUGIN_HQPLAYER_LIVE_WAITING',
-       'and an empty registry says it is waiting for the player');
-    is($i[2]->{name}, 'PLUGIN_HQPLAYER_NONE_DESC',
+    is($i[1]->{name}, 'PLUGIN_HQPLAYER_SETTINGS', 'then the settings row, even with nothing found');
+    is($i[2]->{name}, 'PLUGIN_HQPLAYER_WAIT_AUTO',
+       'and an empty registry says what it is waiting for - with discovery on, looking on the network');
+    is($i[3]->{name}, 'PLUGIN_HQPLAYER_NONE_DESC',
        'with the discovery diagnostic under it');
-    is(scalar( grep { ($_->{type} // '') ne 'text' } @i[1 .. $#i] ), '0',
+    is(scalar( grep { ($_->{type} // '') ne 'text' } @i[2 .. $#i] ), '0',
        'both are plain text rows - a non-playable item with an action navigates when tapped');
 }
 
@@ -1091,12 +1529,13 @@ print "-- the restart row --\n";
     Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
     my @r = @{ $feed->{items} };
     is($r[0]{name}, 'PLUGIN_HQPLAYER_LIVE_TITLE', 'the Live View row is still first');
-    is($r[1]{name}, 'PLUGIN_HQPLAYER_RESTART', 'then Restart, ABOVE the instance blocks');
-    is($r[1]{type}, 'link', 'as a link');
-    is($r[1]{passthrough}[0]{id}, 'aa', 'carrying the bridge id, not an address that can move');
-    ok(scalar( !exists $r[1]{nextWindow} ), 'with no nextWindow - it opens a page, it is not the banned Refresh row');
-    is($r[2]{name}, 'HQPlayer (Test)', 'then the instance name row');
-    is(scalar( grep { ($_->{type} // '') ne 'text' } @r[2 .. $#r] ), '0',
+    is($r[1]{name}, 'PLUGIN_HQPLAYER_SETTINGS', 'then the fixed settings row');
+    is($r[2]{name}, 'PLUGIN_HQPLAYER_RESTART', 'then Restart, ABOVE the instance blocks');
+    is($r[2]{type}, 'link', 'as a link');
+    is($r[2]{passthrough}[0]{id}, 'aa', 'carrying the bridge id, not an address that can move');
+    ok(scalar( !exists $r[2]{nextWindow} ), 'with no nextWindow - it opens a page, it is not the banned Refresh row');
+    is($r[3]{name}, 'HQPlayer (Test)', 'then the instance name row');
+    is(scalar( grep { ($_->{type} // '') ne 'text' } @r[3 .. $#r] ), '0',
        'and every row below the restart block is text - nothing below it can be tapped');
 
     # CONTROL: an unknown host gets no row.
@@ -1184,8 +1623,8 @@ print "-- the restart row --\n";
         $now += 61;
         Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
         is(scalar(@$REQ), '2', 'and again once a minute has passed');
-        # A LINK-UP is throttled too: reconnectNow retries a refusing instance
-        # every discovery round, and each accept probes. Unthrottled it was a
+        # A LINK-UP is throttled too: the link retries a refusing instance
+        # every 10s (Control::BACKOFF_MAX), and each accept probes. Unthrottled it was a
         # dead :8090 GET every ~10s for ever on a host with no helper.
         Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.7');
         is(scalar(@$REQ), '2', 'a link-up inside the minute is throttled as well');

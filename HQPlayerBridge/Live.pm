@@ -120,6 +120,13 @@ sub _page {
         controls   => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_CONTROLS' ),
     );
 
+    # The waiting line is the mode's own (Plugin::waitingText), so the page is
+    # right from its first paint; the poll keeps it right after that. Reached
+    # at call time: a sibling `use` would die at BEGIN in a checkout.
+    my $wait = Plugins::HQPlayerBridge::Plugin->can('waitingText');
+    my $line = $wait ? $wait->($c) : '';
+    $L{waiting} = $line if length $line;
+
     $_ = _esc($_) for values %L;
 
     my $ver = _esc($VERSION);
@@ -559,6 +566,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     // ---------------------------------------------------------------------
     var el   = null;   // the panel's elements, once built
     var CUR  = null;   // the bridge the controls are addressed to
+    var WAIT = L.waiting;   // what it is waiting for - the poll's `waiting`, true to the mode
 
     // WHICH INSTANCE THE PANEL DRIVES, when there is more than one.
     //
@@ -1023,7 +1031,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         var html;
 
         if (!loop || !loop.length) {
-            html = '<div class="card"><div class="v">' + esc(L.waiting) + '</div></div>';
+            html = '<div class="card"><div class="v">' + esc(WAIT || L.waiting) + '</div></div>';
         } else {
             html = '';
             for (var i = 0; i < loop.length; i++) {
@@ -1050,6 +1058,11 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             html += row(L.processing, b.speed);
                 html += row('', b.tier);
                 html += '</div>';
+            }
+            // A typed address still waiting, BELOW the connected ones - the
+            // server sends '' when nothing is.
+            if (WAIT) {
+                html += '<div class="card"><div class="v">' + esc(WAIT) + '</div></div>';
             }
         }
 
@@ -1135,6 +1148,11 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
                 // Nothing is wrong there: the poll answered, and the answer is
                 // that the player has not turned up yet. Say exactly that.
                 var loop = r.bridges_loop || [];
+                // The mode can change under the page (a save in Settings),
+                // so what it is waiting for is re-read on every poll.
+                // '' means waiting for nothing - the line goes; a reply with
+                // no field at all keeps the last one.
+                if (typeof r.waiting === 'string') { WAIT = r.waiting; }
                 LAST = loop;
                 // update() FIRST: it sets CUR, and render() marks that bridge's
                 // card as the selected one.

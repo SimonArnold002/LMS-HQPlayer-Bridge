@@ -1,6 +1,6 @@
 # Discovery: find it, add it, let the link keep it
 
-**Status: PLAN, nothing built.** Restarted from scratch 2026-09-27; the previous draft was discarded.
+**Status: BUILT 2026-09-27, uncommitted, not verified live.** What was built, and its tests: CLAUDE.md, `DISCOVERY FINDS, THE LINK KEEPS`. Restarted from scratch 2026-09-27; the previous draft was discarded. Sections 4.5-4.7, 5 and 7 were rewritten the same day to Simon's rules as he gave them while it was built (two modes, off is off, a new address must answer), replacing the first draft's text rather than patching it.
 
 ## 1. The requirement
 
@@ -98,48 +98,89 @@ quietly with its Restart row. The rule stays as it is.
 This is not the two-tier problem: it is a decision taken once, at the end, and neither part waits on
 the other to do its own job.
 
-### 4.5 Configured addresses — one box
+### 4.5 Two modes, never both
 
-Simon: *"a box to enter and save it to our config, not multiple boxes for each player."*
+Simon, 2026-09-27:
 
-- **One field**, several addresses separated by comma, space or newline, validated on save.
-  A bad entry is **named** and nothing is saved, as `hqrestart.py --allow` already does. Empty means
-  the feature is off.
-- **Each address is connected to over TCP and asked `GetInfo`.** Its `name` enters the same table a
-  discovery reply would, so it is keyed identically (§4.3). An address that is both configured and
-  discovered is one row, one player — the table is keyed by address.
-- **A configured address never expires.** While it is not reachable, it is tried once per round
-  (15s). A dead host costs a TCP attempt, not a line in anyone's HQPlayer log.
-- **Removing and re-adding.** Simon: *"devices or networks change so a user needs the ability to
-  remove it and add it again."* The box is the list: delete an address and save, and its player goes
-  **at once** (not at the next round), unless discovery also hears it. Add it back and save, and it
-  is identified again. Because the id comes from the HQPlayer's **name**, not the address, the
-  player that comes back is the **same** player with its settings, playlist and sync group — and so
-  is one whose address changed: replace the old address with the new one and the player follows.
-- **This brings back a settings page.** The old `Settings.pm` went in 0.2.60–0.2.76 when the live
-  view replaced it. House rules: the field must be `pref_<name>` or LMS will not save it, and a
-  failing handler still renders, so a validation error is reported in the page, not thrown. A bare
-  checkbox is invisible in Material's settings view, so the switch below needs the house markup.
+> *"the option to turn off auto discovery and rely purely on IP input needs to be an option."*
+>
+> *"only allow manual ip addresses when auto is turned off. When its turned off clean the records,
+> we should not be having both active at same time."*
+>
+> *"when auto discovery is off all players are removed, same happens when we have players and go
+> back to autodiscovery that was the entire premise of this addition. It should not discover or
+> add any player without an IP added when in manual mode and vice versa when in auto discovery."*
 
-### 4.6 Automatic discovery can be switched off
+One setting, **Find HQPlayer**, with two options. Exactly one is in force at a time:
 
-Simon: *"the option to turn off auto discovery and rely purely on IP input needs to be an option."*
+| | **Automatically** | **Only at the addresses below** |
+|---|---|---|
+| where players come from | discovery replies only | the typed addresses only |
+| UDP | one multicast probe a round (§4.1) | **none**: no socket, no probe, `probeNow` does nothing, nothing in any HQPlayer's log |
+| the address box | not used; greyed out on the page, and **cleared** when saved | the whole list |
+| an empty box means | nothing (it is always empty) | **no players**, and nothing is found until an address is typed. Never refused, never a fallback to discovering |
+| an HQPlayer whose address changes | followed (§5) | not followed: its link drops, and the user replaces the address |
 
-- **One switch on the same page, "Find HQPlayer automatically", on by default** — so an upgrade
-  changes nothing for anyone who does not touch it.
-- **Off means no UDP at all**: discovery is not started, no socket is opened, no probe is sent, so
-  the bridge writes **nothing** to any HQPlayer's log. The link-drop `probeNow` is a no-op.
-- **Players come only from the box.** On saving it off, every player whose address is not in the
-  box is removed at once; its settings stay under its id, so typing its address later brings the
-  same player back.
-- **Removal is then the box alone.** "Not heard by discovery" cannot apply, so a configured player
-  stays for as long as its address is in the box. It still leaves Material the instant its link
-  drops, as every player does.
-- **A DHCP move is not followed** with discovery off — there is nothing to hear the new address.
-  The user updates the box (or gives HQPlayer a fixed address). Said on the settings page, next to
-  the switch.
-- **Off with an empty box is refused on save**, with the reason, rather than saved as a bridge that
-  can never find anything — the same rule as `hqrestart.py` refusing an empty allow list.
+**Switching cleans out the other mode, at once, connected or not:**
+
+- **Automatic → addresses only:** every player whose address is not in the box is removed on save,
+  and discovery's table is dropped. With an empty box, that is every player. A player at an address
+  that IS typed stays, named from its own player, with no second connection opened to it.
+- **Addresses only → automatic:** the box is cleared (Simon's pick of three: clear it, rather than
+  refuse the save or keep it unused), every typed player is removed on save, and discovery finds
+  again whatever it can reach.
+
+Either way a player's settings stay under its id, so one that comes back, from either mode, is the
+**same** player with its prefs and playlist (§4.3).
+
+**The default mode** lives in one place, `Addresses::AUTO_DEFAULT`, and it is **automatic**, so a
+new install, or an update from a release without this setting, behaves exactly as before (the
+test builds 1.0.30-1.0.33 had it off, Simon's call for testing). **An update never overrides a
+user's choice:** the default only fills a setting that has never been stored, the settings page
+always stores an explicit choice, and nothing else in the plugin writes it.
+
+### 4.6 The addresses mode: one box
+
+Simon: *"a box to enter and save it to our config, not multiple boxes for each player"* and
+*"devices or networks change so a user needs the ability to remove it and add it again."*
+
+- **One field**, several addresses separated by commas, spaces, semicolons or new lines. **IP
+  addresses only** (decision 1). A bad entry is **named** and nothing is saved, not even the good
+  ones.
+- **A new address is saved only if HQPlayer answers there.** Simon: *"we stipulate HQP must be up
+  and running to establish a valid connection"*, the same shape as LBF's API-token check. On save,
+  each address the save ADDS is asked `<GetInfo/>` over TCP, and the page waits (up to 8s) for the
+  answers. If any one does not answer, the whole save is refused and that address is named. If all
+  answer, the page names the HQPlayer that answered at each. An address already saved is not
+  re-checked, so one HQPlayer being off never blocks editing the others. An address whose player
+  is already connected counts as answered: that link is the valid connection.
+- **One connection per new address.** The page's answer is handed on, so applying the save does
+  not ask the same HQPlayer again.
+- **Keyed by HQPlayer's name**, which `GetInfo` returns exactly as discovery does (§4.3), so a
+  typed address gets the same id discovery would have given it.
+- **A typed address never expires.** Its player stays for as long as the address is in the box,
+  and leaves Material the instant its link drops, as every player does. While there is no player
+  (HQPlayer off since the save), it is tried over TCP once a round (15s). A dead host costs a TCP
+  attempt, not a line in anyone's HQPlayer log.
+- **Removing and re-adding.** Delete an address and save: its player goes **at once**. Add it back
+  and save: the **same** player returns. HQPlayer moved: replace the old address with the new one,
+  and the same player follows.
+
+### 4.7 The settings page
+
+It brings back `Settings.pm` (the old one went in 0.2.60-0.2.76, when the live view replaced it),
+built to the fleet's rules:
+
+- **The mode is a radio group to LBF's spec**, a bug that has caught the fleet more than once:
+  each option wrapped in a `<label>`, one per line with `<br>`, never a `<select>`, and EXACTLY ONE
+  option checked in every state, decided in Perl rather than by matching a stored value in the
+  template.
+- Every field is `pref_<name>`. A hidden sentinel field means a partial POST changes nothing.
+- Material never shows `warning`, so every result (a refusal and its reason, or the names that
+  answered) is drawn in the page itself.
+- The page calls nothing in `Plugin.pm`. A save takes effect through the prefs' change handler,
+  applied once both prefs are stored.
+- Linked from LMS's plugin list (`optionsURL`) and from a Settings row in the Apps feed.
 
 ## 5. Today vs after, scenario by scenario
 
@@ -156,8 +197,8 @@ Simon: *"the option to turn off auto discovery and rely purely on IP input needs
 | a same-named pair shrinks to one | survivor takes the plain id, guard stops a duplicate | same — code untouched | = |
 | daemon answers discovery, refuses control | player invisible, Restart row stays, retried each ~10s | same, retried on the link's ≤10s ladder | = |
 | multicast unreliable, instance connected | kept (unicast sustains the table; the link would anyway) | kept by its link | = |
-| multicast unreliable, instance **not** connected | kept while unicast answers | removed after 300s — **type its address** | changed |
-| multicast blocked entirely | never found | **type its address** | better |
+| multicast unreliable, instance **not** connected | kept while unicast answers | removed after 300s — **switch to addresses only and type its address** | changed |
+| multicast blocked entirely | never found | **switch to addresses only and type its address** | better |
 | HQPlayer on two active interfaces | permanent split into two players (declined scope) | the unused address ages out after 300s and they collapse to the plain id | changed, unsupported config |
 
 The two "changed" rows are the only departures, and both are on configurations the address box
@@ -167,12 +208,15 @@ New cases, which have no "today":
 
 | what happens | after |
 |---|---|
-| an address is removed from the box | its player goes on save, unless discovery also hears it |
-| the same address is added back | identified over TCP; the **same** player returns with its settings |
-| HQPlayer's address changes, discovery **on** | followed automatically, as today |
-| HQPlayer's address changes, discovery **off** | its link drops; replace the address in the box and the same player returns |
-| discovery switched **off** | no UDP at all; players not in the box go on save |
-| discovery **off**, box empty | refused on save, with the reason |
+| switched to **addresses only**, box empty | every player goes on save; nothing is found until an address is typed |
+| switched to **addresses only**, box filled | every player not in the box goes on save; a connected one at a typed address stays |
+| switched back to **automatically** | the box is cleared, every typed player goes on save, discovery finds again what it can reach |
+| a new address is typed, HQPlayer running there | saved, and the page names the HQPlayer that answered |
+| a new address is typed, nothing answers | refused, the address named, nothing saved |
+| an address is removed from the box | its player goes on save |
+| the same address is added back | the **same** player returns with its settings |
+| HQPlayer's address changes, **automatically** | followed, as today |
+| HQPlayer's address changes, **addresses only** | its link drops; replace the address in the box and the same player returns |
 
 ## 6. The polling
 
@@ -195,9 +239,16 @@ The link's own traffic (`Status` when quiet for 10s) is unchanged.
    reason. Validation refuses a hostname and names it.
 2. **`GetInfo` name = discovery name on Desktop as well as Embedded** — measured 2026-09-27, §4.3.
 3. **Addresses can be removed and re-added, and automatic discovery can be switched off**
-   (Simon, 2026-09-27) — §4.5 and §4.6. Discovery stays **on** by default.
-
-Nothing is left open.
+   (Simon, 2026-09-27): §4.6 and §4.5.
+4. **Two modes, never both, and off is off** (Simon, 2026-09-27): §4.5. This replaced the first
+   draft's single table, where a typed address could also be discovered and "off with an empty box"
+   was refused on save. Both are gone: no address is ever in both modes, and an empty box with
+   discovery off means no players.
+5. **Switching back to automatic clears the box** (Simon's pick of three, 2026-09-27): §4.5.
+6. **A new address must answer before it is saved** (Simon, 2026-09-27): §4.6.
+7. **The mode is a radio group to the fleet's spec** (Simon, 2026-09-27): §4.7.
+8. **Default mode: automatic; an update never overrides a user's choice** (Simon, 2026-09-27,
+   after off-by-default test builds): §4.5.
 
 ## 8. What changes in the code
 
@@ -210,10 +261,10 @@ Bridge's `Discovery.pm` has one, so there is fleet precedent). `_schedule` becom
 nothing found, else 15s. The comment on the throttled restart probe in `Plugin::_onLinkState`
 cites `reconnectNow`'s pace and must be reworded.
 
-**Added:** the address field, its validation, the TCP `GetInfo` identify step, the discovery
-switch (starting and stopping `Discovery` when it is saved), and a settings page. Saving the page
-reconciles at once: removed addresses and, with discovery off, every non-configured player go on
-save.
+**Added:** `Addresses.pm` (the box: parsing, keying by `GetInfo` name, the once-a-round retry);
+`Control::identify` (one connection, one `<GetInfo/>`, closed); `Settings.pm` and its template
+(the radio group, the box, the connection check on save); the mode switch, which starts and stops
+`Discovery`'s UDP and cleans out the other mode's players on save (§4.5).
 
 **Untouched:** `_idsFor`, `_liveOf`, `_isSplit`, `_idFor`, `_nameFor`, DHCP follow, the pair re-key
 guard, `INSTANCE_TTL` (300s), partial-list player creation on the first reply, `Player::connected`,
@@ -227,14 +278,19 @@ poke, the `_linkUpFor` block and the `start` signature; `t_control.pl`: the `rec
 - the socket survives a round, and a reply after `LISTEN_TIME` is accepted
 - a link drop triggers one probe, and only one
 - a dropped link returns within 10s with discovery stopped
-- a configured address and a discovery reply with the same `name` give **one id** — the same one
-- a configured address is never expired; a removed one goes **on save** unless discovery hears it
-- removed then re-added, an address gets back the **same id** it had
-- a bad address or a hostname is named and nothing is saved; an empty field saves as off
-- discovery off: no socket is opened and no datagram is sent, `probeNow` sends nothing, and every
-  player not in the box is removed on save
-- discovery off with an empty box is refused, and nothing is saved
-- discovery defaults to on, so an upgraded install behaves exactly as before
+- a typed address gets the same id discovery gives the same `name`
+- a typed address is never expired; a removed one goes **on save**; re-added, it is the **same id**
+- a bad address or a hostname is named and nothing is saved
+- a new address is saved only if HQPlayer answers; one that does not refuses the whole save and is
+  named; an address already saved is not re-checked; a connected one opens no second connection
+- automatically: the box is never used, and a save clears it; switching on removes every typed
+  player
+- addresses only: no socket, no datagram, `probeNow` sends nothing; switching off removes every
+  player not in the box; an EMPTY box saves and leaves no players, and nothing is ever found
+- the radio group: label-wrapped, `<br>`-separated, no `<select>`, exactly one checked in every
+  stored state
+- the default is `Addresses::AUTO_DEFAULT`, pinned ON; a stored OFF starts with no socket and no
+  probe; nothing in the plugin writes either setting except the settings page
 - `INSTANCE_TTL` stays 300 and removal still needs *both* not-connected and not-heard
 
 The `CLAUDE.md` ledger entries that cite `reconnectNow`, `COLD_PERIOD`, `_linkUpFor` or the unicast

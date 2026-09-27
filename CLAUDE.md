@@ -60,13 +60,13 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `_liveOf` collapsing an established PAIR when one member misses a round (`_isSplit`, `_onInstances` passing `\%bridges`) | **FIXED** 1.0.9 — found in review 2026-09-21, introduced by 1.0.8 | `AN ESTABLISHED PAIR IS NOT A DHCP MOVE` |
 | a DEAD address in a still-duplicated group keeping an address-qualified player until it expires (`_idsFor`, the `@$group` loop) | **DECLINED** 2026-09-21 — pre-existing in 1.0.7, it is `INSTANCE_TTL`'s designed grace, and looping `@$live` would strip that grace from a quiet member of a real pair | `a quiet pair member and a dead address are the same row` |
 | a brand-new same-named instance appearing while the first is QUIET is treated as a DHCP move for one round | **RESIDUAL, ACCEPTED** 2026-09-21 — inherent to fixing the DHCP move; bounded and characterised | `S9 - the one-round residual` |
-| one host on TWO interfaces (Ethernet + Wi-Fi), a PERMANENT split | **DECLINED** 2026-09-20, Simon's call — the vendor documents single-interface operation | `more than one interface active is DECLINED` |
+| one host on TWO interfaces (Ethernet + Wi-Fi), a PERMANENT split; BOTH its addresses typed in addresses mode (two connections to one HQPlayer); a "one name = one connection" guard | **DECLINED** 2026-09-20, **RE-DECLINED 2026-09-27**, Simon's call — the vendor documents single-interface operation, and a name guard would merge two Embedded boxes (same default name) | `more than one interface active is DECLINED` |
 | the licence `fingerprint` as a stable machine identity | **WRONG, MEASURED** 2026-09-20 — it is INTERFACE-derived, DO NOT RE-PROPOSE | `the fingerprint is not a machine identity` |
 | renaming an instance making a NEW player and stranding its settings (`_idFor`, the discovery name) | **KNOWN, UNFIXED** 2026-09-20 — the name is a user-editable field, not a product string | `the discovery name is a SETTING` |
 | NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
-| `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance | `Lyrion's 5-second heartbeat` |
-| the flat 5s discovery pace, `PROBE_BURST` (3 probes a round); discovery traffic filling HQPlayer's log | **REVERSED** 2026-09-25, Simon: "why are we polling more" - ONE probe a round; 2/4/8/10s while nothing is found, 10s while a known one is not connected, `IDLE_PERIOD` 15s once all are connected (`_linkUpFor` = `Player::connected`). A new HQPlayer appears within ~15s. NAA plays NO part | `DISCOVERY PACE 2026-09-25` |
-| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down now DOES call playerInactive unless the only active player (2026-09-27, see `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`), `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
+| `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance. **Pace SUPERSEDED 2026-09-27** - see `DISCOVERY FINDS, THE LINK KEEPS` | `Lyrion's 5-second heartbeat` |
+| the flat 5s discovery pace, `PROBE_BURST` (3 probes a round); discovery traffic filling HQPlayer's log | **REVERSED** 2026-09-25, Simon: "why are we polling more" - ONE probe a round; 2/4/8/10s while nothing is found, 10s while a known one is not connected, `IDLE_PERIOD` 15s once all are connected (`_linkUpFor` = `Player::connected`). A new HQPlayer appears within ~15s. NAA plays NO part. **SUPERSEDED 2026-09-27** (built from the plan): no link state in the pace, no unicast - see `DISCOVERY FINDS, THE LINK KEEPS` | `DISCOVERY PACE 2026-09-25` |
+| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down now DOES call playerInactive unless the only active player (2026-09-27, see `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`; sync groups themselves are NOT SUPPORTED, see `SYNC GROUPS ARE NOT SUPPORTED - FINAL`), `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
 | `client new` sent only by the plugin's `_create`, so moving it moves the announcement | **WRONG, MEASURED** 2026-09-25 - `Slim::Player::Client::new` sends it itself (Client.pm:315); the offline stub does not, which hides it | `the constructor already sends` |
 | an expired HQPlayer trial that REPLIES with `result="Error"` reading connected (`Control::proven` on any reply) | **DECIDED** 2026-09-25, Simon's call - no trial detection; only a SHUT DOWN HQPlayer must leave the list, and it does | `we cant attempt to work out if its a trial` |
 | `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `DOES interpolate` |
@@ -74,7 +74,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | Windows support for the restart helper - `install.ps1`, `t_powershell.py`, any `win32` branch in `hqrestart.py`; every Windows finding (Store placeholder, `-System` folder lock, `Stop-Helper`, firewall profiles, `pythonw`) | **REMOVED** 2026-09-25, Simon's call - "causing too many problems". macOS and Linux only; `main()` refuses any other OS with exit 2. Do not re-propose, and do not report a Windows gap | `WINDOWS SUPPORT REMOVED` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
 | `_queueTrack` gating a load on "an `hqControl` OBJECT exists" while `Control::send` no longer connects on demand; three `PROBLEM_OPENING` skips for one drop | **FIXED** 2026-09-25 — a knock-on of 1.0.22's send fix, found by review. `Control::up` (the sock-or-connecting test `send` itself makes) is the gate now; pinned in `t_control.pl` and `t_player.pl`. **2026-09-27: that one failure is now a STOP, not a skip** - see `NO LINK IS NOT A BAD TRACK` | `A LOAD IN THE DROP WINDOW` |
-| `_onLinkProven`'s `playerActive` being a no-op on a reconnect (LMS's "already active" guard), a synced member not reloading after an outage | **REVERSED 2026-09-27, Simon's call** (was DECLINED 2026-09-25) — link-down now calls `playerInactive` as Slimproto does, so the reconnect's `playerActive` rejoins the group. See `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` | `PLAYERACTIVE ON A RECONNECT` |
+| `_onLinkProven`'s `playerActive` being a no-op on a reconnect (LMS's "already active" guard), a synced member not reloading after an outage | **DISMISSED - sync groups are not supported, see `SYNC GROUPS ARE NOT SUPPORTED - FINAL`.** History: REVERSED 2026-09-27, Simon's call (was DECLINED 2026-09-25) — link-down now calls `playerInactive` as Slimproto does, so the reconnect's `playerActive` rejoins the group. See `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` | `PLAYERACTIVE ON A RECONNECT` |
 | auto-RESUME after a control-link outage (remember the song + position on the drop, re-load with a seek on the next proven link); "the music does not come back after a config save or a restart" | **DECLINED** 2026-09-26, Simon's call — **HQPlayer has to be sent the WHOLE stream, so any re-load plays from the START; it has always done this.** A "resume" would be a track silently restarting, which is worse than the stop. Do not re-propose from the fact that `_queueTrack` accepts a `$seek` | `RESUME AFTER AN OUTAGE IS DECLINED` |
 | resuming at a position by handing LMS `playlist jump <idx>` with `{ timeOffset => N }` (`Commands.pm:1021` -> `controller->play`, resolved in `Song::open`) | **WRONG, MEASURED LIVE 2026-09-26** — it does NOT seek, and it makes LMS LIE: the clock froze at the claimed offset while the audio played from the track start, and hqplayerd logged NO `Seek to:` line. Do not re-propose from LMS's source | `THE SEEKDATA RESUME IS A DISPLAY LIE` |
 | `set_allow` truncating the TOKEN-bearing config in place (`open(path,'w')`), against its own docstring | **FIXED** 2026-09-25 — sibling + `os.replace`, chmod before the swap; a torn write is pinned in `t_hqrestart.py` | `THE CONFIG WRITE IS ATOMIC` |
@@ -84,7 +84,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `FakeCtl` in `t_player.pl` being a bare `bless {}` with no package, so any new method call on the control link kills 20+ load tests | **FIXED** 2026-09-25 — it is a real stub of `Control`'s accessors (`up`/`connected`/`proven`). Keep it in step when one is added | `FAKECTL IS A REAL STUB` |
 | `HQP_FREEWHEEL`, `freewheel` / `start` written on every `PlaylistAdd`, "an older HQPlayer may not know the attribute" | **MEASURED 2026-09-26** — HQPlayer Embedded **5.17.2 parses the same six `PlaylistAdd` attributes as 6.x**; the whole v5 -> v6 command delta is `GetJunkFilters`, `SetJunkFilter`, `LibraryGetHash` and the `filter_junk` status attribute | `The v5 / v6 control-API delta, measured from the daemons` |
 | "`freewheel` never appears in the user's HQPlayer log", freewheel not taking effect | **NOT A VERSION DIFFERENCE, MEASURED 2026-09-26** — the line is written by the HTTP stream reader ONLY, and Desktop writes no log at all unless the user ticks it | `the freewheel line comes from clStreamReaderHTTP, and Desktop logs nothing by default` |
-| `volume()`, `hqVolDb`, `hqVolSent`, a slider move made while the control link is DOWN | **FIXED** 2026-09-26 (round 2) — the level was recorded as sent, never arrived, and the first `<Status/>` after the reconnect pulled the slider back. Held in `hqVolPending` and re-asserted by `refreshInfo` | `A LEVEL SET WHILE THE LINK IS DOWN` |
+| `volume()`, `hqVolDb`, `hqVolSent`, a slider move made while the control link is DOWN | **FIXED** 2026-09-26 (round 2) — the level was recorded as sent, never arrived, and the first `<Status/>` after the reconnect pulled the slider back. Held in `hqVolPending` and re-asserted by `refreshInfo` **SUPERSEDED 2026-09-27 - the volume code went back to its original (pre-1.0.25) behaviour; see `BACK TO THE ORIGINAL VOLUME`.** | `A LEVEL SET WHILE THE LINK IS DOWN` |
 | `hqWanted` written across a send that a down link dropped (the same class as the volume bug) | **NOT A DEFECT** 2026-09-26 — checked, not guessed: the Status stream heals it at every reconnect | `hqWanted is healed by the Status stream` |
 | `hqrestart.py::main()`, a bare `--allow` with no config path | **FIXED** 2026-09-26 (round 2) — it fell through to serve mode and wrote a config file named `--allow` | `a bare --allow fell through to serve mode` |
 | `client forget` on a CONNECTED bridge player, `clientForgetCommand` returning without `setStatusDone()`, `_onForget` | **DISPROVEN 2026-09-26, MEASURED IN LMS SOURCE** — a REFUSED forget notifies nothing; the subscription cannot see it | `a REFUSED forget notifies nothing` |
@@ -93,10 +93,15 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `volume()` reading `Control::send`'s **1** as delivery; a level set during a reconnect HANDSHAKE (`up` = `sock \|\| connecting`); `volumeAsserted` releasing the hold on any first reply | **FIXED** 2026-09-26 (round 3) — `send` answers 1 for a command it has only QUEUED, and a failed connect drains that queue; `<Volume>` had no callback, so the hold was released and the level recorded as applied. Released by the command's OWN reply now (`_volumeDelivered`) | `THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1` |
 | the helper's installer "installing Python" on macOS; treating Apple's Command Line Tools prompt as something `install.sh` does | **MEASURED 2026-09-26 — IT IS APPLE'S PROMPT, NOT OURS.** `install.sh` never installs anything: no `python3` means exit 1 and an untouched system. macOS ships no Python; `/usr/bin/python3` is a STUB sharing one inode with `/usr/bin/git` and `/usr/bin/clang`, and invoking it is what makes macOS offer the Command Line Tools. Linux has no equivalent | `THE PYTHON PROMPT IS APPLE'S, NOT THE INSTALLER'S` |
 | a volume set while LMS is NOT PLAYING appearing to be forgotten across an HQPlayer restart; `_followVolume` reading `$serverPrefs->client->get('volume')` rather than `$self->volume` | **NOT OURS** 2026-09-26, Simon's call: *"I adjust volume previously when LMS was not playing, this did not get saved, that's the difference and is an LMS issue not ours."* The bridge reads the PERSISTED level BY DESIGN. Do not "fix" it by reading the live value - that breaks `_Resume`'s temporary 0 | `THE LATCH HELD, AND THE 45 WAS LMS NOT SAVING THE LEVEL` |
-| the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
-| the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone | `THE IDLE DIVERGENCE IS BY DESIGN` |
-| the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands | `An endpoint re-registering announces its own level` |
-| a bridge player in a SYNC GROUP - joining, leaving, dropping its link, reconnecting, being removed (`_onLinkState`, `_onLinkProven`, `_teardown`, `Control::_dropLink` order) | **NARROWED 2026-09-27, Simon's call** - sample-accurate audio sync is NOT offered (*Not in v1*), but the player's side of group membership MUST follow Lyrion's players: a finding about that half IS a finding. The 2026-09-27 morning row ("do not report any sync-group scenario") is SUPERSEDED | `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` |
+| the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play **SUPERSEDED 2026-09-27 - the volume code went back to its original (pre-1.0.25) behaviour; see `BACK TO THE ORIGINAL VOLUME`.** | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
+| the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone **SUPERSEDED 2026-09-27 - the volume code went back to its original (pre-1.0.25) behaviour; see `BACK TO THE ORIGINAL VOLUME`.** | `THE IDLE DIVERGENCE IS BY DESIGN` |
+| the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands **SUPERSEDED 2026-09-27 - the volume code went back to its original (pre-1.0.25) behaviour; see `BACK TO THE ORIGINAL VOLUME`.** | `An endpoint re-registering announces its own level` |
+| the 1.0.25 / 1.0.27 / 1.0.28 volume work - a level set while HQPlayer is away held and re-sent (`hqVolPending`, `assertPendingVolume`, `_volumeDelivered`), and the startup-volume latch (`hqVolLinkNew`, `hqVolStartup`, `_lmsOwnsVolume`) | **SUPERSEDED 2026-09-27, Simon: back to the original volume** - removed from `Player.pm`, `t_player.pl`, `Plugin.pm`, `t_plugin.pl`; 1.0.26 (benign `<Volume>` error at debug) KEPT | `BACK TO THE ORIGINAL VOLUME` |
+| a bridge player in a SYNC GROUP - ANY issue: starting, playing, joining, leaving, dropping its link, reconnecting, being removed, timing (`_onLinkState`, `_onLinkProven`, `_teardown`, `Control::_dropLink` order, `chunks`, `startAt`, `playPoint`, `ReadyToStream` in `WAITING_TO_SYNC`) | **NOT SUPPORTED - DISMISSED, FINAL 2026-09-27 (evening), Simon's call** - sync groups are not something the Bridge will support. **Every finding whose scenario involves a sync group is dismissed**: do not report it, do not fix it, do not offer sync handling as a remedy for anything else. Supersedes the same day's `NARROWED` verdict. The measured reason a group never starts is logged so it is not re-derived | `SYNC GROUPS ARE NOT SUPPORTED - FINAL` |
+| a Desktop HQPlayer the bridge cannot find or add (no discovery reply, control RESET from its LAN address, loopback `GetInfo` fine) | MEASURED 2026-09-27 - HQPlayer's own network toggle was OFF, not the plugin; **HQPlayer Desktop switches it off ITSELF when the host's network/IP changes** | `MainWindow.network` |
+| a refused settings save redrawing the TYPED mode and box, so the page looks saved while the server is unchanged | DECLINED 2026-09-27, Simon: "no leave as is" | `no leave as is` |
+| the settings page taking ~5s to refuse a dead address (the check waits out `Control::CONNECT_TIMEOUT`; a shorter identify-only connect timeout, 2s) | KEPT 2026-09-27, Simon: "keep it ... better safe than sorry on slow networks" - a dead host never answers, so only a timeout can say so; measured live HQPlayer accepts in 0.01s, a dead address answers nothing until the timeout | `a dead host never answers` |
+| Material not prompting "Do you want to save them?" when only the MODE radio was changed (a radio's `value` never differs from `defaultValue`); a `<select>` instead, or a hidden mirror field to make Material see it | DECLINED 2026-09-27, Simon: "we can leave it as then not a problem" - measured live: radio-only change + back = no prompt, as the code predicts; a `<select>` breaks the fleet radio rule and Material's check misfires on one | `radio-only change` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -128,6 +133,7 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 
 | Finding | Verdict | Why |
 |---|---|---|
+| "The plugin stopped finding the Mac's HQPlayer Desktop" - it worked earlier the same day, in automatic and by address, and then neither mode could see it | **WRONG, MEASURED 2026-09-27** | HQPlayer Desktop's **network control toggle** (the network button on its main window toolbar) was OFF. Saved in `~/Library/Preferences/com.signalyst.HQPlayer 5 Desktop.plist` as **`MainWindow.network = false`** - HQPlayer 6 Desktop uses that same domain (its own `HQPlayer6Desktop` plist holds only file-dialog state), and it is written only when HQPlayer QUITS, so the file lags the button. **The signature, so the next one is recognised in a minute, not an hour:** HQPlayer running and LISTENING on TCP and UDP 4321; `<GetInfo/>` over **127.0.0.1 answers** (`name="Mac"`); the same over the host's own LAN address (192.168.1.109, from the host itself) is **RESET**; a discovery probe gets **no reply at all, even unicast to 127.0.0.1**; the host's other apps reach the LAN fine (the Mac mini answers the same probe); it **survives HQPlayer restarts** in both bridge modes. Ruled out on the way, each measured: the macOS firewall (off, and it does not filter loopback), a client holding the port (no connection on 4321 at all), the licence (`valid="0"` on Wi-Fi is normal here, and Simon: no licence), the restart helper (HQPlayer was an ordinary app launch). **The plugin cannot set it:** no control command toggles it (none in `Control.pm`'s vocabulary nor in Signalyst's `hqp-control` source), and while it is off only loopback reaches HQPlayer, which the bridge on plex never uses. Fixed by Simon clicking the toolbar button: within seconds discovery answered from .109 and the bridge had `HQPlayer (Mac)` connected beside the Mac mini. **THEN IT HAPPENED AGAIN, AND THAT GAVE THE CAUSE: HQPlayer Desktop turns its network control OFF BY ITSELF WHEN THE HOST'S NETWORK CHANGES.** Simon changed the Mac's IP (his DHCP-move test); macOS logged a new private Wi-Fi MAC at 21:44:13; at 21:44:29 new network connections were refused again while the bridge's EXISTING link stayed up (so the bridge had dropped nothing); the button was off. Simon: *"it must be how it works it was off again after i switched the macs ip"*. The first time (~21:27) fits the same trigger, during his restart/IP testing - not a stray click. **Consequences:** (1) on HQPlayer DESKTOP a move needs the network button switched back ON afterwards - then the bridge follows it (measured minutes later, below); (2) a Desktop host on Wi-Fi with a rotating **private Wi-Fi address** can lose remote control on its own - set that network's Private Wi-Fi address to Off/Fixed; (3) the bridge cannot work round it - the switch is not in the control API, and while off only loopback reaches HQPlayer. **Related, found in the same hour:** every save with that address was REFUSED by the page's connection check (correctly - HQPlayer was refusing), and a refused save changes nothing, the MODE included - but the redrawn page shows the typed mode and box, so it LOOKED like addresses-only while the server was still automatic. Put to Simon as a display fix ((a) a "Still set to" line, (b) the radio back to the saved mode): **DECLINED 2026-09-27, Simon: "no leave as is"** - a refused page keeps showing what was TYPED, mode included. Do not re-propose. |
 | `install.sh --allow` / `install.ps1 -Allow` (via `hqrestart.py --allow`, `set_allow`) REPLACE the whole `allow` list rather than append, so following the helper's refusal hint (`./install.sh --allow <ip>`) drops any second Lyrion server already listed | **BY DESIGN** 2026-09-23, Simon's call | **ONE LYRION SERVER PER HQPLAYER.** Only one Lyrion server should be talking to an HQPlayer, so `allow` naming the one current server is the intended state; replace is correct and append would be the bug. Raised as a minor aside in the 2026-09-23 review of 5775983..6ee1185 and declined there. Do not re-report. |
 | The restart helper should support Windows (`install.ps1`, a scheduled task, `Restart-Service` / `taskkill` / `tasklist`, SID owner checks) | **REMOVED** 2026-09-25, Simon's call | **WINDOWS SUPPORT REMOVED.** Simon: *"remove all support for windows on the helper its causing too many problems."* It had never run on a real Windows install - only in a harness - and in the 2026-09-25 review 4 of 9 findings were Windows installer defects, after four earlier rounds of the same. Deleted: `install.ps1`, `tools/t_powershell.py`, the install.ps1 half of `t_installers.py`, the Windows cases in `t_hqrestart.py`, and every `win32` branch in `hqrestart.py` (`detect_win32`, `win32_owner_sids`, `powershell()`, the tasklist/taskkill paths, `creationflags`, the `pythonw` stderr-to-file fallback). `main()` now exits 2 with "hqrestart runs on macOS and Linux only" on any other OS, before a config or token is written (pinned in `t_hqrestart.py`, fails 2 against the old helper). The plugin side never had Windows code - the Restart row only calls `/ping` and `/restart`. The historical rounds below that discuss Windows are kept as history, not live guidance. |
 | The volume echo guard assumes `_lmsToDb(_dbToLms($db)) == $db`, which the clamp breaks below −100 dB, so an endpoint muted at −120 dB is written back up to −100 dB (`Player.pm`, `volume` / `_onStatus`) | **SUPERSEDED** 2026-08-27 | Was declined on the grounds that the mapping was 1:1 and the clamp intended. The round trip is no longer assumed at all: both directions now compare **in dB with a half-step tolerance** (`_volTol`), which is what the range work needed anyway. |
@@ -163,12 +169,13 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | `cancelQueued('track')` can drop `flush()`'s `<PlaylistClear/>` before it reaches the wire, so a deleted pre-queued track is left in HQPlayer's playlist until the next full load (`Player.pm`, `flush` / `_newGeneration`) | **MOOT** 2026-09-11 — raised in review, verified here, NO code change | The cancel is real; the consequence is not. `cancelQueued` has exactly one caller, `_newGeneration`, and that has exactly two: `_startTrack` and `stop()`. **Both cover the clear they cancel.** Down `_startTrack` the very next call is `_queueTrack`, which re-sends `<Stop/>` + `<PlaylistClear/>` in the NEW generation — so the cancel removes a redundant clear that the load's own clear supersedes, which is what the scope is for. Down `stop()` the item genuinely does survive, and it cannot be reached: the engine is stopped, `stop()` zeroes `hqStarted` and `hqPlayAck` so `_canHandOver` refuses every hand-over, and the only route back to playback is `play()` → `_startTrack`, which opens Stop + PlaylistClear. Nothing can play the stale item, and `resume()` is not that route — LMS reaches it from `pause()`, never from a stop. **The stated consequence is the DESIGNED steady state, not a defect**: `_appendTrack` only ever adds and `<PlaylistClear/>` runs only on a full load, so HQPlayer's list is a HISTORY of the run and every track already played sits in it on exactly the same terms. Trimming it was offered and declined — see `HQPlayer's playlist should show the whole LMS queue`. **No writer reaches the harmful branch**, which is the whole verdict: the review named a branch, not a route to it. Suite green at the time of checking (62 + 133 + others, 0 failed). |
 | The image proxy answers a dead cover with 200 and radio.png, so since 1.0.1 an expired CDN link or dead station logo shows a radio icon on the endpoint where it used to show nothing (`Player.pm` `_remoteArt`) | **ACCEPTED** 2026-09-17, Simon's call | Measured live: a 404 origin through `/imageproxy/.../image_600x600_o.jpg` answers `200 image/png`, 41,647 B, LMS's 512x512 `radio.png`. In 9.1 `_artworkError` has `$response->code($code)` commented out, so no status reaches the endpoint; only `Cache-Control: no-cache` and a past `Expires` mark it. `_coverURL` still returns a URL, so `_reusableArt` never runs and the log shows no miss. Detecting it would need the bridge to serve its own cover route and turn that header into a 404; declined as not worth the LMS-internals dependency. It is what LMS's own screens show for a dead cover. |
 | The live page's service badge is drawn only where Material is installed: `loadEmblems()` fetches `/material/html/misc/emblems.json` and the logo comes from `/material/svg/<name>`, so on a server without Material the fetch 404s, `EMBLEMS` stays null and no badge is ever drawn (`Live.pm`, `np-badge`) | **BY DESIGN** 2026-09-20, Simon's call: "only material shows badges so this is expected" - badge itself **VERIFIED LIVE** on 1.0.3 | **Only Material shows badges, and that is the whole point** — the badge exists to match the one Material already draws on LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows, so it uses Material's own emblem table and its own recoloured logos rather than a copy that would drift the moment Material changes a colour or adds a service. A skin that draws no badges anywhere has nothing to match, and a fallback drawn from some other asset would be a second, divergent badge. The fetch failing costs the badge and nothing else on the page. **Not a defect, and not a gap to fill with a fallback.** |
-| One host on TWO interfaces (Ethernet + Wi-Fi) splitting into two players (`_idsFor`, `tools/probe_identity.py`) | **DECLINED** 2026-09-20, Simon's call | Superseded the PARKED entry of the same day. The split is REAL and was reproduced live - see `A CORPSE IS NOT AN INSTANCE` - but running HQPlayer with more than one interface active is documented upstream as unsupported, so the plugin does not defend against it. The DHCP-move half of the same bug IS fixed. |
+| One host on TWO interfaces (Ethernet + Wi-Fi) splitting into two players (`_idsFor`, `tools/probe_identity.py`) | **DECLINED** 2026-09-20, Simon's call | Superseded the PARKED entry of the same day. The split is REAL and was reproduced live - see `A CORPSE IS NOT AN INSTANCE` - but running HQPlayer with more than one interface active is documented upstream as unsupported, so the plugin does not defend against it. The DHCP-move half of the same bug IS fixed. **RE-DECLINED 2026-09-27 after the discovery rewrite, Simon:** *"they could be two players if its embedded as name would be the same for any instance. We leave it as it is. It is unsupported for HQPlayer [so] it is for us."* Where it stands now: AUTOMATIC mode is effectively one connection - no unicast probes any more, and hqplayerd answers the multicast from ONE interface only (measured on Embedded; Desktop with both interfaces up is unmeasured). ADDRESSES mode: typing BOTH addresses of one HQPlayer gives two address-qualified players and two control links (pinned in `t_plugin.pl` as `two HQPlayers answering to one name are two players`) - accepted, unsupported configuration. **A guard keyed on the name was proposed and declined:** the name is the only thing two addresses share (the licence fingerprint is per-interface, DISPROVEN), and two separate Embedded boxes share the default `HQPlayerEmbedded`, so it would merge real players. Do not re-propose without a way to tell one host from two. |
 | The licence `fingerprint` identifies the MACHINE, so it can key a player across a rename or a move | **WRONG, MEASURED** 2026-09-20 | `the fingerprint is not a machine identity` |
-| "a connected player outranks discovery" having no counterpart in `Discovery::_probe`, so a player kept by its link goes unprobed once its address ages out of `%found` | **WRONG, WITHDRAWN 2026-09-27 the same session it was raised.** `_probe` unicasts to every address in `%found` EVERY round and any reply refreshes `lastSeen`, so the reliable path sustains itself: losing multicast cannot age an address out. It needs ALL UDP to the host to fail for 5 unbroken minutes while TCP 4321 keeps working, and no writer was named for that | `the unicast probe sustains its own entry` |
-| the discovery pace / `_settled` / the 2-4-8-10 ladder / `INSTANCE_TTL` as a liveness rule | **PLANNED, do not re-argue from scratch** - the pace has been reversed TWICE, both at Simon's call (flat 5s to follow Lyrion 2026-09-23; back to a ladder 2026-09-25 because discovery was 92% of HQPlayer's log). Root cause: `%found` is the address book AND the liveness register. Design in `docs/discovery-simplification-plan.md` | `one address book, one liveness signal` |
+| "a connected player outranks discovery" having no counterpart in `Discovery::_probe`, so a player kept by its link goes unprobed once its address ages out of `%found` | **WRONG, WITHDRAWN 2026-09-27 the same session it was raised.** `_probe` unicasts to every address in `%found` EVERY round and any reply refreshes `lastSeen`, so the reliable path sustains itself: losing multicast cannot age an address out. It needs ALL UDP to the host to fail for 5 unbroken minutes while TCP 4321 keeps working, and no writer was named for that. **MOOT 2026-09-27: the unicast probe is GONE** - a connected player is kept by its link, an unconnected one whose multicast is lost goes after 300s, and the typed address is the remedy (plan section 5) | `the unicast probe sustains its own entry` |
+| the discovery pace / `_settled` / the 2-4-8-10 ladder / `INSTANCE_TTL` as a liveness rule | **PLANNED, do not re-argue from scratch** - the pace has been reversed TWICE, both at Simon's call (flat 5s to follow Lyrion 2026-09-23; back to a ladder 2026-09-25 because discovery was 92% of HQPlayer's log). Root cause: `%found` is the address book AND the liveness register. Design in `docs/discovery-simplification-plan.md`. **BUILT and VERIFIED LIVE 2026-09-27 (1.0.30-1.0.34); OPEN TO REVIEW FINDINGS** - see `DISCOVERY FINDS, THE LINK KEEPS` | `one address book, one liveness signal` |
+| `Discovery::_probe` unicasting known addresses, `_settled`, `_linkUpFor`, `Control::reconnectNow`, `BACKOFF_MAX` 60, a per-round socket; typed addresses (`Addresses.pm`, `Control::identify`), `Settings.pm`, the `autodiscover` switch, `probeNow`, `optionsURL`, a typed address whose GetInfo answers Error; typed addresses and discovery running TOGETHER | **BUILT 2026-09-27 from the plan, Simon's call ("implement the new plan", all of it)** - one multicast datagram a round, pace from discovery's own state, one socket for the plugin's life, link capped at 10s on its own ladder, probe on a PROVEN link drop, typed addresses keyed by HQPlayer's name. **TWO MODES, NEVER BOTH** (Simon, same day): the box is used only with discovery off; switching either way removes the other mode's players at once, and switching on clears the box. **OFF IS OFF** (Simon, same day): an empty box with discovery off means NO players - never refused, never a fallback to discovering (`empty box`). Default `AUTO_DEFAULT` = 1 (on) again after the off-by-default test builds; an update never overrides a user's choice (`AN UPDATE NEVER OVERRIDES`). **VERIFIED LIVE 1.0.30-1.0.34** (see the entry's STATUS). **OPEN TO REVIEW FINDINGS (Simon, 2026-09-27):** only the decisions the STATUS block lists are settled - everything else in this code is reviewable, and a finding about it is NEW, not a repeat | `DISCOVERY FINDS, THE LINK KEEPS` |
 | The bridge should detect the Eversolo NAA coming back and press HQPlayer's **Refresh devices** itself, because after the endpoint is powered off and on hqplayerd does not use it until that button is pressed — the NAA vanishes and a refresh drops DSD | **DECLINED** 2026-09-21, Simon's call: *"This is for Eversolo to fix"* | Measured in hqplayerd's `:8088/log` 2026-09-21. **(1) hqplayerd never noticed the endpoint was gone:** it sat idle holding the NAA TCP link, and logged **zero** of its 2-second `NAA output discovery` scans all morning; it found out only when the next command failed — `11:28:35 Stop` → `clNetEngine::Stop(): send(): Broken pipe`, then `PushSDM(): not connected to adapter`. **(2) Its own reconnect stalled:** it rediscovered and connected to `192.168.1.197:43210` by itself at 11:28:38 (`attempting to reinitialize...`) but never logged `NAA output network engine started`; Play at 11:28:47 ran with `hardware: 0`. **(3) Refresh devices fixes the link but drops the user's mode:** the button is `GET /config/refresh` behind HTTP Digest auth (`/` and `/log` need none). After it, HQPlayer came back in **PCM 768k / TPDF / poly-sinc-gauss-long** while the saved config says **SDM / LNS15 / poly-sinc-gauss-hires-lp**, and it had been running SDM at 5.6 MHz before. The bridge sends no `SetMode`/`SetRate`/`SetFilter`/`SetShaping`/`SetTransport` — none has a call site, `%KNOWN` in `Control.pm` only whitelists — so the refresh itself did it. The Eversolo still advertised DSD 2.8–22.5 MHz on reconnect. **Also no route on the control socket:** there is no rescan verb, and `ConfigurationLoad` needs Signalyst's Ed25519 client key plus a session key. An auto-refresh would recover the endpoint and silently drop DSD, and would need the web login stored in the plugin plus HTTP brought back (removed 0.2.54). **A full daemon restart DOES restore the mode** (Simon, 11:48 same day): the startup applies the saved settings explicitly — `Set dither: 9`, `Set modulator: 18` right after `HQPlayer Engine version` — and it came back SDM 5.6 MHz, ASDM7EC-light, `NAA output network engine started at: 5644800`. The `/config/refresh` restart logs no such `Set` lines. Untested, and the only thing that could reopen this: whether re-POSTing the unchanged `/config` form (Apply) straight after restores SDM. **DISPROVEN 2026-09-21: `http://<hq>:8088/restart` is NOT a remote restart.** Tried unauthenticated from LAN and from 127.0.0.1, and by Simon logged in via curl and in the browser: every one `200` + an empty page, PID unchanged, no `Server stopping...`. The 15:20:04 restart it was credited with was a **Dock-tile Quit**: macOS log `15:20:03.556 DockHelper spawned` → `15:20:04.641 Dock: Calling force quit` → `libquit: hqplayerd [85837] force quit` → launchd respawned it as pid 20799 at 15:20:08 (Chrome was frontmost, hence the mix-up). That restart DID restore SDM (`Set dither: 9`/`Set modulator: 18`, then `engine started at: 5644800`), so a daemon restart remains the manual fix, but there is still NO HTTP route to it. Check a claimed restart by the PID and the macOS `libquit` line, not by timing. **MANUAL RESTART BUILT 2026-09-21 (on top of the uncommitted 1.0.9), Simon's brief:** `tools/hqrestart/` is a stdlib-Python webhook on the HQPlayer host (:8090) that restarts HQPlayer the way it was started, app or service, on macOS/Linux/Windows; macOS app mode verified live (7.1s, SDM restored). The Bridge gets a **Restart HQPlayer** row per instance in the Apps feed, confirm-then-act, shown only once `http://<instance ip>:8090/ping` has answered as the helper (`%restartable`, never shrinks in a run, because `item_id` is positional). **Still no settings page:** the helper authorises the LMS server by its `allow` list, not a token. **Still manual:** the bridge never restarts on its own, so the auto-refresh DECLINE above stands. Bridge side offline-tested only (t_plugin.pl, 25 assertions). Build, twenty review rounds and the live verification: see `## 1.0.10-1.0.13 (2026-09-21): Restart HQPlayer from LMS`. |
-| `assertPendingVolume` calling `_lmsOwnsVolume` disarms the 1.0.28 startup latch before HQPlayer has reported anything on the new link, so the held-level + HQPlayer-restart case loses the protection 1.0.28 exists to give | **DISPROVEN 2026-09-27, and the proposed fix was ALREADY APPLIED AND REVERTED BY HAND.** The held-level path IS the 19:09 live run where the level survived; clearing the latch there is load-bearing, or a CLAMPED reply to our own assert is ignored as "still the startup level" | `_lmsOwnsVolume in the replay is BY DESIGN` |
+| `assertPendingVolume` calling `_lmsOwnsVolume` disarms the 1.0.28 startup latch before HQPlayer has reported anything on the new link, so the held-level + HQPlayer-restart case loses the protection 1.0.28 exists to give | **DISPROVEN 2026-09-27, and the proposed fix was ALREADY APPLIED AND REVERTED BY HAND.** The held-level path IS the 19:09 live run where the level survived; clearing the latch there is load-bearing, or a CLAMPED reply to our own assert is ignored as "still the startup level" **SUPERSEDED 2026-09-27 - the volume code went back to its original (pre-1.0.25) behaviour; see `BACK TO THE ORIGINAL VOLUME`.** | `_lmsOwnsVolume in the replay is BY DESIGN` |
 | `explain_refusal` stamping its 60s per-address throttle before deciding whether it will log, so a refusal that says nothing buys 60s of silence for the next one that would | **DISPROVEN 2026-09-27** — the silent branch needs POST + JSON + in-`allow` + `direct_host()`, which is precisely the combination that makes `trusted` true, so that request is SERVED and never reaches `explain_refusal` | `explain_refusal's silent branch is unreachable` |
 
 
@@ -202,7 +209,9 @@ then plays it.
 | File | Role |
 |---|---|
 | `HQPlayerBridge/Plugin.pm` | Lifecycle, discovery wiring, player create/teardown, the Apps feed |
-| `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list |
+| `HQPlayerBridge/Discovery.pm` | UDP multicast probe, instance list, and the round clock (which also runs, with no UDP, when automatic discovery is off) |
+| `HQPlayerBridge/Addresses.pm` | HQPlayer addresses typed into the settings: parse/validate, identify over TCP (`Control::identify`), stamp per round |
+| `HQPlayerBridge/Settings.pm` | The settings page (since 2026-09-27): the address box and the "Find HQPlayer automatically" switch. Nothing else - the live reading is `Live.pm`'s |
 | `HQPlayerBridge/Control.pm` | Async TCP XML client + tiny XML helpers |
 | `HQPlayerBridge/Player.pm` | `Slim::Player::Player` subclass - the virtual player |
 | `HQPlayerBridge/Stream.pm` | Tier 4: the plugin's own audio endpoint, serving LMS's transcoded stream. Its paths carry no query string, but that is a convention, NOT the constraint the ledger disproves at the top of this file |
@@ -2549,13 +2558,14 @@ one; corrected the same day, with the reason in the code.)
 
 ## Testing without LMS
 
-`sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (1,039 assertions: `t_control` 108, `t_player`
-510, `t_stream` 64, `t_plugin` 198, `t_live` 159) plus the live page EXECUTED
-under osascript (17, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (180) and the installer run end to end (23), checks
-`install.sh` parses, and sweeps called-vs-defined subs. 1,259 in total. Counts
-as of 2026-09-27 (third pass); they move every round, and the run prints them. (The
+`sh tools/run_checks.sh` — syntax-checks all eight modules against the stub Slim
+tree, runs the six Perl suites (1,198 assertions: `t_control` 117, `t_player`
+456, `t_stream` 64, `t_plugin` 293, `t_live` 161, `t_settings` 107) plus the live
+page EXECUTED under osascript (25, from `t_live.pl`) and the settings page's checking script
+EXECUTED (11, from `t_settings.pl`), both skipped out loud without osascript, and the helper's Python suite (180) and the installer run end to end
+(23), checks `install.sh` parses, and sweeps called-vs-defined subs. 1,437 in
+total. Counts as of 2026-09-27 (the discovery rewrite, after the checking line); they move every round,
+and the run prints them. (The
 PowerShell parse check and the install.ps1 half of the installer suite went with
 Windows support.)
 
@@ -2564,7 +2574,8 @@ Windows support.)
 | `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads**; one WARN per event, a proven link's reply timeout included |
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
-| `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper); the REAL `_teardown`, which stops only a controller the player has to itself |
+| `t_settings.pl` | the settings page's REAL `handler()` against a base class that saves as LMS does: prefs order, field names, decimal address normalisation, an unticked box stored as 0, every bad entry NAMED with nothing saved, discovery-off with an empty box SAVED (off is off), a partial POST changing nothing |
+| `t_plugin.pl` | discovery (one datagram a round, one socket, its own pace, `probeNow`, discovery off) and typed addresses (keyed as discovery, never expired, removed on save, same id back); player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper); the REAL `_teardown`, which stops only a controller the player has to itself |
 | `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
 | `t_installers.py` | `install.sh` RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt and no Python all leave the old helper running. Refuses to run unless the stub `launchctl` wins on PATH; `read_key` lifted out and run by sh, so a JSON null token reads as unwritten |
@@ -6975,7 +6986,46 @@ the prose was the defect. The old assertion could never have caught this because
 `BACKOFF_MAX`, where doubling is a no-op; there are now two assertions from the BOTTOM of the
 ladder in `t_control.pl`.
 
-### sync groups are not supported - SUPERSEDED THE SAME DAY by `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` below
+### SYNC GROUPS ARE NOT SUPPORTED - FINAL (2026-09-27, evening)
+
+**Simon, 2026-09-27: *"we stop all work, we flag we dont support sync and any issues in this
+area are to be ignored at this time. its not something we are going to support."*** This is the
+standing rule and it supersedes both entries below (the morning's `sync groups are not
+supported` and the afternoon's `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`).
+
+**The rule for reviews.** A bridge player in an LMS sync group is **not supported**. Any finding
+whose failure scenario needs a sync group - starting, playing, rebuffering, timing, joining,
+leaving, a link drop or reconnect while synced, removal while synced - is **DISMISSED**. Do not
+report it, do not fix it, and do not propose sync handling as the remedy for something else. The
+README says so under *Not supported*.
+
+**The code that stays (1.0.29, `6b983b7`).** `_onLinkState` calls `playerInactive` on a proven
+drop when the player is not the only active one, and `Control::_dropLink` runs the link-down
+listener before failing the stranded commands. It stays as it is: it is Lyrion's own bookkeeping
+and harmless solo. **It is not a statement of support**, and a finding about it in a group is
+dismissed like any other.
+
+**Why a group never starts - MEASURED LIVE 2026-09-27 18:53, so nobody re-derives it.** Group:
+the bridge player (master) + a squeezelite player, a local FLAC on tier 1.
+- LMS opens ONE source for the group. `Slim::Player::Source::nextChunk` pushes every chunk it
+  reads onto each OTHER active member's `$client->chunks`, and stops reading for the WHOLE group
+  while any member's queue is at `QUEUED_CHUNKS_HWM` (10) - Bug 14117.
+- The bridge's queue is drained only by its tier 4 player-stream endpoint (`Stream.pm` ->
+  `addStreamingResponse` -> `nextChunk`). On tier 1 (and any tier where HQPlayer fetches the
+  file itself) nothing drains it, so it fills to 10 and stays there.
+- Log, at `player.source` DEBUG: `Waiting for queue to drain for 02:2e:32:97:3c:99` first at
+  24.16 (0.9s after the stream opened), 190 times, until the capture ended 76s later. The
+  squeezelite member reached buffer ready, was `startAt`'d, then `playerOutputUnderrun ...
+  decoder: 8 / output: 0` at 26.18 -> `_Rebuffer` -> the bridge paused -> the ~33s
+  reload loop.
+- Also seen, every cycle: the bridge's `_armNextTrack` sends `ReadyToStream` while the group is
+  in `WAITING_TO_SYNC`, which LMS logs as `_Invalid` with a backtrace. The bridge stubs `startAt`
+  / `playPoint` and starts HQPlayer at once; HQPlayer adds its own ~1.5s output delay. Tight sync
+  was never achievable.
+- Two remedies were identified and **not built** (tier 4 while grouped; a throwaway `chunks`
+  on self-fetch tiers). Do not build or propose them unless Simon reopens sync support.
+
+### sync groups are not supported - SUPERSEDED THE SAME DAY by `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` below, and both by `SYNC GROUPS ARE NOT SUPPORTED - FINAL` above
 
 **The claim** (review 2026-09-27): `_teardown`'s `controller->stop` runs LMS's
 `StreamingController::_Stop` over every player in the group, where `client forget` uses
@@ -7000,7 +7050,7 @@ still holds on both (`_stopClient` reaches `Player::stop` -> `_newGeneration`, a
 `forgetClient` runs `Timers::forgetTimer` as well). Pinned in `t_plugin.pl` on the REAL
 `_teardown`, which nothing drove before; fails with the old line restored.
 
-### A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO (2026-09-27)
+### A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO (2026-09-27) - SUPERSEDED THE SAME EVENING by `SYNC GROUPS ARE NOT SUPPORTED - FINAL`: its "a finding about that half is a finding" no longer holds
 
 **Simon, 2026-09-27: *"we may not support them for being actually in sync as thats not really
 feasible but we should still have the process working properly from a player perspective"* -
@@ -7151,8 +7201,430 @@ evaluated against the code first and each new test was run against the OLD code 
 | 7 | a proven link's reply timeout logging two WARNs | FIXED - one line, `control link down - no reply to <X> after 30s`, text kept for log greps |
 | 8 | `volume()` / `assertPendingVolume` duplicated send block | DECLINED - volume is stable and is where one change breaks three |
 
+## BACK TO THE ORIGINAL VOLUME (2026-09-27)
+
+**The volume code is back to its original, pre-1.0.25 behaviour, Simon's call.** The removal was
+already in the working tree when the discovery rewrite started (not made in that session, and not
+logged then), so it shipped inside every build from 1.0.30 to 1.0.34; Simon confirmed it on
+2026-09-27: *"remove the commits we have superseded with returning to the original volume"*.
+
+**SUPERSEDED, and gone from the code:**
+- **1.0.25** (`26e3d15`) - a volume set while HQPlayer is away is held (`hqVolPending`) and re-sent
+  when the link returns (`assertPendingVolume`, `refreshInfo`);
+- **1.0.27** (`df31af1`) - a volume set during a reconnect is held until HQPlayer answers
+  (`_volumeDelivered`, `send` answering 1/0);
+- **1.0.28** (`df35c15`) - HQPlayer's startup volume no longer captures the LMS slider (the
+  link-up latch `hqVolLinkNew` / `hqVolStartup`, `_lmsOwnsVolume`), and its docs in `5b202a5`.
+
+**KEPT:** 1.0.26 (`73a2fa5`) - the benign empty-playlist `<Volume>` error logged at debug; its
+`t_control.pl` pins still run. The anti-snap rule and following HQPlayer's own level into LMS are
+the original behaviour and remain.
+
+**Behaviour now, as before 1.0.25:** the level you start with is HQPlayer's own; a slider move
+while the link is down is not held; after an HQPlayer restart the slider follows HQPlayer's
+startup level. README restored to the 1.0.24 wording ("The level you start with is HQPlayer's own,
+not one the plugin asserts").
+
+**History, not rewritten:** Simon first asked to REMOVE the superseded commits; rewriting eleven
+unpushed commits would have meant hand-resolving conflicts in every later one (each bumps the
+version and edits this ledger) for an identical final tree, so the return is ONE commit that says
+so, and the superseded commits stay in the log as history. Rows 87, 96, 97, 98 and 177 of the
+index are marked superseded; their full entries below are HISTORY.
+
+## DISCOVERY FINDS, THE LINK KEEPS (2026-09-27, built from the plan)
+
+**Simon: "current discovery on HQPlayer isnt working, lets look to implement the new plan" - all
+of it.** `docs/discovery-simplification-plan.md` is the design and the reasoning; this is what
+was built.
+
+**STATUS (end of 2026-09-27) - READ THIS FIRST, the rest is the history of how it got here.**
+- **What changed, in one place:** discovery only FINDS (one multicast datagram a round, no
+  unicast, one socket for the plugin's life, 2/4/8/10s then 15s); the control link KEEPS itself
+  alive (`BACKOFF_MAX` 10, `reconnectNow` gone, a PROVEN drop asks for one probe); a settings page
+  (`Settings.pm`, `Addresses.pm`) with TWO MODES - Automatically, or Only at typed IP addresses;
+  a new address saved only if HQPlayer answers `<GetInfo/>`; every save says what it did; a
+  "Checking..." line while it waits; the live page and Apps feed say what they are waiting for,
+  per mode.
+- **Builds:** 1.0.30 (off-by-default test build) -> 1.0.31 (refusal wording) -> 1.0.32 (checking
+  line) -> 1.0.33 (save result lines) -> **1.0.34 (default back to Automatically)**. All installed
+  and verified on plex:9000 by Simon.
+- **Verified live:** startup in both modes; add / refuse / remove / re-add a typed address (same
+  player back); switching both ways (the other mode's players removed, the box cleared going
+  automatic); HQPlayer restarted in addresses mode (player leaves and returns on its link); an
+  ADDRESS MOVE with discovery on (Desktop .109 -> .107, same id `02:17:48:c0:64:4a`); the
+  greyed box made editable by the radio in Material; every result line; and **an update keeping
+  a user's addresses-only mode and list** (1.0.33 -> 1.0.34, default 1, rig still `0` /
+  `192.168.1.248`).
+- **SETTLED - Simon's decisions, do not re-raise** (grep the phrase): two modes never both and
+  switching on CLEARS the box (`TWO MODES, NEVER BOTH`); off is off, an empty box means no
+  players (`OFF IS OFF`); default automatic and an update never overrides (`AN UPDATE NEVER
+  OVERRIDES`); one HQPlayer on two interfaces, and a name guard, declined (`more than one
+  interface active is DECLINED`); the 5s wait on a dead address kept (`a dead host never
+  answers`); a refused page shows what was typed (`no leave as is`); no prompt on a radio-only
+  change (`radio-only change`); and the MEASURED HQPlayer-side behaviour - Desktop's network
+  toggle switching itself off on an IP change (`MainWindow.network`).
+- **OPEN TO REVIEW FINDINGS (Simon, 2026-09-27: "its now back in for review findings"):**
+  everything else in `Discovery.pm`, `Control.pm` (identify / oneShot / the 10s cap),
+  `Addresses.pm`, `Settings.pm`, the settings template and its script, and the Plugin.pm
+  mode/apply/waiting code. Seven inline reviews ran during the build (logged below); they do NOT
+  close this code - a new finding against it is new information, per the workspace gates.
+
+**Discovery (`Discovery.pm`)** - one socket opened at `start`, closed at `stop` (bound at open:
+`IO::Socket::INET` does NOT bind for `LocalPort => 0`, so the old socket only got a port at its
+first send). ONE multicast datagram a round, no unicast. Pace from its own state only:
+2/4/8/10s while nothing is found, then 15s; 15s flat with discovery off. `probeNow` runs a round
+now unless one is already listening, so N links dropping at once cost one probe; it is called from
+`Plugin::_onLinkState` on a **PROVEN** link drop only (an accept-then-drop every 10s must not
+become a probe every 10s). With `udp => 0` no socket is opened and nothing is sent, but the ROUND
+CLOCK still runs: its `onRound` hook is when typed addresses are checked, and one clock means a
+typed address and a discovery reply carry comparable `round` stamps for `_liveOf`.
+`_settled`, the link callback and `_linkUpFor` are DELETED.
+
+**The link (`Control.pm`)** - `BACKOFF_MAX` 60 -> 10: the 10s discovery-round poke was the real
+return time after a long outage, and the link now owns it. `reconnectNow` DELETED. New:
+`identify($ip, $cb)` - a `oneShot` link: connect, one `<GetInfo/>`, closed on the next turn; never
+reconnects, logs only at debug (a new object per attempt, so its own `quiet` could never hold).
+
+**Typed addresses (`Addresses.pm`)** - one box, parsed by ONE `parse()` used by both the settings
+page and the plugin: comma/space/semicolon/newline separated, IPv4 dotted quad read as DECIMAL
+(`inet_aton` would read `010` as octal 8), no host names, no 0.x, no 224+. Per round: never
+identified -> `identify`; player connected -> stamp the round (no traffic); player down -> left to
+its own link (its stamp ages, which is what lets a DHCP move heard by discovery win the name
+group); no player -> `identify`. Never expired. The failure warns once per outage per address.
+
+**TWO MODES, NEVER BOTH - Simon, 2026-09-27, after the first build: *"only allow manual ip
+addresses when auto is turned off. When its turned off clean the records, we should not be having
+both active at same time."*** Asked what switching back on does to the box, he picked **clear
+it** (over refusing the save, or keeping it unused). So:
+- **discovery ON** - the box is empty and ignored (`Plugin::_boxAddresses` returns none), greyed
+  out on the page (a disabled textarea posts nothing), and a save with it on stores it CLEARED;
+- **discovery OFF** - only the box; no socket, no UDP (`udp => 0`), `%found` dropped;
+- **switching** removes the other mode's players AT ONCE, connected or not (`_applySettings`).
+  Switching on: every typed player goes, and discovery finds again what it can reach under the
+  same ids (a player is keyed by HQPlayer's name), prefs and playlist intact. Switching off:
+  every player not in the box goes; a player that IS at a typed address stays, keyed from that
+  player's own name (`Addresses::verify`, `$state` returns the name) - no second control
+  connection to an HQPlayer already connected;
+- **OFF IS OFF, WHATEVER THE BOX HOLDS - Simon, 2026-09-27, correcting the build: *"when auto
+  discovery is off all players are removed ... It should not discover or add any player without
+  an IP added when in manual mode and vice versa when in auto discovery."*** Off with an empty
+  box saves, removes every player, and finds nothing until an address is typed; the Apps feed
+  and the live page then say to enter one (`Plugin::waitingText`, see inline review 5).
+  **REVERSED, both mine:** the page refusing that save (`ADDR_NEEDED`, from the plan's 4.6) and
+  `_autoDiscover` keeping discovery ON for it (inline review 2(b), for a hand-typed `pref`) - the
+  two together made "off" impossible with an empty box, against the premise of the feature. Do
+  not re-propose either as a safety net: an empty off-mode bridge is the intended state.
+- **the default mode is `Addresses::AUTO_DEFAULT`**, the one place it lives (`prefs->init`, the
+  page's `beforeRender` and a missing radio all read it). **BACK TO 1 (ON) 2026-09-27 after the test
+  builds, see `AN UPDATE NEVER OVERRIDES`.** It was 0 (OFF) for the 2026-09-27 test builds,
+  Simon's call.** Starting with it off opens no socket and sends no probe - only the round timer
+  runs, checking the (empty) box.
+This retired the first build's merge of the two lists into one table and `Addresses::adoptName`
+(the rename re-key fix, below): with no address ever in both, neither is needed, and the rename
+case is covered by keying from the held player.
+
+**Saves are applied ONCE, after both prefs are stored (`Plugin::_settingsChanged`).** LMS fires
+a change handler once PER PREF in the middle of a save, so the first call sees half of it - the
+switch flipped and the box not yet written, which read as "off with an empty box" and warned on
+a perfectly good save whichever order the prefs were listed in (that warning is gone with the
+empty-box rule). The handler now only schedules
+`_applySettings` for the next event-loop turn, killing any pending one. A switch change restarts
+the round clock (which runs a round at once, keying every address in the box); otherwise new
+addresses are keyed at once.
+
+**The table (`Plugin::_table`)** - discovery's list or the typed entries, keyed by address.
+
+**The settings page (`Settings.pm`, `settings/basic.html`)** - the MODE IS A RADIO GROUP (Simon,
+2026-09-27: *"ensure radio buttons are following the same spec as our other plugins as we have been
+caught out by same bug many times"*), to LBF's `pref_sort` / `pref_genre_lookup` spec: two options,
+`<label>`-wrapped, `<br>`-separated, no `<select>`, `name="pref_autodiscover"` posting `1`
+(automatically) or `0` (only these addresses), and EXACTLY ONE checked in every state - decided
+in Perl (`hqp_auto` in `beforeRender`; the template checks one option on `hqp_auto` and the other
+on `!hqp_auto`, and never reads `prefs.autodiscover`). Anything but `0` posted, nothing included,
+is automatic. The `hqp_form` hidden sentinel guards a partial POST. It replaced the first build's
+checkbox, so `@CHECKBOX_PREFS` and `PLUGIN_HQPLAYER_ENABLED` are gone. A refusal deletes
+`saveSettings` (the base class writes NOTHING) and draws the reason in the page with the typed text
+kept (Material never shows `warning`); `beforeRender` builds the template vars after the save. It
+calls nothing in `Plugin.pm`. A **Settings** row is second in the Apps feed, always present, so the
+positional Restart rows never move within a run; `install.xml` carries the `optionsURL`.
+
+**A NEW ADDRESS IS SAVED ONLY IF HQPLAYER ANSWERS THERE** (Simon, same day: *"we stipulate HQP
+must be up and running to establish a valid connection"*, pointing at LBF's API-token check). Same
+shape as LBF's `validateToken` in its `Settings::handler`: the handler returns nothing, asks each
+address this save ADDS for `<GetInfo/>` (`Control::identify`, in parallel), and renders through
+`$callback` once every answer is in or `CHECK_WAIT` (8s) passes - an HQPlayer that accepts and
+never replies would otherwise hold the page for `REPLY_TIMEOUT` (30s); a late answer is ignored.
+One address that does not answer refuses the WHOLE save and is named; all answering saves, and
+the page names the HQPlayer that answered at each. An address already in the box is not re-checked:
+it never expires, and one HQPlayer being off must not block editing the others. Nor is an address
+a player is CONNECTED at (proven link, `Addresses::held`): that link is the answer, named from the
+player, with no second connection beside it - see inline review 3. A new address costs ONE
+connection: the page hands each answer to `Addresses::answered`, and the save's apply keys the
+address from it instead of asking again.
+
+`t_settings.pl` 74 (runs the real handler, async included): the radio markup and its one-checked
+rule across five stored states (never set, 1, 0, empty, junk), automatic clears the box and asks
+nothing, a new address deferred until HQPlayer answers, one dead address refuses all and is named,
+removing an address asks nothing and saves at once, the deadline draws the page and a late answer
+is ignored, five bad entries named, addresses-only with none refused, a partial POST changes
+nothing. Mutation-checked: no connection check (12 fail), every address re-checked (3), no
+deadline (4), saving the ones that answered (5), the template matching the stored value (2).
+Trap met again: the "no `<select>`" assertion first matched the TEMPLATE COMMENT saying so - TT
+comments are now stripped before any template assertion.
+
+**Tests** (the FIRST build's; the cases that ran both modes at once were replaced after TWO
+MODES - see "Tests after the decision" below) - `t_plugin.pl` (234): one datagram, to the group, with an instance known; same socket
+across rounds; a reply after LISTEN_TIME accepted; 15s up or down; probeNow coalesces (control: a
+later drop probes again); discovery off: no socket, no datagram, probeNow silent, rounds still run
+(control: on opens and sends); proven drop probes, unproven does not; default on; typed address
+gets discovery's id; never expired; removed on save connected or not, re-added = same id, moved
+address = same id; unless discovery hears it; switch off removes non-box players; DHCP followed
+when the typed address's link is down, and (control) not when it is up. `t_control.pl` (117): the
+ladder 2,4,8,10; reconnectNow gone; a dropped link retries within 10s with discovery stopped;
+identify (control: an ordinary link DOES reconnect and warn). `t_settings.pl` (46, new, runs the
+real `handler()`): order of prefs, template field names, decimal normalisation, unticked = 0,
+empty saves, five bad entries each NAMED with nothing saved, discovery-off + empty refused, partial
+POST changes nothing, unset draws ON. **Mutation-checked**: unicast restored (3 fail), no probe
+coalescing (2), no forced removal (3), probe on an unproven drop (1), connected typed address
+never stamped (1 - caught only after the test drove WHOLE rounds; `_roundDone` alone never runs
+the round hook), error still saving (12), checkbox uncoerced (3).
+
+**INLINE REVIEW 2026-09-27 (same session, over the uncommitted rewrite): 4 findings, 3 FIXED, 1 NOT
+REACHED.**
+1. **A rename re-keyed the player back when discovery was switched off - FIXED.** A typed entry
+   keeps the name it was identified by and is never re-asked while its player is connected; with
+   discovery on, a rename makes the new-named player as it always has, and switching discovery
+   off then rebuilt the OLD one from the stale entry (reproduced: `create X | teardown`). `_table`
+   now hands discovery's name to the entry (`Addresses::adoptName`) whenever both see the address.
+   Pinned in `t_plugin.pl`; fails 2 with the call removed. **RETIRED the same day by TWO MODES,
+   NEVER BOTH:** no address is ever typed and discovered at once, so `adoptName` is gone; the
+   rename case is pinned again against the new rule (switching off keys from the held player).
+2. **No `<optionsURL>` in `install.xml` - FIXED.** Discography and Listen to Later both carry
+   one; it is what links a plugin's settings page from LMS's plugin list. Added; `t_plugin.pl`
+   asserts it is the same path as `Plugin::SETTINGS_PATH`.
+3. **The "nothing found" diagnostic named a multicast probe that discovery-off never sends -
+   FIXED.** `PLUGIN_HQPLAYER_NONE_DESC_OFF`, chosen on `Discovery::listening()`; pinned both ways.
+4. **An HQPlayer that answers the typed-address `<GetInfo/>` with `result="Error"` never gets a
+   player, and is logged as "not answering" - NOT REACHED, not fixed.** No such HQPlayer has been
+   seen: the one candidate, an expired trial, was only INFERRED to answer GetInfo OK (2026-09-25,
+   `we cant attempt to work out if its a trial`), never measured. Re-raise only with a real
+   HQPlayer whose GetInfo errors.
+
+Counts after the review: `t_plugin.pl` 240.
+
+**INLINE REVIEW 2 (same session): 2 minor findings, both RESOLVED by the two-modes decision.**
+(a) Typing the address of an HQPlayer a player already held opened a second `GetInfo` control
+connection beside the player's own - unmeasured risk (the 2026-09-05 wedge followed a bare second
+connection, though its trigger was later put down to a network change); now keyed from the held
+player, no connection. (b) A hand-typed `pref` could switch discovery off with an empty box; now
+`_autoDiscover` keeps it on and warns. **(b) REVERSED the same day by Simon - see OFF IS OFF.**
+
+**Tests after the decision:** `t_plugin.pl` 250 (discovery-on ignores the box; switching off
+removes non-box players and keys a held address with NO GetInfo; switching on removes typed
+players; a save applied once after both prefs; empty-box off stays on; two typed addresses with
+one name split by address; the rename case), `t_settings.pl` 53 (discovery on clears the box, a
+bad entry in a box being cleared is no error, a greyed box posting nothing still clears, the
+template greys it). Mutation-checked: box kept by the page (3 fail), box used with discovery on
+(3), typed players kept on switching on (1), a held address identified anyway (4), applied
+mid-save (2), empty-box off honoured (1).
+
+**INLINE REVIEW 3 (same session, over the connection check): 3 findings, all FIXED.**
+1. **The save's connection check reopened the second control connection that review 2(a) had
+   removed - FIXED (regression).** Typing the address of an HQPlayer discovery had found, as
+   discovery is switched off, sent `<GetInfo/>` on a new link beside the player's own; the first
+   write-up above logged it as a "known cost", which was never Simon's call. The page now asks
+   `Addresses::held($ip)` - `Plugin::_linkStateAt`, handed to `Addresses::init`, so the page
+   still calls nothing in `Plugin.pm` - and a PROVEN link is the answer: named from its player,
+   saved at once, no connection. A player whose link is down proves nothing and is asked.
+2. **Every new address was identified TWICE per save - FIXED.** The page asked it, then the
+   save's apply (`_applySettings` -> `verify`) found no player there yet and asked again a turn
+   later. `Addresses::answered` takes the page's answer; `verify` uses it ONCE (deleted as read,
+   whatever the branch) and `set` drops one for an address not in the box. A refused save hands
+   nothing on.
+3. **`_linkStateAt` carried its old comment above the new one ("undef for no player"; it returns
+   an empty list) - FIXED**, deleted.
+
+Pins: `t_settings.pl` 89 (a connected address asks nothing, saves at once and is named from its
+player; CONTROL a down link is asked; mixed, only the new one asked and both named; the apply
+keys from the page's answer with no GetInfo, used once; a refused save keeps no answer; an answer
+for an address left out of the box is dropped), `t_plugin.pl` 257 (both apply branches - switching
+off, already off - make the player from the answer with no GetInfo; `held` names a connected
+player, CONTROL not a down one, nothing where there is no player). Mutation-checked: page ignores
+the held link (6 fail), verify ignores the answer (2+2), page hands nothing on (2), `set` keeps a
+stray answer (1), `held` on a down link (2+1), answer not deleted as used (1). (`t_plugin.pl` has
+one standing false `grep FAIL` match - a test NAME containing "FAILED" - so count its failures
+against that baseline.)
+
+**INLINE REVIEW 4 (same session): no findings.** Checked and cleared, so the next round need not
+re-derive them: `onRound` is handed `$roundNo` and `Discovery::round()` returns the same, so an
+entry keyed from the page's answer inside `verify` and one stamped `up` in the same pass carry the
+same round; `_identified` running synchronously inside `Discovery::_round` (the switch-off branch)
+was already the rig's path before review 3, since its `identify` stub answers at once; a one-shot
+link leaves no timer behind (`_dropLink` kills the connect and reply timers, `close` the
+reconnect); `listening()` is `running && udp`, so a socket that fails to open does not make every
+save restart discovery; a manual save only ever holds box addresses, so `held` cannot vouch for an
+address outside the box; the switch back to automatic drops a typed player and discovery rebuilds
+it under the same id about 1.5s later - the "clear them" decision, not a defect. **Not a finding
+but a live-check item:** the address box is rendered `disabled` in automatic mode and only the
+radio's inline `onclick` makes it editable again. NowPlayingDisplay's settings page runs inline
+`onclick` in the same iframe, but this repo's own settings page once ran a script that never
+updated in Material (cause never found), so check it live. If it fails, saving with the second
+radio and the (greyed, so empty) box switches to addresses-only, and that page draws the box
+editable. (With `AUTO_DEFAULT` 0 the test build opens there anyway.) `t_live.pl`
+forbade a `<script` in this template (narrowed 2026-09-27 for the checking line - scripts are
+allowed, pollers and live links are not), so a load-time fix is now possible if the live check fails.
+
+**OFF IS OFF (Simon's correction above) - built 2026-09-27.** Pins: `t_plugin.pl` 265 (never set
+= `AUTO_DEFAULT`, pinned at 0 for this build; explicit 0 with an EMPTY box is off; init reads
+the constant; switching off with an empty box removes every player, discovery stops, rounds later
+nothing found, no datagram, no GetInfo; the feed's empty-box row, and no "waiting" row), and
+`t_settings.pl` 92 (addresses-only with none SAVES at once, asks nothing, no error; the string
+is gone; a missing radio is `AUTO_DEFAULT`). Mutation-checked: the empty-box fallback restored
+(6 fail), the page refusing an empty box again (3), the default back to on (1), no empty-box feed
+row (2).
+
+**INLINE REVIEW 5 (same session, over OFF IS OFF): 3 findings, all FIXED.**
+1. **The discovery-pace test passed without testing anything - FIXED (a regression from the
+   default flip).** The stub prefs never store `init`'s values, so the pref read undef = the new
+   default, off: `_startDiscovery` opened no socket, the test's reply never landed, and it still
+   read 15/15 because a discovery-off round is 15s too. It now sets automatic explicitly and
+   asserts the reply landed. Trap for any future default change: **every test that calls
+   `_startDiscovery` inherits the default.**
+2. **No test covered startup with the setting never stored - FIXED.** Simon asked whether the
+   bridge discovers at startup with it off: it does not (`udp => _autoDiscover()`, no socket, no
+   probe, only the 15s round clock). Now pinned on the call `initPlugin` makes, with a CONTROL
+   that stored-on does probe.
+3. **The live page said "Waiting for the player to connect" in every state - FIXED to Simon's
+   spec:** *"This should show the correct state in either mode and refresh accordingly when
+   connected."* (I had first proposed it as replacing the message; he read that as removing it -
+   it is replaced by the RIGHT one, never removed.) ONE answer, `Plugin::waitingText`: automatically
+   = looking on the network (`WAIT_AUTO`); addresses only = waiting at the typed addresses, named
+   (`WAIT_ADDR`); none typed = enter one in Settings (`NONE_DESC_EMPTY`). The Apps feed shows it
+   first (then the mode's diagnostic, none when nothing is typed), the `signalpath` poll carries it
+   as `waiting`, and the live page re-reads it on EVERY poll - so a mode saved in Settings shows
+   without a reload, and a connecting HQPlayer's card replaces it on the next poll. First paint uses
+   it too (reached through `->can`, no sibling `use`). The Apps feed stays a snapshot: Material
+   never re-renders a browse list on its own.
+
+Pins: `t_plugin.pl` 277 (the three modes' feed rows, the poll's `waiting` equal to the feed's line
+in each, the startup block, the pace test's landed reply), `t_live.pl` 161 (re-read per poll, the
+card draws it), the EXECUTED page 22 (addresses named; a mode change shows on the next poll with
+no reload; a connecting HQPlayer's card replaces the line; it comes back when the player goes; a
+reply without `waiting` keeps the last line). Mutation-checked: page never re-reads it (6 fail),
+card draws the fixed label (6), poll carries none (3), one line for every mode (3), pace test on
+the default (1), startup always discovering (12).
+
+**INLINE REVIEW 6 (same session, over review 5): 1 finding, FIXED.** With typed addresses, one that
+had never answered was shown NOWHERE once another was connected: the waiting line only appeared
+with no player at all. An LMS restart while one of two typed HQPlayers is off left it invisible in
+the Apps feed and the live page. Now `waitingText` names EVERY typed address with no player (via
+`_linkStateAt`, read in LIST context: in scalar context a player with an empty name would read as
+none), even while others are connected; the live page draws it as a card BELOW the connected ones;
+the Apps feed as the LAST row (so no positional row moves), with the "nothing answered"
+diagnostic only when there is no player at all. **Waiting for nothing is an EMPTY string, and the
+poll SENDS it**, so the page drops a line that no longer holds (the page keeps the last line only
+when the field is absent altogether). Automatically, once a player exists, it is '' - there is no
+list of HQPlayers to expect. Pins: `t_plugin.pl` 284, the EXECUTED page 25 (connected card plus
+the waiting line, the line below it, an empty `waiting` removes it and keeps the card).
+Mutation-checked: every typed address named (3 fail), undef instead of '' (2), automatic with
+players still waiting (1), no waiting card below connected (4), '' not honoured by the page (4).
+
+**INLINE REVIEW 7 (same session, no code change since 6): no findings.** Checked and cleared on
+the typed-address reconcile, so the next round need not re-derive them: a typed entry is in
+`_table` for as long as its address is in the box, so the full round's removal pass always marks
+its player seen - its stale round stamp only matters inside a same-NAME group (pinned: the live
+one keeps the plain id); a `client forget` in addresses mode tears the player down and the round
+brings it back from the kept entry (`_identified` announces only NEWS, and the round-end full
+reconcile does the rest); switching off with the address of a pair member that held an
+ADDRESS-QUALIFIED id gives it the plain id and retires the old one - the same "pair shrinking to
+one" rule as with discovery on; a rename in HQPlayer while its typed player exists is not picked
+up until that player is rebuilt (removed and re-added, or an LMS restart), where it becomes a new
+id, as a rename does with discovery on. **Remove a specific player** (Simon asked whether it was
+built): yes, by the box - delete its address and save, the player goes at once; re-adding brings
+the SAME player back. No separate per-player Remove button was built; offered, not requested.
+
+**BUILT 1.0.30 2026-09-27** (test build, `AUTO_DEFAULT` 0): zip rebuilt with `Addresses.pm`,
+`Settings.pm` and `settings/basic.html`, repo.xml sha `39fbd3f9`, 1,402 checks green.
+Uncommitted.
+
+**THE "CHECKING" LINE (2026-09-27, Simon: *"maybe add a message its checking as currently the state
+doesnt change"*), after he KEPT the 5s wait for slow networks.** A save that adds an address can
+only answer when the check is done, so the PAGE says so the moment the save starts: *"Checking that
+HQPlayer answers at %s - this can take a few seconds."* (`PLUGIN_HQPLAYER_ADDR_CHECKING`), naming
+only the NEW addresses. Shown only when the save will check: addresses-only selected, the box not
+greyed, and an address not in `hqp_saved` - the SAVED list `beforeRender` hands the page, the one
+`handler()` compares against (NOT the box as the page opened: a refused page redraws the typed box,
+and saving that again re-checks). BOTH ways a save starts: the Save button fires `submit`;
+Material's save-on-close (`iframe-dialog.js`, `forms.settingsForm.submit()`) fires NO event, so
+`beforeunload` covers it. **`t_live.pl`'s "no `<script`" pin on this template is NARROWED** to what
+it was for - no poller (`setInterval|setTimeout|XMLHttpRequest|fetch(|jsonrpc`) and no live-page
+link. Pins: `t_settings.pl` 96 (the saved list on an ordinary and a REFUSED page, the template
+hands it over) + `tools/t_settings_page.js` 11 EXECUTED under osascript (appears on Save naming
+only the new address; on `beforeunload`; not for a removal, an unchanged box, an empty box,
+automatic, or a switch to automatic before saving; after a refusal, saving again still says it).
+Mutation-checked: compared against the opened box (5 fail), no `beforeunload` (2), shown in
+automatic (3), every address named (4), page handed the box not the saved list (1). **Verified live on the Save button in 1.0.32.** **WHEN MATERIAL PROMPTS "Do you want to save them?" - it depends on the ROUTE, measured in `lms-material` (44827f66) after Simon saw it on Qobuz and never on ours:** `iframe-dialog.js` installs change tracking (`initChangeListeners`, value vs `defaultValue` on every input/textarea/select) ONLY for its own settings screens, page `server` or `player` - i.e. the plugin picked from Material's SERVER SETTINGS list, as Qobuz usually is. Opened from the **Apps -> HQPlayer Bridge -> Settings** row (Simon's route) it is page `other`: a plain page, no tracking, back just leaves with no prompt (Simon: "its never done that ... If i back out it says nothing"). On the server-settings route: an address typed then back -> the prompt; its Save calls `form.submit()` (no `submit` event - hence `beforeunload`) and Material closes the page ~100ms later, so the check still runs and saves if HQPlayer answers, but a REFUSAL is never seen; a MODE-ONLY change then back -> NO prompt and the change is dropped, because a radio's `value` never differs from its `defaultValue` (only `checked` moves) - Material's limitation, true of every plugin's radios, LBF's too. The `beforeunload` listener is therefore NEEDED, not harmless. My first note here ("does not occur in use") was wrong in the other direction - it occurs on the other route. **CORRECTED THE SAME HOUR - it is the BUTTON, not only the route.** Simon opens it the server-settings way (Server settings -> Plugins -> the plugin's settings link) and still gets no prompt on BACK: a link followed inside the settings frame pushes the Plugins page onto Material's history (`iframe-href`), and `goBack()` just POPS that history - it never calls `canClose()`, so unsaved typing is dropped silently. The prompt comes only from CLOSING the settings window (X / home -> `canClose` -> `confirmClose`) or switching section with the settings drop-down (`settingsSectionChangedReq`), with a field changed. Material's behaviour for every plugin page.
+
+**AN UPDATE NEVER OVERRIDES A USER'S CHOICE; DEFAULT BACK TO AUTOMATIC (2026-09-27, after 1.0.33).**
+Simon: *"Set the default back to auto now please, but what we need is for the plugin to remember
+the users settings for updates and not override ... for any more updates it doesnt lose setting if
+you have it set to manual."* `AUTO_DEFAULT` is 1 again, so a new install or an update from main
+finds HQPlayer as before. What keeps a choice across updates: `prefs->init` only FILLS a pref never
+stored - fleet-measured, LBF's `all_past` stored as null stayed null through restarts and updates
+despite init's default of 1 (the `undef // 1` trap, memory material-settings-page); the settings
+page always stores an explicit 0 or 1; and NOTHING ELSE in the plugin writes either pref. Pins in
+`t_plugin.pl` (293): no `->set`/`->remove`/`->delete` of `autodiscover` or `addresses` and no
+`->migrate` in any module (comments stripped); `prefs->init` called ONCE; startup with a stored OFF
+- with a list and with an EMPTY box - opens no socket and sends nothing; NEVER STORED discovers.
+Mutation-checked: startup resetting the mode (1 fail), startup clearing the list (1), a second init
+(1), the default off again (2), startup ignoring a stored off (16). **PROVEN LIVE with 1.0.34** - addresses-only
+with its list survived an update whose default is automatic (see BUILT 1.0.34).
+README updated the same day at Simon's request (normally a merge-to-main job): *"Nothing to
+configure for most setups"*, a Settings section for the IP-address option, the 15s pace, the
+Desktop network-toggle limitation, and two interfaces at once under Not supported.
+
+**BUILT 1.0.34 2026-09-27** (uncommitted): the default back ON, the no-override pins, the README. repo.xml sha `c2bb233d`, 1,437 checks green. **INSTALLED + UPDATE CASE VERIFIED LIVE:** before the install the rig held `autodiscover = 0`, `addresses = 192.168.1.248` (read over HTTP); after installing 1.0.34 (whose default is 1) it still read `0` / `192.168.1.248`, the live page served v1.0.34, and `HQPlayer (MacMini)` was connected at .248. Simon: "installed settings kept."
+
+**EVERY SAVE THAT GOES THROUGH SAYS WHAT IT DID (2026-09-27, after 1.0.32).** Simon: saving a blank
+box *"gave no message at all"* - the empty-box refusal was gone (OFF IS OFF) and a save with no new
+address had no line. Offered the blank-box line and lines for the other silent saves; Simon: "yes".
+`Settings::_savedLines`, into the same `hqp_found` list the page already prints: a blank box ->
+*"Saved: no HQPlayer address entered, so there are no players until you add one."*; removed ->
+*"Saved: removed %s."* (only when the box was IN USE - coming from automatic, a stale pref is not
+"removed"); each new address -> the existing *"answered at"* line; switched to automatically ->
+*"Saved: HQPlayer is now found automatically."* (+ *"The addresses were cleared and their players
+removed."* when there were any); nothing else -> *"Saved."*. A refused save still says only why.
+`t_settings.pl` 107. Mutation-checked: blank box silent (3 fail), removals unsaid (3), unchanged
+save silent (1), a stale box called removed (2), cleared addresses unsaid (1), an automatic save
+silent (3). **BUILT 1.0.33 2026-09-27**, repo.xml sha `6a94337f`, 1,428 checks green. **INSTALLED + VERIFIED LIVE, Simon: "all good"** - blank box, add, remove, switch to automatically and an unchanged save each showed its line. Uncommitted.
+
+**BUILT 1.0.32 2026-09-27** (uncommitted): 1.0.31 plus the checking line above. repo.xml sha `751bbcd1`, 1,417 checks green. **INSTALLED + VERIFIED LIVE in Material, Simon: "that worked"** - the checking line on Save with a dead address then the refusal, with a live one then the saved line, none on a removal. The prompt's Save path (server-settings route only) is not live-tested - see below.
+
+**BUILT 1.0.31 2026-09-27** (uncommitted, not installed): 1.0.30 plus ONE string - `PLUGIN_HQPLAYER_ADDR_DEAD` to Simon's wording, *"Not saved: nothing answered at %s. HQPlayer must be running at this address. Nothing was changed."* repo.xml sha `3a9c778e`, 1,402 checks green.
+
+**1.0.30 VERIFIED LIVE 2026-09-27 on plex:9000, Simon: "that all seemed to work, went through all
+6":** (1) startup with the default off - the Apps feed and the live page say to enter an address,
+no HQPlayer players, no discovery lines in HQPlayer's log; (2) the settings page in Material opens
+on "Only at the addresses below" with the box editable; (3) the Mac mini's address saved with
+HQPlayer running - named on save, player appeared, the live page swapped the line for its card
+with no reload; (4) an address with nothing there refused and named; (5) address removed - player
+gone at once; added back - the same player; (6) switched to Automatically - box cleared, typed
+player gone, discovery found it again. (7) Also checked by Simon: **HQPlayer restarted in
+addresses-only mode** - the player left Material when its link dropped and came back when HQPlayer
+was up again, with no discovery involved (the link's own ladder, capped at 10s): "expected
+behaviour working as planned". **Still not exercised live:** the radio's `onclick`
+re-enabling a box greyed in automatic mode (step 2 opened in addresses mode, where the box is
+drawn editable), and a DHCP move with discovery on.
+
+**ADDRESS MOVE WITH DISCOVERY ON - VERIFIED LIVE 2026-09-27 21:47** on HQPlayer Desktop: Simon moved the Mac 192.168.1.109 -> **192.168.1.107** (manual IP), switched HQPlayer's network button back on (it turns itself off on the move - `MainWindow.network`), and the bridge showed `HQPlayer (Mac)` Connected at .107 beside the Mac mini, **same id `02:17:48:c0:64:4a`** (= `_idFor('Mac')`), one Mac player.
+
+**VERIFIED LIVE 2026-09-27 (Simon: "its always worked"):** in MATERIAL, from Automatically, clicking "Only at the addresses below" makes the greyed box editable before saving - the radio's inline `onclick` runs in Material's settings iframe.
+
+**Owed:** the README (merge-to-main artifact) still says "nothing to configure" and
+"every 5 seconds".
+
 ## Not in v1
 
 HQPlayer DSP/filter/mode selection from LMS, HQPlayer's own
-library browsing, multi-room sync with hardware players, editable settings,
+library browsing, sync groups of any kind (NOT SUPPORTED, final - see `SYNC GROUPS ARE NOT SUPPORTED - FINAL`), any settings beyond the address box and the discovery switch,
 plugin icon artwork, HTTP auth on the LMS URLs when a server password is set.

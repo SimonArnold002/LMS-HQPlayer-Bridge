@@ -1,0 +1,71 @@
+[% PROCESS settings/header.html %]
+
+<input type="hidden" name="hqp_form" value="1" />
+
+[% IF hqp_error %]
+<p style="color:#c62828;font-weight:bold;">[% hqp_error | html %]</p>
+[% END %]
+
+[%# Shown by the script below the moment Save is pressed on a save that will
+    wait for HQPlayer - the server can only answer once the check is done. %]
+<p id="hqp_checking" style="display:none;font-weight:bold;" data-text="[% 'PLUGIN_HQPLAYER_ADDR_CHECKING' | string | html %]" data-saved="[% hqp_saved | html %]"></p>
+
+[% FOREACH f IN hqp_found %]
+<p style="font-weight:bold;">[% f | html %]</p>
+[% END %]
+
+[%# TWO MODES, NEVER BOTH. A RADIO GROUP to LBF's spec: <label>-wrapped,
+    <br>-separated, no <select>, and exactly one option checked in every
+    state - hqp_auto is decided in Perl (Settings::beforeRender), so the
+    template never matches a stored value. The address box is used only in
+    the second mode, and is greyed out (so it posts nothing, and the save
+    clears it) in the first. %]
+[% WRAPPER setting title="PLUGIN_HQPLAYER_MODE_TITLE" desc="PLUGIN_HQPLAYER_AUTO_DESC" %]
+<div>
+  <label><input type="radio" name="pref_autodiscover" value="1" [% IF hqp_auto %]checked="checked"[% END %] onclick="var a=document.getElementsByName('pref_addresses')[0]; if (a) { a.disabled=true; }"> [% 'PLUGIN_HQPLAYER_AUTO_TITLE' | string %]</label><br>
+  <label><input type="radio" name="pref_autodiscover" value="0" [% IF !hqp_auto %]checked="checked"[% END %] onclick="var a=document.getElementsByName('pref_addresses')[0]; if (a) { a.disabled=false; }"> [% 'PLUGIN_HQPLAYER_MANUAL_TITLE' | string %]</label>
+</div>
+[% END %]
+
+[% WRAPPER setting title="PLUGIN_HQPLAYER_ADDR_TITLE" desc="PLUGIN_HQPLAYER_ADDR_DESC" %]
+<textarea name="pref_addresses" rows="3" cols="40" placeholder="192.168.1.20, 192.168.1.21" style="width:100%;max-width:28em;" [% IF hqp_auto %]disabled="disabled"[% END %]>[% hqp_addresses | html %]</textarea>
+[% END %]
+
+[%# THE "CHECKING" LINE. A save that ADDS an address waits for HQPlayer to
+    answer there (up to Control's 5s connect timeout, kept on purpose for slow
+    networks) and the server can send nothing until it has - so the page says
+    so itself, the moment the save starts. Only when the save will check:
+    addresses-only selected and an address not already saved (hqp_saved, the
+    list handler() compares against). BOTH ways a save starts: the Save
+    button fires `submit`; Material's "Do you want to save them?" prompt calls
+    form.submit(), which fires no event, so `beforeunload` covers it. That
+    prompt appears ONLY when the page is opened from Material's server
+    settings list (iframe-dialog.js initChangeListeners, page 'server' or
+    'player'); opened from the Apps row it is a plain page and back just
+    leaves. It polls nothing. %]
+<script>
+(function () {
+    var box  = document.getElementsByName('pref_addresses')[0];
+    var note = document.getElementById('hqp_checking');
+    if (!box || !box.form || !note) { return; }
+
+    var split = function (t) { return String(t || '').split(/[\s,;]+/).filter(function (a) { return a; }); };
+    var saved = {};
+    split(note.getAttribute('data-saved')).forEach(function (a) { saved[a] = 1; });
+
+    var show = function () {
+        var manual = false, r = document.getElementsByName('pref_autodiscover');
+        for (var i = 0; i < r.length; i++) { if (r[i].checked && r[i].value === '0') { manual = true; } }
+        if (!manual || box.disabled) { return; }
+        var added = split(box.value).filter(function (a) { return !saved[a]; });
+        if (!added.length) { return; }
+        note.textContent = note.getAttribute('data-text').replace('%s', added.join(', '));
+        note.style.display = '';
+    };
+
+    box.form.addEventListener('submit', show);
+    window.addEventListener('beforeunload', show);
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

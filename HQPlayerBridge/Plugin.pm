@@ -10,9 +10,9 @@ package Plugins::HQPlayerBridge::Plugin;
 # audio at all: it hands HQPlayer a URL pointing back at LMS's own HTTP
 # server and lets HQPlayer fetch the bytes directly.
 #
-# No configuration.  Instances are found by multicast, and there is no settings
-# page at all - nothing here is configurable, so the only surfaces are the Apps
-# feed and the live view (Live.pm).
+# Instances are found by multicast, or from addresses typed into the settings
+# page (Settings.pm), which is also where automatic discovery can be switched
+# off. The other surfaces are the Apps feed and the live view (Live.pm).
 
 use strict;
 use warnings;
@@ -32,6 +32,9 @@ use Socket qw(pack_sockaddr_in INADDR_LOOPBACK);
 
 use Slim::Utils::Log;
 use Slim::Utils::PluginManager;
+use Slim::Utils::Prefs;
+use Slim::Utils::Timers;
+use Time::HiRes ();
 use Slim::Control::Request;
 use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Player::Source;
@@ -40,6 +43,7 @@ use Plugins::HQPlayerBridge::Live;
 use Slim::Display::NoDisplay;
 use Slim::Utils::Strings qw(cstring);
 
+use Plugins::HQPlayerBridge::Addresses;
 use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Discovery;
 use Plugins::HQPlayerBridge::Player;
@@ -66,6 +70,10 @@ my $log = Slim::Utils::Log->addLogCategory({
     'defaultLevel' => 'INFO',
     'description'  => 'PLUGIN_HQPLAYER_BRIDGE',
 });
+
+# The settings page's two prefs. The default mode is Addresses::AUTO_DEFAULT.
+my $prefs = preferences('plugin.hqplayerbridge');
+$prefs->init( { addresses => '', autodiscover => Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT() } );
 
 # id => { instance => {...}, control => $ctl, client => $client }
 my %bridges;
@@ -124,12 +132,166 @@ sub initPlugin {
     # reconnecting a player LMS no longer has. NO UI in LMS or Material sends
     # it to this player (Slimproto's timer is for SlimProto clients, and the
     # on-device menu needs a display) - only a third-party app or a hand-typed
-    # command. If the instance still answers discovery, the next round (10s at
-    # most, since this one is not connected) makes a FRESH player: unlike a Lyrion player, which returns only when it
-    # reconnects, this one returns when discovery answers.
+    # command. If the instance still answers discovery, or its address is in
+    # the settings, the next round (15s at most) makes a FRESH player: unlike a
+    # Lyrion player, which returns only when it reconnects, this one returns
+    # when discovery answers.
     Slim::Control::Request::subscribe( \&_onForget, [ ['client'], ['forget'] ] );
 
-    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances, \&_linkUpFor );
+    if (main::WEBUI) {
+        require Plugins::HQPlayerBridge::Settings;
+        Plugins::HQPlayerBridge::Settings->new;
+    }
+
+    # A saved settings page - or a `pref` command - takes effect AT ONCE: a
+    # removed address loses its player now, not at the next round.
+    $prefs->setChange( \&_settingsChanged, qw(addresses autodiscover) );
+
+    # A typed address answering for the first time is announced straight
+    # away, as a new discovery reply is. Additive only - see _onInstances.
+    # _linkStateAt also tells the settings page which addresses are already
+    # connected, so its check opens no second link to them.
+    Plugins::HQPlayerBridge::Addresses::init( sub { _onInstances( _table(), 1 ) }, \&_linkStateAt );
+    Plugins::HQPlayerBridge::Addresses::set( _boxAddresses() );
+
+    _startDiscovery();
+
+    return;
+}
+
+# TWO MODES, NEVER BOTH (Simon, 2026-09-27: "only allow manual ip addresses
+# when auto is turned off ... we should not be having both active at same
+# time"). Automatic discovery ON: the box is empty and ignored. OFF: the box is
+# the whole list and no UDP is sent. Switching cleans out the other mode's
+# players - see _applySettings.
+sub _rawBox {
+    my ($ok) = Plugins::HQPlayerBridge::Addresses::parse( $prefs->get('addresses') );
+    return $ok;
+}
+
+# Never set means Addresses::AUTO_DEFAULT. The settings page always stores an
+# explicit 0 or 1 (the mode radio, Settings::handler).
+#
+# OFF IS OFF, WHATEVER THE BOX HOLDS (Simon, 2026-09-27: "It should not
+# discover or add any player without an IP added when in manual mode"). Off
+# with an empty box is a bridge with no players until an address is typed -
+# never discovery running on its own. (A first build refused that save, and
+# inline review 2 then kept discovery running for it; both REVERSED.)
+sub _autoDiscover {
+    my $v = $prefs->get('autodiscover');
+    return defined $v ? ( $v ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
+}
+
+# The addresses in use: the box with discovery off, none with it on.
+sub _boxAddresses {
+    return _autoDiscover() ? [] : _rawBox();
+}
+
+# The round clock always runs: with automatic discovery off it opens no socket
+# and sends nothing, but its rounds are still when the typed addresses are
+# checked.
+sub _startDiscovery {
+    Plugins::HQPlayerBridge::Discovery->start(
+        sub { _onInstances( _table(), $_[1] ) },
+        onRound => \&_onRound,
+        udp     => _autoDiscover(),
+    );
+
+    return;
+}
+
+sub _onRound {
+    my $round = shift;
+    Plugins::HQPlayerBridge::Addresses::verify( $round, \&_linkStateAt );
+    return;
+}
+
+# Does a player already hold this address? ( 'up' | 'down', its HQPlayer's
+# name ), or an empty list for no player. `up` is the proven link - the answer
+# Material shows. The name lets a typed address that a player already holds
+# be keyed without opening a second control connection to it.
+sub _linkStateAt {
+    my $ip = shift;
+
+    for my $b ( values %bridges ) {
+        my $inst = $b->{instance} or next;
+        next unless ( $inst->{ip} // '' ) eq $ip;
+        return ( $b->{client} && $b->{client}->connected ? 'up' : 'down', $inst->{name} );
+    }
+
+    return;
+}
+
+# THE ONE TABLE the players are reconciled against. With the two modes
+# exclusive, it is discovery's list OR the typed addresses, never a mix - but
+# it is keyed by address either way, so a transition can never make one
+# HQPlayer two rows.
+sub _table {
+    my %t = map { $_->{ip} => { %$_ } } @{ Plugins::HQPlayerBridge::Discovery::instances() };
+
+    for my $ip ( @{ Plugins::HQPlayerBridge::Addresses::list() } ) {
+        my $e = Plugins::HQPlayerBridge::Addresses::entry($ip) or next;
+        $t{$ip} ||= { %$e };
+    }
+
+    return [ map { $t{$_} } sort keys %t ];
+}
+
+# LMS fires the change handler once PER PREF, in the middle of a save, so the
+# first call would see a half-saved page - the switch flipped but the box not
+# yet written, or the other way round. Applied one event-loop turn later
+# instead, once, when both are stored.
+sub _settingsChanged {
+    Slim::Utils::Timers::killTimers( undef, \&_applySettings );
+    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time(), \&_applySettings );
+    return;
+}
+
+# The settings were saved (or a `pref` command changed one).
+#
+# SWITCHING CLEANS OUT THE OTHER MODE, at once and connected or not (Simon,
+# 2026-09-27: "when its turned off clean the records"):
+#   - discovery OFF: every player whose address is not in the box goes, and
+#     discovery's table is dropped (Discovery->stop);
+#   - discovery ON: the box is cleared (by the settings page) and every typed
+#     player goes. Discovery finds again whatever it can reach, under the same
+#     id - a player is keyed by HQPlayer's name - so its prefs and playlist
+#     come back with it.
+# Within the typed mode, an address taken out of the box loses its player the
+# same way; typing it back brings the same player back.
+sub _applySettings {
+    my $auto = _autoDiscover();
+    my $box  = _boxAddresses();
+
+    my $removed = Plugins::HQPlayerBridge::Addresses::set($box);
+
+    if ( $auto != Plugins::HQPlayerBridge::Discovery::listening() ) {
+        main::INFOLOG && $log->is_info && $log->info(
+            'automatic discovery ' . ( $auto ? 'on' : 'off - no UDP at all, only the addresses in the settings' ) );
+
+        # Restarting the clock runs a round at once, which keys every address
+        # in the box: from the player that already holds it, or over TCP.
+        Plugins::HQPlayerBridge::Discovery->stop;
+        _startDiscovery();
+    }
+    else {
+        # Anything newly typed is keyed now, not at the next round.
+        Plugins::HQPlayerBridge::Addresses::verify(
+            Plugins::HQPlayerBridge::Discovery::round(), \&_linkStateAt );
+    }
+
+    my %gone = map { $_ => 1 } @$removed;
+    my %box  = map { $_ => 1 } @$box;
+
+    for my $id ( keys %bridges ) {
+        my $ip = ( $bridges{$id}->{instance} || {} )->{ip};
+
+        next unless defined $ip;
+        next if $auto ? !$gone{$ip} : $box{$ip};
+
+        $log->info( ( $bridges{$id}->{name} || $id ) . ": $ip is not in use in the settings any more, removing player" );
+        _teardown($id);
+    }
 
     return;
 }
@@ -222,6 +384,7 @@ sub postinitPlugin {
 sub shutdownPlugin {
     Slim::Control::Request::unsubscribe( \&_onForget );
     Plugins::HQPlayerBridge::Discovery->stop;
+    Plugins::HQPlayerBridge::Addresses::reset();
     %splitWarned = ();
 
     for my $id ( keys %bridges ) {
@@ -253,13 +416,15 @@ sub bridges { return \%bridges }
 # when tapped - `text` avoids that entirely.
 # ---------------------------------------------------------------------------
 use constant ICON => 'plugins/HQPlayerBridge/html/images/HQPlayerBridgeIcon.png';
+use constant SETTINGS_PATH => '/plugins/HQPlayerBridge/settings/basic.html';
 
 sub topLevel {
     my ( $client, $callback, $args ) = @_;
 
-    # THE ONE ACTION, AND THERE IS NO SETTINGS PAGE BEHIND IT ANY MORE. Nothing
-    # in this plugin is configurable, so a settings page was only ever a place
-    # to read numbers from - and it could not keep them current.
+    # THE LIVE VIEW FIRST. The live reading is not a settings page: the one
+    # that existed until 0.2.62 was only a place to read numbers from, and it
+    # could not keep them current. (The settings page that came back on
+    # 2026-09-27 holds only the typed addresses and the discovery switch.)
     #
     # A BROWSE LIST CANNOT REFRESH ITSELF IN MATERIAL, and that is settled from
     # Material's own source, not inferred: every `refreshList` trigger in
@@ -277,6 +442,15 @@ sub topLevel {
         weblink => Plugins::HQPlayerBridge::Live::PATH(),
         image   => ICON,
     } );
+
+    # THE SETTINGS PAGE, second and ALWAYS present: a fixed row above the
+    # Restart block, so it never moves one of those positional rows within a
+    # run. A relative weblink opens in Material's own iframe dialog.
+    push @items, {
+        name    => cstring( $client, 'PLUGIN_HQPLAYER_SETTINGS' ),
+        type    => 'link',
+        weblink => SETTINGS_PATH,
+    } if main::WEBUI;
 
     # THE RESTART ROWS: ONE BLOCK, RIGHT UNDER THE LIVE VIEW, APPEND-ONLY.
     #
@@ -341,16 +515,27 @@ sub topLevel {
         }
     }
 
-    # NOTHING DISCOVERED YET SAYS SO, rather than showing a bare link and
-    # leaving the user to wonder whether the plugin is working. The wording
-    # matches the live page's - waiting, not failed - because that is what it
-    # is: discovery keeps probing, and an instance that is simply switched off
-    # will appear on its own. The second row is the diagnostic, for the case
-    # where it never does.
+    # WHAT IT IS STILL WAITING FOR SAYS SO, rather than leaving the user to
+    # wonder whether the plugin is working: waitingText, the SAME words the
+    # live page shows, true to the mode - and with typed addresses, even when
+    # other players are connected. Last, so it can never move a positional
+    # row above it. With no player at all, the diagnostic follows, matching
+    # what is actually running (with discovery off no probe was sent at all);
+    # with no address typed the waiting row already says what to do.
+    #
+    # This feed is a snapshot: Material never re-renders a browse list on its
+    # own. The live page is the surface that follows the state as it changes.
+    my $wait = waitingText($client);
+
+    push @items, { name => $wait, type => 'text' } if length $wait;
+
     if ( !keys %bridges ) {
-        push @items,
-            { name => cstring( $client, 'PLUGIN_HQPLAYER_LIVE_WAITING' ), type => 'text' },
-            { name => cstring( $client, 'PLUGIN_HQPLAYER_NONE_DESC' ),    type => 'text' };
+        my $auto = Plugins::HQPlayerBridge::Discovery::listening();
+
+        push @items, {
+            name => cstring( $client, $auto ? 'PLUGIN_HQPLAYER_NONE_DESC' : 'PLUGIN_HQPLAYER_NONE_DESC_OFF' ),
+            type => 'text',
+        } if $auto || @{ Plugins::HQPlayerBridge::Addresses::list() };
     }
 
     $callback->( { items => \@items } );
@@ -406,9 +591,9 @@ sub _now { return time() }
 
 # At every link-up and whenever the Apps list is drawn, while the host is still
 # unknown - at most once per REPROBE_AFTER either way. A link-up is throttled
-# too: reconnectNow retries a refusing instance every discovery round, and an
-# unthrottled probe was a 3s GET to a dead :8090 every ~10s for ever on a host
-# with no helper. A host already known is never asked again.
+# too: the link retries a refusing instance every 10s (Control::BACKOFF_MAX),
+# and an unthrottled probe was a 3s GET to a dead :8090 every ~10s for ever on
+# a host with no helper. A host already known is never asked again.
 sub _probeRestart {
     my $ip = shift;
     return unless $ip;
@@ -510,6 +695,39 @@ sub _shortMime {
     return uc $mime;
 }
 
+# WHAT THE BRIDGE IS STILL WAITING FOR - true to the mode, and ONE answer for
+# the Apps feed and the live page (whose poll carries it as `waiting`), so the
+# two never disagree. '' when it is waiting for nothing: the poll sends that
+# too, so the live page drops a line that no longer holds.
+#
+#   automatically, no player       looking on the network
+#   automatically, players         '' - there is no list of HQPlayers to expect
+#   addresses only, none typed     nothing to wait for: enter one in Settings
+#   addresses only                 every typed address with NO player yet, named
+#                                  - even while others are connected (review 6:
+#                                  one off at an LMS restart was shown nowhere)
+sub waitingText {
+    my $client = shift;
+
+    if ( Plugins::HQPlayerBridge::Discovery::listening() ) {
+        return keys %bridges ? '' : cstring( $client, 'PLUGIN_HQPLAYER_WAIT_AUTO' );
+    }
+
+    my $list = Plugins::HQPlayerBridge::Addresses::list();
+
+    return cstring( $client, 'PLUGIN_HQPLAYER_NONE_DESC_EMPTY' ) if !@$list;
+
+    # In LIST context: _linkStateAt answers ( state, name ) or nothing, and
+    # in scalar context a player with no name would read as no player.
+    my @waiting = grep { my @at = _linkStateAt($_); !@at } @$list;
+
+    return '' if !@waiting;
+
+    ( my $text = cstring( $client, 'PLUGIN_HQPLAYER_WAIT_ADDR' ) ) =~ s/%s/join( ', ', @waiting )/e;
+
+    return $text;
+}
+
 # ---------------------------------------------------------------------------
 # The query the live page polls.
 #
@@ -567,6 +785,7 @@ sub _signalPathQuery {
     }
 
     $request->addResult( 'count', $i );
+    $request->addResult( 'waiting', waitingText($client) );
     $request->setStatusDone();
 
     return;
@@ -856,21 +1075,6 @@ sub _fmtFormat {
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
 # ---------------------------------------------------------------------------
-# Discovery asks this to decide how often to look (Discovery::IDLE_PERIOD):
-# is the player at this address connected? The same answer Material shows,
-# Player::connected - so the two cannot disagree. An address with no player
-# yet is not connected: it is still being built.
-sub _linkUpFor {
-    my $ip = shift or return 0;
-
-    for my $b ( values %bridges ) {
-        next unless $b->{instance} && ( $b->{instance}->{ip} || '' ) eq $ip;
-        return $b->{client} && $b->{client}->connected ? 1 : 0;
-    }
-
-    return 0;
-}
-
 # $partial is set when discovery is announcing a reply mid-round, before the
 # rest of the instances have had their chance to answer.  Such a list is
 # additive only: see the removal pass at the end.
@@ -917,14 +1121,9 @@ sub _onInstances {
                 _create( $id, $inst, $name );
             }
             else {
+                # Nothing to poke: a down link reconnects on its own ladder
+                # (Control::BACKOFF_MAX), whatever discovery hears.
                 $b->{instance} = $inst;
-
-                # It answered THIS round, so it is there: if its link is down,
-                # reconnect now instead of waiting out the backoff (up to 60s
-                # after a long outage). A no-op while the link is up.
-                $b->{control}->reconnectNow
-                    if $b->{control}
-                    && ( $inst->{round} // -1 ) == Plugins::HQPlayerBridge::Discovery::round();
             }
         }
         else {
@@ -1078,10 +1277,11 @@ sub _isSplit {
 # IT DELIBERATELY DOES NOT MERGE TWO ADDRESSES THAT ARE BOTH ANSWERING, and an
 # interface move is exactly that once the daemon is healthy.  MEASURED the same
 # day: hqplayerd answers the MULTICAST probe from one address only, but answers
-# a UNICAST probe on EVERY address it holds - and `_probe` unicasts to every
-# address already in %found.  So a remembered address refreshes its own
-# lastSeen for as long as its interface is up and never ages out; that split is
-# PERMANENT, not an INSTANCE_TTL window.  Running HQPlayer on more than one
+# a UNICAST probe on EVERY address it holds.  While `_probe` unicast to every
+# address in %found (until 2026-09-27) a remembered address refreshed its own
+# lastSeen for ever and that split was PERMANENT; with multicast only, the
+# unused address now ages out after INSTANCE_TTL and the pair collapses to the
+# plain id (docs/discovery-simplification-plan.md section 5).  Running HQPlayer on more than one
 # active interface is DECLINED as scope (Simon, 2026-09-20; the vendor
 # documents single-interface operation), so collapsing it is not this gate's
 # job - and merging on the name alone would take two REAL instances with it.
@@ -1301,9 +1501,9 @@ sub _onLinkState {
         # closing the socket - see _statusWatchdog in Player.pm.
         $client->_startPolling;
 
-        # Throttled like every other call (see _probeRestart): reconnectNow
-        # retries a refusing instance once per discovery round, and every
-        # accept reaches this branch.
+        # Throttled like every other call (see _probeRestart): the link retries
+        # a refusing instance every BACKOFF_MAX (10s), and every accept
+        # reaches this branch.
         _probeRestart( ( $b->{instance} || {} )->{ip} );
     }
     else {
@@ -1330,6 +1530,13 @@ sub _onLinkState {
         if ($wasProven) {
             $client->disconnected(1);
             Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
+
+            # Look NOW: if HQPlayer moved (DHCP), this is how the new address
+            # is heard without waiting for the next round. One probe however
+            # many links drop, and none with automatic discovery off. Only a
+            # PROVEN link - an accept-then-drop every 10s must not become a
+            # probe every 10s.
+            Plugins::HQPlayerBridge::Discovery->probeNow;
 
             my $controller = eval { $client->controller };
             if ( $controller && !$controller->onlyActivePlayer($client) ) {
@@ -1362,12 +1569,6 @@ sub _onLinkProven {
     # without the notification Material never re-lists the player.
     $client->disconnected(0);
     Slim::Control::Request::notifyFromArray( $client, [ 'client', 'reconnect' ] );
-
-    # NOTHING ABOUT THE HELD VOLUME HERE. A reply on the link does not prove
-    # THIS link carried the <Volume> refreshInfo queued: a slider move made
-    # after the link came up sits behind VolumeRange/GetInfo, so the first reply
-    # can arrive while it is still queued. It is released by its own reply -
-    # see Player::_volumeDelivered.
 
     # playerActive can run the whole _JumpToTime -> play() path when the group
     # is playing; a failure there is logged, not allowed to unwind the proof.

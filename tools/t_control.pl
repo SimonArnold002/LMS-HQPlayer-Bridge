@@ -8,6 +8,9 @@ my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
   if ($got eq $want){$pass++; printf "  ok   %s\n",$name}
   else {$fail++; printf "  FAIL %s\n        got: %s\n       want: %s\n",$name,$got,$want} }
+# see the note on ok() in t_player.pl - a failed match returns the EMPTY LIST
+sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
+  $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
 
 print "-- parseAttrs --\n";
 my $a = $C->can('parseAttrs')->('<?xml version="1.0"?><Status state="Playing" position="42.5" rate="352800"/>');
@@ -273,7 +276,7 @@ print "-- the reconnect ladder must climb against a peer that accepts and drops 
     }
     Slim::Utils::Timers::_reset();
 
-    is( join( ',', @waits ), '2,4,8,16,32,60,60',
+    is( join( ',', @waits ), '2,4,8,10,10,10,10',
         "it doubles from ${min}s and caps at ${max}s" );
 }
 
@@ -433,53 +436,77 @@ print "-- up(): will send() accept a command? --\n";
     Slim::Utils::Timers::_reset();
 }
 
-print "-- reconnectNow: discovery heard it, so try now --\n";
+print "-- the link keeps itself alive: no discovery in the loop --\n";
 {
-    my @connects;
+    # reconnectNow is GONE (2026-09-27). Discovery used to poke a down link
+    # every 10s round, and that poke was the real return time after a long
+    # outage; the link's own ladder now caps at that same 10s.
+    ok( !Plugins::HQPlayerBridge::Control->can('reconnectNow'), 'reconnectNow no longer exists' );
+    is( Plugins::HQPlayerBridge::Control::BACKOFF_MAX(), 10, 'the link backs off to 10s at most, not 60' );
+
+    # A link that has been down a long time - the ladder at its top - is
+    # retried within 10s, with nothing else running at all.
+    require Plugins::HQPlayerBridge::Discovery;
+    Plugins::HQPlayerBridge::Discovery->stop;
+    Slim::Utils::Timers::_reset();
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->{backoff}    = Plugins::HQPlayerBridge::Control::BACKOFF_MAX();
+    $c->{connecting} = 1;
+    my $t0 = Time::HiRes::time();
+    $c->_dropLink('connect: refused');
+    my @r = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() };
+    is( scalar @r, 1, 'a dropped link schedules its own retry, discovery stopped' );
+    ok( @r && $r[0]{when} - $t0 <= 10.01, 'and it comes within 10s' );
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- identify: one <GetInfo/> to a typed address, and done --\n";
+{
+    my @warned;
     no warnings qw(redefine once);
-    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, 1 };
+    local *Slim::Utils::Log::Obj::warn = sub { push @warned, $_[1] };
+    my @connects;
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, $_[0]; $_[0]->{connecting} = 1 };
     Slim::Utils::Timers::_reset();
 
-    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
-    $c->{backoff} = 60;
-    $c->_scheduleReconnect;                        # the backoff timer, as after a drop
-    $c->reconnectNow;
-    is(scalar @connects, 1, 'a down link connects now');
-    is(scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
-       'and the pending backoff retry is dropped, not left to connect again');
-    is($c->{backoff}, 60, 'reconnectNow itself does not touch the backoff');
+    my $got = 'none';
+    my $c = Plugins::HQPlayerBridge::Control->identify( '10.1.2.3', sub { $got = $_[0] } );
+    is( scalar @connects, 1, 'it opens one connection' );
+    is( $c->{queue}[0]{cmd}, '<GetInfo/>', 'and queues <GetInfo/> on it' );
 
-    # AND WHAT IT DOES NOT DO - the corrected comment on reconnectNow.  It used
-    # to claim "the backoff itself is left where it is: if this attempt fails,
-    # the next scheduled retry is as far away as before".  Only the first half
-    # is true.  The attempt reconnectNow starts goes _dropLink ->
-    # _scheduleReconnect when it fails, which doubles the ladder like any other
-    # retry.  The assertion above could never catch that: it runs at
-    # BACKOFF_MAX (60), where doubling is a no-op.  Pin it from the BOTTOM of
-    # the ladder, where a double is visible.
-    {
-        Slim::Utils::Timers::_reset();
-        my $e   = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
-        my $min = $e->{backoff};
+    # HQPlayer answers: the same name discovery reports (measured, both products)
+    $c->{connecting} = 0; $c->{connected} = 1; $c->{sock} = 'x';
+    $c->{inflight} = shift @{ $c->{queue} };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo engine="6.0.4" name="MacMini" platform="Mac" product="Signalyst HQPlayer Embedded" version="6"/>');
+    is( ref $got eq 'HASH' ? $got->{name} : $got, 'MacMini', 'the answer hands back GetInfo\'s name' );
+    my @close = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_closeOneShot } @{ Slim::Utils::Timers::_timers() };
+    is( scalar @close, 1, 'and the connection is closed on the next turn, not under _dispatch' );
 
-        $e->reconnectNow;
-        is($e->{backoff}, $min, 'CONTROL: from the bottom of the ladder too, reconnectNow leaves it alone');
+    delete $c->{sock};
+    Slim::Utils::Timers::_fireAll();
+    ok( $c->{closing}, 'then it is closed' );
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
+        'and a one-shot link never schedules a reconnect' );
+    is( scalar @warned, 0, 'nor logs above debug when it closes' );
 
-        $e->{connecting} = 1;                      # the attempt it just started
-        $e->_dropLink('connect: refused');         # ...and that attempt fails
-        is($e->{backoff}, $min * 2,
-           'but the FAILURE it leads to doubles it - the pace is one attempt per discovery round, the ladder is NOT held');
-    }
+    # Nothing there: the callback gets undef, nothing reconnects, nothing warns.
+    Slim::Utils::Timers::_reset();
+    my $dead = 'none';
+    my $d = Plugins::HQPlayerBridge::Control->identify( '10.1.2.4', sub { $dead = $_[0] } );
+    $d->_connectTimeout;
+    is( defined $dead ? $dead : 'undef', 'undef', 'a dead address answers undef' );
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
+        'and costs that one attempt - no retry ladder' );
+    is( scalar @warned, 0, 'and no warning of its own - the caller reports once per outage' );
 
-    @connects = ();
-    $c->{sock} = 'up';
-    $c->reconnectNow;
-    is(scalar @connects, 0, 'CONTROL: a link that is up is left alone');
-
-    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
-    $d->{closing} = 1;
-    $d->reconnectNow;
-    is(scalar @connects, 0, 'and a link being closed is not reopened');
+    # CONTROL: an ordinary link DOES reconnect and DOES warn, so the two
+    # assertions above are about oneShot and not a broken stub.
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '10.1.2.5', name => 'T' );
+    $e->{connecting} = 1;
+    $e->_connectTimeout;
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 1,
+        'CONTROL: an ordinary link reconnects' );
+    is( scalar @warned, 1, 'CONTROL: and warns' );
     Slim::Utils::Timers::_reset();
 }
 
