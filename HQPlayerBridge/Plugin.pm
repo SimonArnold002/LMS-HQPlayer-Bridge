@@ -74,7 +74,7 @@ my %splitWarned;  # name => the addresses last reported as a same-named pair
 # ip => 1 once that host's restart helper answered; never shrinks in a run.
 # See _probeRestart.
 my %restartable;
-my %probedAt;       # ip => when it was last asked, for the feed's throttled re-ask
+my %probedAt;       # ip => when it was last asked - the REPROBE_AFTER throttle
 
 # The Restart rows, in the order they first appeared: bridge ids, APPEND-ONLY
 # for the server run, plus the name each was last seen under. See topLevel.
@@ -313,7 +313,7 @@ sub topLevel {
         # the row stays hidden until the link next drops - days on a healthy
         # host. hqplayerd and the helper start at login in no fixed order, so
         # the miss is ordinary. Throttled; the row shows on the NEXT open.
-        _probeRestart( ( $b->{instance} || {} )->{ip}, 1 );
+        _probeRestart( ( $b->{instance} || {} )->{ip} );
 
         my $p = signalPathFor( $client, $b );
 
@@ -381,9 +381,10 @@ sub topLevel {
 # the NAA was DECLINED 2026-09-21 ("This is for Eversolo to fix").
 # ---------------------------------------------------------------------------
 use constant RESTART_PORT  => 8090;
-use constant REPROBE_AFTER => 60;    # seconds between the feed's re-asks of one host
+use constant REPROBE_AFTER => 60;    # seconds between asks of one still-unknown host
 
 sub restartable { return \%restartable }
+sub probedAt    { return \%probedAt }       # for the tests
 sub restartRows  { return \@restartRows }    # for the tests
 sub restartNames { return \%restartName }
 
@@ -403,13 +404,16 @@ sub _decode {
 # glob assignment cannot reach.
 sub _now { return time() }
 
-# At every link-up, and - throttled - whenever the Apps list is drawn while the
-# host is still unknown. A host already known is never asked again.
+# At every link-up and whenever the Apps list is drawn, while the host is still
+# unknown - at most once per REPROBE_AFTER either way. A link-up is throttled
+# too: reconnectNow retries a refusing instance every discovery round, and an
+# unthrottled probe was a 3s GET to a dead :8090 every ~10s for ever on a host
+# with no helper. A host already known is never asked again.
 sub _probeRestart {
-    my ( $ip, $throttled ) = @_;
+    my $ip = shift;
     return unless $ip;
     return if $restartable{$ip};
-    return if $throttled && _now() - ( $probedAt{$ip} || 0 ) < REPROBE_AFTER;
+    return if _now() - ( $probedAt{$ip} || 0 ) < REPROBE_AFTER;
     $probedAt{$ip} = _now();
 
     Slim::Networking::SimpleAsyncHTTP->new(
@@ -1305,29 +1309,41 @@ sub _onLinkState {
         # closing the socket - see _statusWatchdog in Player.pm.
         $client->_startPolling;
 
-        # THROTTLED, exactly as the feed's call is.  1.0.24's reconnectNow
+        # Throttled like every other call (see _probeRestart): reconnectNow
         # retries a refusing instance once per discovery round, and every
-        # accept reaches this branch - so an unthrottled probe is one 3s GET to
-        # a dead :8090 every ~10s for ever on a host with no helper installed,
-        # where $restartable is never set to stop it.  $probedAt was already
-        # written here and never read; REPROBE_AFTER is what it is for.
-        _probeRestart( ( $b->{instance} || {} )->{ip}, 1 );
+        # accept reaches this branch.
+        _probeRestart( ( $b->{instance} || {} )->{ip} );
     }
     else {
         $client->_stopPolling;
 
         # Only a link LMS was told about: an accept-then-drop never was, and
-        # must announce nothing.
+        # must announce nothing - and was never made active, so it has no
+        # group to leave.
         #
-        # DELIBERATELY NOT playerInactive, which Slimproto's close does call:
-        # leaving a synced member in the active set is what every release
-        # before 1.0.17 did, when `connected` was always 1, and a sync group is
-        # not changed here. (It was also once unsafe: its Stop reached
-        # Control::send, which connected at once on a dead link. send now
-        # fails a command on a down link instead - see Control::send.)
+        # THEN LEAVE THE GROUP, exactly as Slimproto's close does: playerInactive
+        # unless this is the only active player. Left in, a synced member with a
+        # dead link is still handed every track, fails to open it, and LMS fails
+        # that track for the WHOLE group - every other room skipping through the
+        # playlist. Out of it, the others play on; `_onLinkProven`'s playerActive
+        # brings it back at the group's position (_JumpToTime restarts the
+        # group, as a Lyrion player rejoining does). A solo player is left
+        # active, Slimproto's rule, so a restart never stops a lone player here.
+        #
+        # playerInactive's _stopClient reaches Player::stop, whose <Stop/> is
+        # failed quietly on the dead link (Control::send) - no reconnect, nothing
+        # queued. Control::_dropLink calls this BEFORE it fails the load that
+        # was in flight, so stop()'s new generation retires that load instead of
+        # letting it report a failure against the group.
         if ($wasProven) {
             $client->disconnected(1);
             Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
+
+            my $controller = eval { $client->controller };
+            if ( $controller && !$controller->onlyActivePlayer($client) ) {
+                eval { $controller->playerInactive($client); 1 }
+                    or $log->error( ( $b->{name} || $id ) . ": could not leave the sync group: $@" );
+            }
         }
     }
 
@@ -1338,8 +1354,10 @@ sub _onLinkState {
 # is concerned (Player::connected reads the same flag). Always `client
 # reconnect` - the constructor sent `new`, and _create marked the player
 # disconnected straight after. Lyrion's Squeezebox::reconnect: a powered player
-# rejoins its sync group's active set - needed at the first link too, since
-# Client::startup's restoreSync ran while it read as disconnected. Forgetting is
+# rejoins its sync group's active set - after a drop took it out (_onLinkState),
+# and at the first link too, since Client::startup's restoreSync ran while it
+# read as disconnected. A solo player is already active and LMS returns at its
+# "already active" guard. Forgetting is
 # unchanged: Lyrion's 300s, via discovery (INSTANCE_TTL).
 sub _onLinkProven {
     my $id = shift;
@@ -1390,9 +1408,11 @@ sub _teardown {
 
             # ONLY A CONTROLLER THIS PLAYER HAS TO ITSELF.  controller->stop is
             # StreamingController::_Stop, which stops EVERY player in a sync
-            # group.  Sync is not supported here (CLAUDE.md, `sync groups are
-            # not supported`), but that is no reason to silence another room:
-            # forgetClient below runs LMS's own unsync first, which stops just
+            # group.  Sample-accurate sync is not offered, but a bridge player
+            # joins and leaves a group as a Lyrion player does (CLAUDE.md,
+            # `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`), and removing
+            # it must not silence another room: forgetClient below runs LMS's
+            # own unsync first, which stops just
             # the one it removes and hands it a controller of its own - the
             # same path `client forget` takes.  A solo player is stopped here
             # exactly as before.

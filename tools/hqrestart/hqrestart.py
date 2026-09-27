@@ -36,6 +36,11 @@ Run:
                                             validate and write it, keeping every
                                             other key; exits 1 naming a bad one.
                                             install.sh calls this.
+    python3 hqrestart.py --get CONFIG KEY   print one key as the helper reads it
+                                            (defaults and corrections applied),
+                                            writing nothing; exits 2 with the
+                                            helper's own message when the file
+                                            does not parse. install.sh calls this.
 
 Standard library only; Python 3.7+.
 """
@@ -192,7 +197,10 @@ def write_config(path, data):
 
 
 class Config:
-    def __init__(self, path):
+    # generate=False is `--get`: read the file exactly as the helper will - the
+    # same parse, the same refusal, the same coercion - but never write it. A
+    # token is generated only by the helper's own first start.
+    def __init__(self, path, generate=True):
         self.path = path
         self.state_path = os.path.join(os.path.dirname(path), 'hqrestart-state.json')
         data = {}
@@ -214,7 +222,7 @@ class Config:
                 data = {}
         self.c = dict(DEFAULTS, **data)
         self._coerce()
-        if not self.c['token']:
+        if generate and not self.c['token']:
             self.c['token'] = secrets.token_urlsafe(24)
             data['token'] = self.c['token']
             # Atomic, and for the same reason as every other write here: by the
@@ -829,9 +837,16 @@ class Handler(BaseHTTPRequestHandler):
                     % (who, self.headers.get('Host') or ''))
             return
 
+        # The command is keyed on how THIS helper was installed, never on how
+        # HQPlayer runs: `--allow` has to be given the way the helper was
+        # installed or it writes a config this helper never reads (and the
+        # install beside it starts a second helper on the same port). A system
+        # install runs as root, a per-user one as the user - see install.sh.
+        path = getattr(self.cfg, 'path', None)
         log('refused a restart from %s: that address is not in "allow". If %s is your '
-            'Lyrion server, run  ./install.sh --allow %s  on this machine (add --system if '
-            'HQPlayer runs as a service).' % (who, who, who))
+            'Lyrion server, run  %s  on this machine%s.'
+            % (who, who, install_cmd('--allow ' + who),
+               ' (this helper reads %s)' % path if path else ''))
 
     def handle_any(self):
         url = urlparse(self.path)
@@ -898,6 +913,15 @@ def server_for(listen, port):
             ThreadingHTTPServer.server_bind(self)
 
     return Server((listen, port), Handler)
+
+
+def install_cmd(args):
+    """The installer command for THIS helper's own install: install.sh runs a
+    `--system` helper as root and a per-user one as the user, so the effective
+    uid says which one is answering."""
+    if os.geteuid() == 0:
+        return 'sudo ./install.sh --system ' + args
+    return './install.sh ' + args
 
 
 def set_allow(path, raw=None):
@@ -976,6 +1000,21 @@ def main():
             sys.stderr.write('  %s\n' % e)
             return 1
         print(' '.join(got))
+        return 0
+
+    # `--get <config> <key>` is the installers' way to read the config: through
+    # Config, so the file is parsed, refused and coerced by the SAME code the
+    # running helper uses, instead of a second reader in shell that drifts (a
+    # JSON null token read as the text "None" was exactly that drift). A file
+    # that does not parse exits 2 with Config's own line - which is how
+    # install.sh refuses it BEFORE stopping a helper that is working.
+    if len(sys.argv) > 1 and sys.argv[1] == '--get':
+        if len(sys.argv) < 4 or sys.argv[3] not in DEFAULTS:
+            sys.stderr.write('usage: %s --get <config> <key>   (key: one of %s)\n'
+                             % (os.path.basename(sys.argv[0]), ', '.join(sorted(DEFAULTS))))
+            return 2
+        v = Config(sys.argv[2], generate=False)[sys.argv[3]]
+        print('' if v is None else ' '.join(map(str, v)) if isinstance(v, (list, tuple)) else v)
         return 0
 
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'hqrestart.json')

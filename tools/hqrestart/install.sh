@@ -56,6 +56,8 @@ if [ $SYSTEM = 1 ] && [ "$(id -u)" != 0 ]; then echo "--system needs sudo" >&2; 
 # reimplemented here: one rule, one validator. It refuses a host name -
 # `allow` is matched against the address a request arrives from - and never
 # rewrites a config that does not parse, because the token lives in that file.
+# Its errors are silenced here only because a config that does not parse has
+# already been refused by the check below, before this is first called.
 read_allow() {
   "$PY" "$SRC" --allow "$1" 2>/dev/null || true
 }
@@ -105,6 +107,22 @@ CONF="$DIR/hqrestart.json"
 # is safe - it reads the file once, at its own startup, and the new one starts
 # after this is written.
 [ $UNINSTALL = 1 ] || mkdir -p "$DIR"
+
+# A CONFIG THAT DOES NOT PARSE IS REFUSED HERE, while the running helper is
+# still up. The running helper parsed it at ITS start - a hand edit since then
+# (a trailing comma) is invisible to it - but the new one would exit 2 on its
+# first line and stay down (RestartPreventExitStatus=2), and read_allow's
+# silence used to make the broken file read as "not set": the old helper was
+# stopped and replaced by one that could not start. The helper's own reader
+# (`--get`, through Config) decides, so the rule is the one it will apply, and
+# its one-line reason is what the user sees. An uninstall does not need it.
+if [ $UNINSTALL = 0 ] && [ -e "$CONF" ]; then
+  if ! "$PY" "$SRC" --get "$CONF" port >/dev/null; then
+    echo "install.sh: nothing was changed and the running helper was left alone." >&2
+    exit 1
+  fi
+fi
+
 CURRENT="$(read_allow "$CONF")"
 
 # Ask, unless --allow said so already or there is no one to ask (piped input,
@@ -216,18 +234,15 @@ fi
 # not for the file, which now exists already whenever `allow` was answered
 # above. Waiting on the file printed an empty token and a broken curl line.
 #
-# AND A JSON null IS NOT A WRITTEN VALUE. .get(key, default) hands back None
-# for "token": null - the obvious way a user resets a token by hand - not the
-# default, so this printed the literal string None. [ -n "None" ] is true, so
-# the wait loop broke on its FIRST pass and the installer reported success with
-# a bearer token of four characters, None. Treat None as missing.
+# Read through the helper (`--get`), not a copy of its rules in here: the copy
+# that used to live here read a JSON null token as the text "None" - [ -n
+# "None" ] is true, so the wait broke on its first pass and printed a bearer
+# token of None - because it disagreed with Config about what a missing value
+# is. --get prints exactly what the helper will use: an empty token until it
+# has written one, and the port after the helper's own defaults and checks.
+# $2 is only the fallback for a --get that could not run at all.
 read_key() {
-  "$PY" -c "import json,sys
-try:
-    v = json.load(open(sys.argv[1])).get(sys.argv[2])
-    print(sys.argv[3] if v is None else v)
-except Exception:
-    print(sys.argv[3])" "$CONF" "$1" "$2" 2>/dev/null || echo "$2"
+  "$PY" "$SRC" --get "$CONF" "$1" 2>/dev/null || echo "$2"
 }
 
 i=0

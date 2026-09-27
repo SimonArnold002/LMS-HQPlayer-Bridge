@@ -581,7 +581,24 @@ try:
 
     ok(lambda: './install.sh --allow' in advice('linux'), 'on Linux it names install.sh')
     ok(lambda: './install.sh --allow' in advice('darwin'), 'on macOS it names install.sh')
-    ok(lambda: '--system' in advice('darwin'), 'and says to add --system if HQPlayer runs as a service')
+
+    # THE FLAG FOLLOWS THIS HELPER'S INSTALL, NOT HQPLAYER'S. It used to say "add
+    # --system if HQPlayer runs as a service" - so with a per-user helper and a
+    # system HQPlayer, following it wrote /etc/hqrestart (a config this helper
+    # never reads) and started a SECOND helper on the same port.
+    def advice_as(uid):
+        was = hq.os.geteuid
+        hq.os.geteuid = lambda: uid
+        try:
+            return advice('linux')
+        finally:
+            hq.os.geteuid = was
+    ok(lambda: 'sudo ./install.sh --system --allow' in advice_as(0),
+       'a helper running as root (a --system install) is told to use sudo and --system')
+    ok(lambda: '--system' not in advice_as(1000),
+       'CONTROL: a per-user helper is NOT told --system, whatever HQPlayer runs as')
+    ok(lambda: hq.Handler.cfg.path in advice_as(1000),
+       'and it names the config file this helper actually reads')
 
     # The throttle bounds the LOG. Nothing bounded the MAP, so one entry per
     # distinct address accumulated for ever on a host anything scans.
@@ -753,6 +770,43 @@ ok(lambda: hq.set_allow(CONF) == ['10.0.0.7'], 'and still writes the address')
 ok(run_main('--allow', CONF)[0] == 0, 'CONTROL: --allow <config> still reads back')
 
 # ---------------------------------------------------------------------------
+# `--get`: install.sh's ONE reader of the config, through Config - so the file
+# is parsed, refused and coerced by the code the running helper uses. The
+# shell copy it replaces read a null token as the text "None".
+# ---------------------------------------------------------------------------
+print('== --get reads the config the way the helper does, and writes nothing')
+
+def get(path, key):
+    out, argv = sys.stdout, sys.argv[:]
+    sys.stdout, sys.argv = io.StringIO(), ['hqrestart.py', '--get', path, key]
+    try:
+        try:
+            code = hq.main()
+        except SystemExit as e:
+            code = e.code
+        return code, sys.stdout.getvalue().rstrip('\n')
+    finally:
+        sys.stdout, sys.argv = out, argv
+
+GC = os.path.join(tmp, 'get.json')
+json.dump({'token': None, 'port': '9000', 'allow': ['10.0.0.9']}, open(GC, 'w'))
+_gc_before = open(GC).read()
+ok(lambda: get(GC, 'token') == (0, ''), 'a null token reads as EMPTY - unwritten, as the helper treats it')
+ok(lambda: get(GC, 'port') == (0, '9000'), 'a port written as text reads as the number the helper binds')
+ok(lambda: open(GC).read() == _gc_before, 'and --get writes NOTHING - a read never generates the token')
+json.dump({'port': 'abc'}, open(GC, 'w'))
+ok(lambda: get(GC, 'port') == (0, '8090'), "a port the helper would refuse reads as the helper's default, not the raw text")
+_absent = os.path.join(tmp, 'absent.json')
+ok(lambda: get(_absent, 'port') == (0, '8090') and not os.path.exists(_absent),
+   'a missing config reads the defaults, and is not created')
+ok(lambda: get(GC, 'nope')[0] == 2, 'an unknown key is refused (exit 2), not printed as empty')
+open(GC, 'w').write('{"port": 9000,}')
+logged()
+ok(lambda: get(GC, 'port')[0] == 2, 'a config that does NOT PARSE exits 2 - what install.sh stops on')
+ok(lambda: 'cannot read' in logged(), "and says so with the helper's own one-line reason")
+ok(lambda: open(GC).read() == '{"port": 9000,}', 'and the broken file is left exactly as it was')
+
+# ---------------------------------------------------------------------------
 # The FIRST-START token write, which is the other writer of this file and had
 # its own truncating `open(path, 'w')`. install.sh now writes `allow` BEFORE
 # the helper first starts, so this write is no longer writing a file that holds
@@ -807,8 +861,12 @@ def report(conf_json, system=0, current='192.168.1.234'):
     c = os.path.join(tmp, 'report.json')
     open(c, 'w').write(conf_json)
     sh = os.path.join(tmp, 'tail.sh')
-    open(sh, 'w').write('set -e\nPY=python3\nCONF=%s\nSYSTEM=%d\nCURRENT=%s\n%s'
-                        % (c, system, current or "''", body))
+    # SRC as install.sh sets it: read_key asks the helper (`--get`), and without
+    # it every read would fall back to its default and the checks below would
+    # pass or fail on the fallback, not on the config.
+    open(sh, 'w').write('set -e\nPY=python3\nSRC=%s\nCONF=%s\nSYSTEM=%d\nCURRENT=%s\n%s'
+                        % (os.path.join(os.path.dirname(INST), 'hqrestart.py'),
+                           c, system, current or "''", body))
     # REAL_POPEN, not subprocess.run: the suite stubs Popen on that same module
     # object, so run() would hand this the recording stub.
     pr = REAL_POPEN(['sh', sh], stdout=hq.subprocess.PIPE, stderr=hq.subprocess.STDOUT,

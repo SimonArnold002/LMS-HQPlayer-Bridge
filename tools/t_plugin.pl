@@ -339,12 +339,32 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     is(join(', ', @ev), 'disconnected 0, notify reconnect, playerActive',
        'first proof, powered: announced as a reconnect, then made active');
 
-    # a proven link going down: flagged and announced - and NOT playerInactive,
-    # which would send <Stop/> down the dead link and reconnect ahead of the backoff
+    # a proven link going down: flagged, announced, and OUT OF THE GROUP -
+    # Slimproto's close. Left in, a synced member with a dead link fails every
+    # track the group plays, and LMS skips the whole group for it.
+    @ev = ();
+    Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 );
+    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, playerInactive',
+       'down after proven, others active: flagged, announced, then made inactive');
+
+    # a SOLO player stays active (Slimproto's rule): nothing to leave, and
+    # playerInactive on the last active player would _Stop the controller
+    $ctrl->{only} = 1;
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 );
     is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect',
-       'down after proven: flagged and announced, NO playerInactive (no command on a dead link)');
+       'down after proven, the only active player: NOT made inactive');
+    $ctrl->{only} = 0;
+
+    # playerInactive DYING must not escape the link-down listener, which runs
+    # inside Control::_dropLink ahead of the reconnect it schedules
+    $ctrl->{dieInactive} = 1;
+    @ev = ();
+    my $okDown = eval { Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 ); 1 };
+    ok($okDown, 'a playerInactive that dies does not escape _onLinkState');
+    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, playerInactive',
+       'and the disconnect was announced regardless');
+    $ctrl->{dieInactive} = 0;
 
     # later proofs are RECONNECTS too
     @ev = ();
@@ -471,7 +491,7 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     package FakeController;
     sub new { bless { ev => $_[1], only => 0 }, $_[0] }
     sub playerActive     { push @{ $_[0]->{ev} }, 'playerActive'; die "boom\n" if $_[0]->{die} }
-    sub playerInactive   { push @{ $_[0]->{ev} }, 'playerInactive' }
+    sub playerInactive   { push @{ $_[0]->{ev} }, 'playerInactive'; die "boom\n" if $_[0]->{dieInactive} }
     sub onlyActivePlayer { $_[0]->{only} }
 
     package FakeClient;
@@ -1043,6 +1063,9 @@ print "-- the restart row --\n";
     my $rs  = Plugins::HQPlayerBridge::Plugin::restartable();
     my $REQ = \@Slim::Networking::SimpleAsyncHTTP::REQ;
     %$rs = ();
+    # and the throttle: every call is throttled now, link-ups included, and the
+    # blocks above have already asked this address inside the last minute
+    %{ Plugins::HQPlayerBridge::Plugin::probedAt() } = ();
 
     Slim::Networking::SimpleAsyncHTTP::_reset();
     Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.5');
@@ -1172,8 +1195,14 @@ print "-- the restart row --\n";
         $now += 61;
         Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
         is(scalar(@$REQ), '2', 'and again once a minute has passed');
+        # A LINK-UP is throttled too: reconnectNow retries a refusing instance
+        # every discovery round, and each accept probes. Unthrottled it was a
+        # dead :8090 GET every ~10s for ever on a host with no helper.
         Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.7');
-        is(scalar(@$REQ), '3', 'while a link-up is never throttled');
+        is(scalar(@$REQ), '2', 'a link-up inside the minute is throttled as well');
+        $now += 61;
+        Plugins::HQPlayerBridge::Plugin::_probeRestart('10.0.0.7');
+        is(scalar(@$REQ), '3', 'and asks once the minute has passed');
         $REQ->[2]{cb}->( FakeRes->new('{"ok": true, "service": "hqrestart"}') );
         Plugins::HQPlayerBridge::Plugin::topLevel( undef, sub { $feed = shift }, {} );
         is(scalar( grep { ($_->{name} // '') eq 'PLUGIN_HQPLAYER_RESTART' } @{ $feed->{items} } ), '1',

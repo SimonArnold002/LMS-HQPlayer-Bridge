@@ -332,6 +332,33 @@ print "-- onState(0) says whether the dropped link had been PROVEN --\n";
     is(join(',', @got), '0,1', 'an unanswered accept reports 0, a replied link reports 1');
 }
 
+print "-- the link-down listener hears BEFORE the stranded commands are failed --\n";
+{
+    # A synced player leaves its group in the listener, and the stop that does
+    # it retires the load in flight. Failed first, that load would report a
+    # failure LMS charges to the WHOLE group. So: listener, then callbacks.
+    my @ev;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onState => sub { push @ev, 'onState' } );
+    $c->{closing}   = 1;
+    $c->{connected} = 1;
+    $c->{proven}    = 1;
+    $c->{inflight}  = { verb => 'PlaylistAdd', cb => sub { push @ev, 'inflight failed' } };
+    $c->{queue}     = [ { verb => 'Play', cb => sub { push @ev, 'queued failed' } } ];
+    $c->_dropLink('test');
+    is(join(', ', @ev), 'onState, inflight failed, queued failed',
+       'onState first, then the in-flight command, then the queue');
+    is(scalar @{ $c->{queue} }, 0, 'and nothing is left queued');
+
+    # CONTROL: an accept that never answered is not announced, and its
+    # commands are still failed
+    @ev = ();
+    $c->{connected} = 0;
+    $c->{inflight}  = { verb => 'GetInfo', cb => sub { push @ev, 'inflight failed' } };
+    $c->_dropLink('test');
+    is(join(', ', @ev), 'inflight failed', 'CONTROL: a link that was never up still fails its command');
+}
+
 print "-- send on a DOWN link fails the command and does NOT connect --\n";
 {
     # It used to connect at once, skipping the reconnect backoff for every

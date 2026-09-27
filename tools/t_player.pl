@@ -1921,6 +1921,42 @@ print "-- a load that genuinely fails --\n";
        'and Play is never sent for a track HQPlayer refused');
 }
 
+print "-- a SYNCED player losing its link mid-load does not fail the group's track --\n";
+{
+    # Control::_dropLink tells the plugin first, and a synced member leaves its
+    # group there: playerInactive -> _stopClient -> stop(). Only then is the
+    # PlaylistAdd in flight failed. LMS fails a track for the WHOLE group when
+    # one member reports it, so that failure must find its load retired.
+    my $mk = sub {
+        my $pl = Plugins::HQPlayerBridge::Player->new($_[0], 'paddr', 1.0, undef, 12, undef);
+        $pl->hqControl( bless {}, 'FakeCtl' );
+        my $cc = LoadController->new($one);
+        $pl->controller($cc);
+        @sent = (); @sentCb = ();
+        $pl->play({ controller => $cc });
+        $cc->{calls} = [];
+        return ( $pl, $cc );
+    };
+
+    my ( $sp, $sc ) = $mk->('02:99:88:77:66:61');
+    my $inflight = shift @sentCb;     # the PlaylistAdd, still unanswered
+    {
+        local $linkUp = 0;
+        $sp->stop;                    # what playerInactive's _stopClient does
+        $inflight->( undef, undef );  # then _dropLink fails the stranded command
+    }
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$sc->{calls}}),
+       'synced: the stranded load is retired by the stop, not reported against the group');
+
+    # CONTROL: a SOLO player is not made inactive, nothing retires the load,
+    # and its failure is still reported, once - unchanged
+    my ( $op, $oc ) = $mk->('02:99:88:77:66:62');
+    $inflight = shift @sentCb;
+    { local $linkUp = 0; $inflight->( undef, undef ); }
+    is(scalar( grep { $_ eq 'playerStreamingFailed' } @{$oc->{calls}} ), 1,
+       'CONTROL solo: the same drop is still reported as one failed load');
+}
+
 print "-- the start deadline: an ack that never becomes playback --\n";
 #
 # THE HOLE. `hqPlayAck` says HQPlayer ACCEPTED <Play/>; `hqStarted` only latches
@@ -2172,6 +2208,30 @@ print "-- the circuit breaker: N consecutive failed loads stop the player --\n";
         ok(scalar( $mod =~ /hqStarted\( 1 \);.*?hqFailRun\( 0 \)/s ),
            'and the start latch is what clears the run');
     }
+
+    # NO LINK IS NOT A BAD TRACK. Play pressed while HQPlayer is off used to be
+    # reported as a skippable failure: LMS moved on, met the same missing link,
+    # and only FAIL_LIMIT stopped it - the playlist two tracks on, nothing
+    # played. The first load now trips the stop and the playlist stays put.
+    my ( $np, $nc ) = $mk->('02:cb:00:00:00:04');
+    $np->hqControl( bless {}, 'DownCtl' );
+    @sent = (); @sentCb = (); $nc->{calls} = []; @ex = ();
+    Slim::Utils::Timers::_reset();
+    $np->play({ controller => $nc });
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$nc->{calls}}),
+       'no link: the load is NOT handed to LMS as a skip');
+    ok(!$stopped->(), 'and the stop is deferred one turn, not dispatched inside play()');
+    Slim::Utils::Timers::_fireAll();
+    is($stopped->(), 1, 'no link: the FIRST failed load stops the player, once');
+    is($np->hqFailRun, '0', 'and the run is cleared by that trip, as at the limit');
+    is(scalar @sent, '0', 'and nothing went on the wire');
+
+    # CONTROL: a live link that refuses the TRACK is still a skip, below the limit
+    $np->hqControl( bless {}, 'FakeCtl' );
+    $failOnce->( $np, $nc );
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$nc->{calls}}),
+       'CONTROL: a refused track on a live link is still reported for LMS to skip');
+    ok(!$stopped->(), 'and does not stop the player');
 
     Slim::Utils::Timers::_reset();
     @ex = ();

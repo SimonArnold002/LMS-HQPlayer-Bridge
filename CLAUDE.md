@@ -66,15 +66,15 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | NAA not seen again after the endpoint is power-cycled; auto `Refresh devices` (`/config/refresh`) from the bridge | **DECLINED** 2026-09-21, Simon's call — Eversolo NAA / hqplayerd, not the bridge; a refresh drops SDM to PCM | `the NAA vanishes and a refresh drops DSD` |
 | `IDLE_PERIOD`, `_settled`, `_linkUpFor`, a second HQPlayer taking up to 10 min to appear; `ADDR_SLACK` vs a faster period | **REPLACED** 2026-09-23, Simon's call - one 5s period (Lyrion's heartbeat); liveness of a name group is by discovery ROUND, not a time allowance | `Lyrion's 5-second heartbeat` |
 | the flat 5s discovery pace, `PROBE_BURST` (3 probes a round); discovery traffic filling HQPlayer's log | **REVERSED** 2026-09-25, Simon: "why are we polling more" - ONE probe a round; 2/4/8/10s while nothing is found, 10s while a known one is not connected, `IDLE_PERIOD` 15s once all are connected (`_linkUpFor` = `Player::connected`). A new HQPlayer appears within ~15s. NAA plays NO part | `DISCOVERY PACE 2026-09-25` |
-| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down does NOT call playerInactive, `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
+| `Player::connected` a literal 1 (`tcpsock`), a dead HQPlayer listed as connected for 5 min | **REVERSED** 2026-09-25 (1.0.17), Simon: "it should follow LMS players" - `connected` is the control link, with Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link (first reply, not the accept - 1.0.18); link-down now DOES call playerInactive unless the only active player (2026-09-27, see `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`), `client forget` keyed on clientid (1.0.19); `client new` comes from LMS's constructor, `_create` announces `disconnect` at once, every proof is `reconnect`, the live page reads `up` (1.0.20) | `CONNECTED IS THE CONTROL LINK` |
 | `client new` sent only by the plugin's `_create`, so moving it moves the announcement | **WRONG, MEASURED** 2026-09-25 - `Slim::Player::Client::new` sends it itself (Client.pm:315); the offline stub does not, which hides it | `the constructor already sends` |
 | an expired HQPlayer trial that REPLIES with `result="Error"` reading connected (`Control::proven` on any reply) | **DECIDED** 2026-09-25, Simon's call - no trial detection; only a SHUT DOWN HQPlayer must leave the list, and it does | `we cant attempt to work out if its a trial` |
 | `cstring($client, KEY, $name)` not interpolating `%s`, so the Restart row would read literally | **WRONG, MEASURED** 2026-09-21 — `cstring` -> `clientString` -> `string`/`getString`, both `return sprintf($string, @_) if @_`. The offline STUB drops the args, and the fleet writes `sprintf(cstring(...))`, so this re-proposes itself | `DOES interpolate` |
 | `_restartNow`'s error callback taking `($self, $error, $response)` - reading the third arg as the body | **CORRECT, VERIFIED** 2026-09-21 — `SimpleAsyncHTTP::onError` calls `$ecb->($self, $error, $http->response)`. The `($res,$err)` trap in this file is `Control::send`, a DIFFERENT contract | `error callback really is three args` |
 | Windows support for the restart helper - `install.ps1`, `t_powershell.py`, any `win32` branch in `hqrestart.py`; every Windows finding (Store placeholder, `-System` folder lock, `Stop-Helper`, firewall profiles, `pythonw`) | **REMOVED** 2026-09-25, Simon's call - "causing too many problems". macOS and Linux only; `main()` refuses any other OS with exit 2. Do not re-propose, and do not report a Windows gap | `WINDOWS SUPPORT REMOVED` |
 | `set_allow`, `install.sh --allow` / `install.ps1 -Allow` REPLACING the `allow` list instead of adding to it; the refusal hint dropping a second Lyrion server | **BY DESIGN** 2026-09-23, Simon's call — one Lyrion server talks to an HQPlayer, never two | `ONE LYRION SERVER PER HQPLAYER` |
-| `_queueTrack` gating a load on "an `hqControl` OBJECT exists" while `Control::send` no longer connects on demand; three `PROBLEM_OPENING` skips for one drop | **FIXED** 2026-09-25 — a knock-on of 1.0.22's send fix, found by review. `Control::up` (the sock-or-connecting test `send` itself makes) is the gate now; pinned in `t_control.pl` and `t_player.pl` | `A LOAD IN THE DROP WINDOW` |
-| `_onLinkProven`'s `playerActive` being a no-op on a reconnect (LMS's "already active" guard), a synced member not reloading after an outage | **DECLINED** 2026-09-25, Simon's call — "isn't a problem I want to bother with". The call is harmless and does its work at the FIRST proof; calling `playerInactive` to make it live again is the settled-declined remedy (`CONNECTED IS THE CONTROL LINK`) | `PLAYERACTIVE ON A RECONNECT` |
+| `_queueTrack` gating a load on "an `hqControl` OBJECT exists" while `Control::send` no longer connects on demand; three `PROBLEM_OPENING` skips for one drop | **FIXED** 2026-09-25 — a knock-on of 1.0.22's send fix, found by review. `Control::up` (the sock-or-connecting test `send` itself makes) is the gate now; pinned in `t_control.pl` and `t_player.pl`. **2026-09-27: that one failure is now a STOP, not a skip** - see `NO LINK IS NOT A BAD TRACK` | `A LOAD IN THE DROP WINDOW` |
+| `_onLinkProven`'s `playerActive` being a no-op on a reconnect (LMS's "already active" guard), a synced member not reloading after an outage | **REVERSED 2026-09-27, Simon's call** (was DECLINED 2026-09-25) — link-down now calls `playerInactive` as Slimproto does, so the reconnect's `playerActive` rejoins the group. See `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` | `PLAYERACTIVE ON A RECONNECT` |
 | auto-RESUME after a control-link outage (remember the song + position on the drop, re-load with a seek on the next proven link); "the music does not come back after a config save or a restart" | **DECLINED** 2026-09-26, Simon's call — **HQPlayer has to be sent the WHOLE stream, so any re-load plays from the START; it has always done this.** A "resume" would be a track silently restarting, which is worse than the stop. Do not re-propose from the fact that `_queueTrack` accepts a `$seek` | `RESUME AFTER AN OUTAGE IS DECLINED` |
 | resuming at a position by handing LMS `playlist jump <idx>` with `{ timeOffset => N }` (`Commands.pm:1021` -> `controller->play`, resolved in `Song::open`) | **WRONG, MEASURED LIVE 2026-09-26** — it does NOT seek, and it makes LMS LIE: the clock froze at the claimed offset while the audio played from the track start, and hqplayerd logged NO `Seek to:` line. Do not re-propose from LMS's source | `THE SEEKDATA RESUME IS A DISPLAY LIE` |
 | `set_allow` truncating the TOKEN-bearing config in place (`open(path,'w')`), against its own docstring | **FIXED** 2026-09-25 — sibling + `os.replace`, chmod before the swap; a torn write is pinned in `t_hqrestart.py` | `THE CONFIG WRITE IS ATOMIC` |
@@ -96,7 +96,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
 | the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone | `THE IDLE DIVERGENCE IS BY DESIGN` |
 | the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands | `An endpoint re-registering announces its own level` |
-| a bridge player in a SYNC GROUP - a synced member not reloading, any sync-group failure scenario | **NOT SUPPORTED** 2026-09-27, Simon's call - no LMS bridge supports sync groups; *Not in v1* already says so. (`_teardown` no longer stops a shared controller - hardened anyway, harmless) | `sync groups are not supported` |
+| a bridge player in a SYNC GROUP - joining, leaving, dropping its link, reconnecting, being removed (`_onLinkState`, `_onLinkProven`, `_teardown`, `Control::_dropLink` order) | **NARROWED 2026-09-27, Simon's call** - sample-accurate audio sync is NOT offered (*Not in v1*), but the player's side of group membership MUST follow Lyrion's players: a finding about that half IS a finding. The 2026-09-27 morning row ("do not report any sync-group scenario") is SUPERSEDED | `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -2550,12 +2550,12 @@ one; corrected the same day, with the reason in the code.)
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (1,023 assertions: `t_control` 105, `t_player`
-501, `t_stream` 64, `t_plugin` 194, `t_live` 159) plus the live page EXECUTED
+tree, runs the five Perl suites (1,039 assertions: `t_control` 108, `t_player`
+510, `t_stream` 64, `t_plugin` 198, `t_live` 159) plus the live page EXECUTED
 under osascript (17, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (169) and the installer run end to end (17), checks
-`install.sh` parses, and sweeps called-vs-defined subs. 1,226 in total. Counts
-as of 2026-09-27; they move every round, and the run prints them. (The
+the helper's Python suite (180) and the installer run end to end (23), checks
+`install.sh` parses, and sweeps called-vs-defined subs. 1,259 in total. Counts
+as of 2026-09-27 (third pass); they move every round, and the run prints them. (The
 PowerShell parse check and the install.ps1 half of the installer suite went with
 Windows support.)
 
@@ -5744,7 +5744,7 @@ The Apps feed gains a **Restart *name*** row per HQPlayer whose host runs `tools
 
 **REVIEW ROUND 1 (2026-09-21), 4 findings, all VERIFIED then FIXED in 1.0.11:** (1) Linux: an app the helper relaunched stayed in the helper's cgroup (`start_new_session` is not a new cgroup), so the next restart read it as `hqrestart.service` and restarted the helper, killing HQPlayer and starting nothing (harness) - now `systemd-run --scope`, `own_unit()` excluded in `detect_linux`, `KillMode=process` in the unit. (2) Helper worst case measured 120s vs the Bridge's 90s - now one `total_timeout` 90s, the Bridge waits 120. (3) `allow` waived the token on ANY method: **LMS's image proxy relays any client's GET from LMS's address, and `/status` answered it** (measured) - now waived only for a `Content-Type: application/json` POST (form/text POST and GET get 401; OPTIONS 501, so no CORS), the Bridge POSTs JSON; re-measured: proxy `/restart` = 401. (4) `?token=` was logged verbatim - now `token=***`. Helper reinstalled on the Mac.
 
-**REVIEW ROUND 2 (2026-09-21), 3 findings, all VERIFIED then FIXED in 1.0.12:** (1) `alive()` read a relaunched child's ZOMBIE as alive (`kill(pid,0)` succeeds on a zombie; nothing reaped it), so each stop waited out `stop_timeout` and SIGKILLed a process already gone - measured 21.0s, now 0.3s via `waitpid(WNOHANG)` first (controls: a TERM-ignorer is still killed, a non-child still reads alive). Not reachable on the Mac today (`open -a` hands hqplayerd to launchd), reachable on Linux app mode and a bare macOS binary. (2) `item_id` is positional, so an instance leaving discovery between render and tap shifts a later instance's Restart row onto the next one's - simulated, B's tap resolved to C; needs 3+ helper hosts. The confirm page was made to NAME the instance (`Restart %s now`) on the claim that this made a wrong target visible - **that claim was WRONG, see round 5**: the second tap is positional too, so the named page itself goes stale. (3) `_probeRestart` ran only at link-up and never retried a miss - on the Mac hqplayerd (login item) and the helper (LaunchAgent) start in no fixed order, so the row could stay hidden until the link next dropped. `topLevel` now re-asks an unknown host, throttled to once per `REPROBE_AFTER` (60s) via `_now()`; link-ups are never throttled; the row appears on the next open. Only-grows still holds, so no new positional shift beyond the one-time appearance.
+**REVIEW ROUND 2 (2026-09-21), 3 findings, all VERIFIED then FIXED in 1.0.12:** (1) `alive()` read a relaunched child's ZOMBIE as alive (`kill(pid,0)` succeeds on a zombie; nothing reaped it), so each stop waited out `stop_timeout` and SIGKILLed a process already gone - measured 21.0s, now 0.3s via `waitpid(WNOHANG)` first (controls: a TERM-ignorer is still killed, a non-child still reads alive). Not reachable on the Mac today (`open -a` hands hqplayerd to launchd), reachable on Linux app mode and a bare macOS binary. (2) `item_id` is positional, so an instance leaving discovery between render and tap shifts a later instance's Restart row onto the next one's - simulated, B's tap resolved to C; needs 3+ helper hosts. The confirm page was made to NAME the instance (`Restart %s now`) on the claim that this made a wrong target visible - **that claim was WRONG, see round 5**: the second tap is positional too, so the named page itself goes stale. (3) `_probeRestart` ran only at link-up and never retried a miss - on the Mac hqplayerd (login item) and the helper (LaunchAgent) start in no fixed order, so the row could stay hidden until the link next dropped. `topLevel` now re-asks an unknown host, throttled to once per `REPROBE_AFTER` (60s) via `_now()`; link-ups were never throttled **(no longer true: since 2026-09-27 every call is throttled and the `$throttled` parameter is gone - `reconnectNow` made each link-up a per-round probe)**; the row appears on the next open. Only-grows still holds, so no new positional shift beyond the one-time appearance.
 
 **REVIEW ROUND 3 (2026-09-21), helper only (the zip is unchanged, so no version bump), 2 findings VERIFIED then FIXED, plus 4 found in a self-sweep:** (1) Linux `pgrep -x` matches the 15-char `comm`, so `hqplayer6desktop`/`hqplayer5desktop` (16) NEVER matched - confirmed from procps `pgrep.c` ("longer than 15 characters will result in zero matches"); names are now cut to 15 on Linux only. (2) SIGKILL on a process that exited after the last `alive()` raised `ProcessLookupError` and aborted the restart BEFORE the relaunch (harness: TERM+KILL sent, no relaunch) - now caught; the same harness restarts. Sweep: (3) a Linux relaunch dropped the session env, so Desktop (GUI) could not open a window from a service helper - `SESSION_ENV` allowlist read from `/proc/<pid>/environ` (only those keys) and passed on; (4) `systemd-run --scope` failing (no user bus) left HQPlayer stopped - a fast non-zero exit now falls back to a plain launch; (5) a non-numeric or negative `Content-Length` crashed or blocked the handler - now 0; (6) no socket timeout - now 30s (measured: idle connection closed at 30s). All with controls; macOS app restart re-run LIVE after: 7.6s, clean stop, SDM restored, Bridge + NAA reconnected.
 
@@ -5999,8 +5999,9 @@ false for the whole of a reconnect, on which `send` still queues and delivers, s
 reading it would refuse loads the link would have carried. `_queueTrack` fails
 once, at the guard, with `no control link`.
 
-**PLAYERACTIVE ON A RECONNECT - DECLINED, Simon's call: "isn't a problem I want to
-bother with".** `Plugin.pm::_onLinkProven` calls `$controller->playerActive($client)`
+**PLAYERACTIVE ON A RECONNECT - REVERSED 2026-09-27, see `A PLAYER JOINS AND LEAVES A GROUP AS
+LYRION'S DO`. The 2026-09-25 decline below is history.** Was: DECLINED, Simon's call: "isn't a problem I want to
+bother with". `Plugin.pm::_onLinkProven` calls `$controller->playerActive($client)`
 and its comment says a powered player rejoins its sync group's active set. It does
 at the FIRST link. On a reconnect it cannot: the down branch never calls
 `playerInactive` (by design - `CONNECTED IS THE CONTROL LINK`), so the client is
@@ -6974,7 +6975,7 @@ the prose was the defect. The old assertion could never have caught this because
 `BACKOFF_MAX`, where doubling is a no-op; there are now two assertions from the BOTTOM of the
 ladder in `t_control.pl`.
 
-### sync groups are not supported - NOT A FINDING
+### sync groups are not supported - SUPERSEDED THE SAME DAY by `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO` below
 
 **The claim** (review 2026-09-27): `_teardown`'s `controller->stop` runs LMS's
 `StreamingController::_Stop` over every player in the group, where `client forget` uses
@@ -6998,6 +6999,141 @@ exactly as `client forget` does. The solo path is unchanged, and the `Timer bala
 still holds on both (`_stopClient` reaches `Player::stop` -> `_newGeneration`, and LMS's
 `forgetClient` runs `Timers::forgetTimer` as well). Pinned in `t_plugin.pl` on the REAL
 `_teardown`, which nothing drove before; fails with the old line restored.
+
+### A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO (2026-09-27)
+
+**Simon, 2026-09-27: *"we may not support them for being actually in sync as thats not really
+feasible but we should still have the process working properly from a player perspective"* -
+and *"follow what LMS does"*.** This narrows the morning's `sync groups are not supported`: tight
+audio sync across rooms is still not offered, but joining, leaving, dropping and rejoining a
+group must behave exactly as a Lyrion player does. **A review finding about that half is a
+finding.**
+
+**The defect it fixed.** A bridge player's control link dropping left it in the controller's
+ACTIVE set (`_onLinkState` deliberately skipped `playerInactive`). LMS kept handing it every
+track; `_queueTrack` failed the load (`no control link`); and `StreamingController::playerStreamingFailed`
+marks the SONG failed for the whole group, so every other room skipped through the playlist
+until `FAIL_LIMIT` stopped them. One lost HQPlayer broke the group.
+
+**What LMS does, read from `public/9.0` (fetched 2026-09-27, not recalled):**
+
+* `Slimproto.pm:273` on a disconnect: `playerInactive($client)` **unless
+  `onlyActivePlayer($client)`** - a solo player is never made inactive.
+* `playerInactive` (`StreamingController.pm:2079`): if the group is not stopped, `_Stop` when it
+  is the last active player, else `_stopClient($player)` (= `$client->stop`, chunks cleared,
+  `closeStream`) for just that one; splice it out; re-elect the master if it was master.
+* `Squeezebox.pm:49` reconnect: `playerActive($client)` if powered; `playerActive` returns at
+  its "already active" guard, else pushes it and `_JumpToTime`s the group if playing.
+
+**The change, all three carriers:**
+
+1. `Plugin::_onLinkState`, proven link down: after `disconnected(1)` and the notify, the
+   Slimproto rule - `playerInactive` unless `onlyActivePlayer`, in its own eval (a die must not
+   escape `_dropLink` ahead of the reconnect it schedules). An accept-then-drop was never made
+   active and still does nothing.
+2. `Plugin::_onLinkProven`: unchanged code. Its `playerActive` now does real work on a reconnect,
+   because the drop took the player out.
+3. **`Control::_dropLink` ORDER.** `onState` now runs BEFORE the in-flight and queued callbacks
+   are failed. Found in the carrier audit, not the review: the in-flight `PlaylistAdd`'s failure
+   called `_loadFailed` -> `playerStreamingFailed` synchronously, BEFORE the listener could take
+   the player out, so a drop mid-load still cost the group one skip. With the listener first,
+   `playerInactive` -> `_stopClient` -> `Player::stop` -> `_newGeneration` retires that load and
+   its callback returns at `_superseded`. The socket is already deleted and `connecting` cleared
+   before `onState`, so the listener's `<Stop/>` takes `send`'s `_failLater` path - no reconnect,
+   nothing queued behind the commands being failed.
+
+**Carrier audit, so the next round need not re-derive it:**
+
+* **Every callback `_dropLink` can fail** was checked for the new order: the load's
+  `PlaylistAdd`/`Play` and the hand-over's `PlaylistAdd` return at `_superseded`;
+  `VolumeRange`/`GetInfo`/`GetTransport` `return` on undef attrs; `_volumeDelivered` returns on
+  undef raw. `cancelQueued` (from `_newGeneration`) stamps the generation first, so the queued
+  track commands it fails are superseded too. Only `Player.pm` sends; no other module has a
+  callback.
+* **A solo player is unchanged**: the listener does not call `playerInactive`, nothing retires
+  the load, and the failure reaches `_loadFailed` exactly as before (the review's finding 1 about
+  that path is separate and still open).
+* `_teardown`, `close()`, `shutdownPlugin`: `_teardown` deletes `$bridges{$id}` before
+  `$ctl->close`, so the `onState` that `close` -> `_dropLink` fires finds no bridge and returns.
+  On the forget path, `Player::forgetClient` closes the link too, but `client forget` refuses a
+  CONNECTED player, so that link is not proven and `_onLinkState` calls no `playerInactive`;
+  LMS's own `clientForgetCommand` has already run it, and its `forgetClient` unsyncs.
+* `playerInactive` on a player not in `{players}` (powered off, never proven) is a no-op apart
+  from a master re-election that only runs if it IS master with others active.
+* **Side effect, LMS's own:** every rejoin `_JumpToTime`s the group to its current position, so a
+  link that keeps dropping and coming back restarts the group each time - the same as a flaky
+  Lyrion player. **This includes a SETTINGS CHANGE in HQPlayer while the player is synced and
+  playing**: that drops the control link for ~2s while the audio rides through (measured
+  2026-09-26), so before this change a synced group heard nothing; now the bridge leaves the group
+  (`_stopClient` also runs our `closeStream`, ending a tier 4 stream) and rejoins at proof, and
+  the whole group restarts at its position. A SOLO player is untouched - it is never made
+  inactive.
+
+**Not copied from Slimproto's close, and why:** `persistPlaybackStateForPowerOff` and
+`_needsUpgrade(undef)` are power/firmware bookkeeping, not group membership; the forget timer
+already exists as `INSTANCE_TTL`.
+
+**Tests, each run against the COMMITTED modules and FAILING there:** `t_control.pl` - onState
+before the in-flight and queued callbacks (control: a never-up link still fails its command);
+`t_plugin.pl` - a proven drop with others active calls `playerInactive`, a solo one does not, and
+a dying `playerInactive` does not escape. `t_player.pl` pins the player half (a stop before the
+failure retires the load; control: solo still reports one failure) - true on both builds, since
+the player side already worked; the defect was the order. **Unverified live** - needs a group of
+the bridge player and a Lyrion player, then HQPlayer restarted mid-track.
+
+### Review round 2026-09-27 (third pass): 5 findings, all FIXED, with the sync change above
+
+Scope `origin/dev..HEAD` (30b1305..83b7305) plus the tree. Simon: fix them all, verify, and audit
+every carrier. Every new assertion was run against the COMMITTED file it covers, in a scratch
+copy, and FAILED there (t_player 3, t_plugin 5, t_hqrestart 8, t_installers 4). Suite 1,259, green.
+
+**NO LINK IS NOT A BAD TRACK - FIXED (`Player::_queueTrack`, `_loadFailed`).** The drop-window fix
+made a load on a down link fail ONCE instead of once per command, but still as a SKIP: LMS moved
+to the next track, met the same missing link, and only `FAIL_LIMIT` stopped it - the playlist two
+tracks on, nothing played. Writer: play pressed while HQPlayer is off or restarting (commands still
+reach the player - `VALIDATE GATES ON CLIENTHASH`). The old test checked once-per-load only, which
+the pre-fix code also met. Now `_loadFailed($why, 1)` - still the ONE place a failed load is
+reported, still counted and cleared - goes straight to the trip: `_tripStop` one turn later, no
+`playerStreamingFailed`, the playlist left where the user put it. One log line instead of an
+error plus three info lines. **Carriers:** `_queueTrack` is reached from `play()` and from both
+held-load sites (`_onStatus`'s tier 4 hold, `_endOfStream`'s demoted hand-over); the `_onStatus`
+one needs a status push, so a live link. `_endOfStream`'s END_GRACE timer can fire on a down link
+- a SYNCED member is already out of the group and returns at `hqStarted`; a solo one now stops
+rather than skipping. `_tripStop`'s generation guard is stamped after `_startTrack`'s
+`_newGeneration`, so it stops only this load. The other three routes (a refused
+`PlaylistAdd`/`Play`, the start deadline) are a TRACK or daemon fault and are unchanged - control
+asserted.
+
+**`_probeRestart`'s `$throttled` - FIXED by deleting it.** Both callers passed 1, so the
+unthrottled branch was dead, and a test (`while a link-up is never throttled`) pinned behaviour no
+production caller had. Every call is throttled now; three comments and the round-2 restart history
+line corrected. The test block now clears the throttle table (`probedAt()`, test accessor) - the
+old unthrottled direct call had been hiding state leaked from the blocks above it.
+
+**The refusal hint named the wrong install - FIXED (`hqrestart.py::explain_refusal`,
+`install_cmd`).** It said "add --system if HQPlayer runs as a service"; `--allow` must match how
+THE HELPER was installed. A per-user helper + a system HQPlayer, followed, wrote `/etc/hqrestart`
+(never read) and started a second helper on the port. `install_cmd` keys on `os.geteuid()` - a
+`--system` install runs as root, a per-user one as the user - and the line names the config file
+this helper reads. The owner-mismatch refusal in `restart()` ("install the helper the same way
+HQPlayer runs") is a different, correct message and is unchanged.
+
+**`install.sh` stopped a working helper over an unreadable config - FIXED.** `read_allow`'s
+`2>/dev/null || true` made a hand edit with a trailing comma read as "allow not set"; the prompt
+could only loop, then the good helper was stopped and replaced by one that exits 2 and stays down
+(`RestartPreventExitStatus=2`), reported as "check python3". **Now checked BEFORE anything is
+asked or stopped**, by the helper's own reader, and the install exits 1 with the helper's line
+plus "nothing was changed and the running helper was left alone". Uninstall skips the check. An
+EMPTY file is refused too - the helper would refuse it the same way.
+
+**`read_key` was a second reader of the config - FIXED with `hqrestart.py --get CONFIG KEY`.**
+`--get` is `Config(path, generate=False)`: the same parse, the same exit-2 refusal, the same
+`_coerce`, and NO token write (only the helper's first start generates one). So a null token reads
+empty, `"port": "9000"` reads 9000 and `"port": "abc"` reads 8090 - what the helper will bind, not
+the raw text. An unknown key exits 2. `read_key` is one line and the pre-stop check above uses the
+same call. **Harness trap met on the way:** the round-26 test pastes only install.sh's TAIL, which
+has no `$SRC`; with `--get` unreachable every read fell back to its default and the "no token yet"
+case passed on the fallback alone. It now sets `SRC` as the installer does.
 
 ### Review round 2026-09-27 (second pass): 8 findings, 5 fixed, 3 dropped
 

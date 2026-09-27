@@ -120,9 +120,12 @@ and the exact command that fixes it:
 
 ```
 refused a restart from 192.168.1.234: that address is not in "allow". If 192.168.1.234 is your
-Lyrion server, run  ./install.sh --allow 192.168.1.234  on this machine (add --system if
-HQPlayer runs as a service).
+Lyrion server, run  ./install.sh --allow 192.168.1.234  on this machine (this helper reads
+/Users/you/Library/Application Support/hqrestart/hqrestart.json).
 ```
+
+A helper installed with `--system` says `sudo ./install.sh --system --allow ...` instead - the
+command always matches how the helper that refused was installed.
 
 **Why only a JSON POST gets in without the token.** Anything that can make the LMS
 server fetch a URL would otherwise restart HQPlayer as a GET. LMS's own image proxy fetches
@@ -150,6 +153,10 @@ Only one restart runs at a time; a second request gets `409`.
 ## Config (`hqrestart.json`)
 
 Every key is optional except `token`, which is generated on first run.
+
+If you edit it by hand and leave it unreadable (a trailing comma, say), the helper refuses to
+start and names the file. Re-running `install.sh` checks it first: it stops with the same
+message and leaves the running helper alone, so fix the file and run it again.
 
 | key | default | meaning |
 |---|---|---|

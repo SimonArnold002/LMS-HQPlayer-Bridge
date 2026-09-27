@@ -1624,11 +1624,17 @@ sub _queueTrack {
     # `PlaylistAdd refused` - one PROBLEM_OPENING per track as LMS walks the
     # playlist.  Fail the load ONCE here instead.  `up` is deliberately true
     # while a reconnect is in flight, because send() queues on that link.
+    #
+    # AND FAIL IT AS A STOP, NOT A SKIP.  A skip is the right answer to a bad
+    # TRACK; this is a missing LINK, which every next track would meet in the
+    # same way - one skip per load until FAIL_LIMIT trips, the playlist two
+    # tracks on and nothing played.  _loadFailed's link-down form goes straight
+    # to the trip, so the stop comes first and the playlist stays where it was.
     my $ctl = $self->hqControl;
 
     if ( !$ctl || !$ctl->up ) {
-        $log->error( $self->name . ': no control link - cannot start playback' );
-        $self->_loadFailed('no control link');
+        # One line, from _loadFailed: "load failed (no control link) - stopping".
+        $self->_loadFailed( 'no control link', 1 );
         return;
     }
 
@@ -1824,15 +1830,20 @@ sub _startDeadline {
 # a Play that was acked but never started - because the run has to be counted
 # across all of them. A breaker wired to one site leaves the other three
 # stampeding, and against a wedged daemon they do not fail one at a time.
+#
+# $linkDown: the load never reached HQPlayer because there is no control link.
+# That is not a fact about the track, so skipping to the next one only meets the
+# same missing link - it trips at once instead. It is still counted and cleared
+# here, so the breaker's run stays the one record of failed loads.
 sub _loadFailed {
-    my ( $self, $why ) = @_;
+    my ( $self, $why, $linkDown ) = @_;
 
     my $run = ( $self->hqFailRun || 0 ) + 1;
     $self->hqFailRun($run);
 
     my $c = $self->controller;
 
-    if ( $run < FAIL_LIMIT ) {
+    if ( $run < FAIL_LIMIT && !$linkDown ) {
 
         main::INFOLOG && $log->is_info && $log->info( $self->name . sprintf(
             ': load failed (%s) - %d of %d', $why, $run, FAIL_LIMIT ) );
@@ -1843,9 +1854,15 @@ sub _loadFailed {
         return;
     }
 
-    $log->error( $self->name . sprintf(
-        ': %d consecutive failed loads (%s) - stopping the player rather than '
-      . 'skipping through the playlist', $run, $why ) );
+    if ($linkDown) {
+        $log->error( $self->name . ": load failed ($why) - stopping the player rather than "
+          . 'skipping through the playlist' );
+    }
+    else {
+        $log->error( $self->name . sprintf(
+            ': %d consecutive failed loads (%s) - stopping the player rather than '
+          . 'skipping through the playlist', $run, $why ) );
+    }
 
     # CLEARED ON THE TRIP, not on the next play. The player must not be left
     # permanently armed: whatever the user asks for next gets a fresh FAIL_LIMIT
@@ -3304,7 +3321,8 @@ sub _endOfStream {
     # reports nothing: LMS has been streaming this song since the hand-over,
     # and the playerTrackStarted at the far end of the load is what retires the
     # one that just finished.  A load that cannot run is not silent either -
-    # _queueTrack answers a missing control link with _loadFailed, and a second
+    # _queueTrack answers a missing control link with _loadFailed (a stop - no
+    # skip can help a missing link), and a second
     # refusal is reported properly there, which is the whole point of demoting
     # to a load rather than failing at append time.
     # A PENDING HAND-OVER IS PROOF THE PLAYLIST HAS NOT ENDED.

@@ -238,13 +238,42 @@ else:
             def read_key(conf, key, dflt):
                 return subprocess.run(
                     ['sh', '-c', fn.group(0) + 'read_key "$1" "$2"', 'sh', key, dflt],
-                    env=dict(os.environ, PY=sys.executable, CONF=conf),
+                    env=dict(os.environ, PY=sys.executable, CONF=conf,
+                             SRC=os.path.join(HQ, 'hqrestart.py')),
                     capture_output=True, text=True).stdout.rstrip('\n')
             kc = os.path.join(tempfile.mkdtemp(), 'k.json')
             json.dump({'token': None, 'port': 9000}, open(kc, 'w'))
             ok(read_key(kc, 'token', '') == '', 'a null token reads as EMPTY, so the wait loop keeps waiting')
             ok(read_key(kc, 'nope', '8090') == '8090', 'a missing key reads as its default')
             ok(read_key(kc, 'port', '8090') == '9000', 'CONTROL: a real value is read as itself')
+            # ONE RULE: read through the helper, so a value the helper would
+            # correct reads as what it will USE, not as the raw text in the file.
+            json.dump({'port': 'abc'}, open(kc, 'w'))
+            ok(read_key(kc, 'port', 'x') == '8090',
+               "a port the helper would refuse reads as the helper's own default")
+
+        # --- a RE-install over a config that no longer PARSES.  The running
+        # helper parsed it at its own start; the new one would exit 2 and stay
+        # down.  It used to read as "allow not set", stop the good helper and
+        # start one that could not run.  It must be refused BEFORE the stop.
+        env, home, stubs = sh_env()
+        c = conf_path(home)
+        os.makedirs(os.path.dirname(c), exist_ok=True)
+        broken = '{"token": "keepme", "allow": ["192.168.1.234"],}'
+        open(c, 'w').write(broken)
+        rc, out = run_sh(sh, [], env)
+        ok(rc != 0, 'a config that does not parse stops the install (rc %s)' % rc)
+        ok(stop not in out and start not in out,
+           'and the running helper is neither stopped nor replaced')
+        ok('cannot read' in out and 'left alone' in out,
+           "and says why, in the helper's own words")
+        ok(lambda: open(c).read() == broken, 'and the file, token and all, is untouched')
+
+        # CONTROL: the same install over a config that parses runs through
+        env, home, stubs = sh_env()
+        rc, out = run_sh(sh, [], env, seed={'token': 'keepme', 'allow': ['192.168.1.234']}, home=home)
+        ok(rc == 0 and stop in out and start in out,
+           'CONTROL: a config that parses re-installs as before (rc %s)' % rc)
 
         # --- uninstall asks nothing and stops it
         env, home, stubs = sh_env()

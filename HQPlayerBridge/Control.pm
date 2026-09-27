@@ -649,15 +649,6 @@ sub _dropLink {
     $self->{wbuf}       = '';
     $self->{rbuf}       = '';
 
-    # Fail the outstanding command and everything queued behind it, so callers
-    # are never left waiting on a callback that can no longer arrive.
-    my $req = delete $self->{inflight};
-    $req->{cb}->( undef, undef ) if $req && $req->{cb};
-
-    while ( my $q = shift @{ $self->{queue} } ) {
-        $q->{cb}->( undef, undef ) if $q->{cb};
-    }
-
     # A link that had been ANSWERING going down is always worth a line. A
     # failed attempt during an outage is not - see _outage.
     if ($wasProven) {
@@ -674,7 +665,25 @@ sub _dropLink {
     # $wasProven: whether this link had carried a reply, i.e. whether LMS was
     # told it was connected (Player::connected is `proven`). Passed because
     # `proven` is already cleared above, so the listener cannot ask.
+    #
+    # THE LISTENER HEARS FIRST, BEFORE ANY STRANDED COMMAND IS FAILED. A synced
+    # player leaves its group here (Plugin::_onLinkState -> playerInactive ->
+    # Player::stop), and stop() retires the load it had in flight by bumping the
+    # generation. Failed the other way round, that load's callback would report
+    # a failed load to LMS first, and LMS fails a track for the WHOLE group when
+    # one member cannot open it - every other room skipping for one lost link.
+    # The socket is already gone, so anything the listener sends is failed on
+    # the next turn (see send) rather than queued behind the commands below.
     $self->{onState}->( $self, 0, $wasProven ) if $wasUp && $self->{onState};
+
+    # Fail the outstanding command and everything queued behind it, so callers
+    # are never left waiting on a callback that can no longer arrive.
+    my $req = delete $self->{inflight};
+    $req->{cb}->( undef, undef ) if $req && $req->{cb};
+
+    while ( my $q = shift @{ $self->{queue} } ) {
+        $q->{cb}->( undef, undef ) if $q->{cb};
+    }
 
     $self->_scheduleReconnect unless $self->{closing};
 
