@@ -112,6 +112,18 @@ def same_addr(a, b):
     return (getattr(ia, 'ipv4_mapped', None) or ia) == (getattr(ib, 'ipv4_mapped', None) or ib)
 
 
+def plain_addr(a):
+    """The address a user would type: a v4 client on a dual-stack socket
+    arrives as `::ffff:192.168.1.234`, and telling them to run
+    `--allow ::ffff:192.168.1.234` matches the README nowhere. Anything that
+    is not a v4-mapped address comes back exactly as given."""
+    try:
+        mapped = getattr(ipaddress.ip_address(a), 'ipv4_mapped', None)
+    except ValueError:
+        return a
+    return str(mapped) if mapped else a
+
+
 def log(msg):
     sys.stderr.write(time.strftime('%Y-%m-%d %H:%M:%S ') + msg + '\n')
     sys.stderr.flush()
@@ -148,15 +160,28 @@ def write_config(path, data):
     """
     tmp = path + '.new'
     try:
-        with open(tmp, 'w') as f:
+        # 0600 AT CREATION, not after the write.  open(tmp, 'w') creates at
+        # 0666 & ~umask - 0644 under the default - and the token was
+        # json.dump'ed and fsync'ed into it BEFORE the chmod ran, so it was
+        # world-readable for the length of the write.  Worse, `except OSError:
+        # pass` around that chmod meant a chmod which failed left the file at
+        # 0644 and os.replace then made THAT the live config - permanently
+        # readable by any local user, with the write reporting success.
+        # Measured both: 0644 during the write, and 0644 left live when the
+        # chmod was forced to fail.  os.open takes the mode at creation, and
+        # os.fchmod pins it even if a stale tmp was left by a crash.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)                     # it holds the token
+            f = os.fdopen(fd, 'w')
+        except BaseException:
+            os.close(fd)                             # nothing owns the raw fd yet
+            raise
+        with f:
             json.dump(data, f, indent=2)
             f.write('\n')
             f.flush()
             os.fsync(f.fileno())
-        try:
-            os.chmod(tmp, 0o600)                     # it holds the token
-        except OSError:
-            pass
         os.replace(tmp, path)
     except Exception:
         try:
@@ -778,7 +803,7 @@ class Handler(BaseHTTPRequestHandler):
         if (self.headers.get('Content-Type') or '').split(';')[0].strip() != 'application/json':
             return
 
-        who = self.client_address[0]
+        who = plain_addr(self.client_address[0])     # it is printed, below
         now = time.time()
         # Under the lock: ThreadingHTTPServer runs each request on its own
         # thread, and pruning the map while another request inserts into it
@@ -913,6 +938,18 @@ def set_allow(path, raw=None):
             raise ValueError('not an IP address: %s' % part)
         if part not in addrs:
             addrs.append(part)
+
+    # AN EMPTY WRITE IS REFUSED, NOT STORED.  main() tells a read from a write
+    # by argument count alone, so `--allow <config> ""` - a wrapper
+    # interpolating an unset variable, or a user copying the usage line -
+    # arrived here as raw='' and stored `allow: []`, which silently disables
+    # the tokenless Restart row and exits 0.  Every address GIVEN is validated;
+    # "no addresses at all" needed a rule of its own.  A read is raw=None and
+    # never reaches here, and install.sh's own `[ -n "$ALLOW" ]` guard is now
+    # belt and braces rather than the only thing preventing it.
+    if not addrs:
+        raise ValueError('no IP addresses given - refusing to write an empty '
+                         '"allow" list, which would disable the tokenless restart')
 
     data['allow'] = addrs
 

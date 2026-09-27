@@ -419,6 +419,34 @@ print "-- forgetClient clears the literal tcpsock first (LMS < 9.1 dies on it) -
        'every forget in Plugin.pm is a METHOD call, so the override runs');
 }
 
+print "-- _teardown stops only a controller the player has to itself --\n";
+{
+    # The REAL _teardown, which no other block here drives. controller->stop
+    # is StreamingController::_Stop, over EVERY player in a sync group; LMS's
+    # forgetClient runs unsync first, which stops just the one it removes.
+    package TdCtl;
+    sub new        { bless { n => $_[1], ev => $_[2] }, $_[0] }
+    sub allPlayers { return ( (1) x $_[0]->{n} ) }
+    sub stop       { push @{ $_[0]->{ev} }, 'controller stop' }
+    package TdClient;
+    sub new           { bless { ctl => $_[1], ev => $_[2] }, $_[0] }
+    sub controller    { $_[0]->{ctl} }
+    sub _stopPolling  {}
+    sub forgetClient  { push @{ $_[0]->{ev} }, 'forgetClient' }
+    package main;
+
+    my $reg = Plugins::HQPlayerBridge::Plugin::bridges();
+    for my $case ( [ 1, 'controller stop, forgetClient', 'a solo player: its controller is stopped, as before' ],
+                   [ 2, 'forgetClient', 'in a group: the group is NOT stopped, forgetClient\'s unsync stops just this one' ] ) {
+        my @ev;
+        %$reg = ( td => { client => TdClient->new( TdCtl->new( $case->[0], \@ev ), \@ev ) } );
+        Plugins::HQPlayerBridge::Plugin::_teardown('td');
+        is(join(', ', @ev), $case->[1], $case->[2]);
+        ok(!exists $reg->{td}, '  and the bridge is gone');
+    }
+    %$reg = ();
+}
+
 print "-- the removal pass reads PROVEN, as Player::connected does --\n";
 {
     my @ev;

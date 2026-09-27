@@ -215,10 +215,17 @@ fi
 # The token is generated on the helper's FIRST START, so wait for THE TOKEN -
 # not for the file, which now exists already whenever `allow` was answered
 # above. Waiting on the file printed an empty token and a broken curl line.
+#
+# AND A JSON null IS NOT A WRITTEN VALUE. .get(key, default) hands back None
+# for "token": null - the obvious way a user resets a token by hand - not the
+# default, so this printed the literal string None. [ -n "None" ] is true, so
+# the wait loop broke on its FIRST pass and the installer reported success with
+# a bearer token of four characters, None. Treat None as missing.
 read_key() {
   "$PY" -c "import json,sys
 try:
-    print(json.load(open(sys.argv[1])).get(sys.argv[2], sys.argv[3]))
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+    print(sys.argv[3] if v is None else v)
 except Exception:
     print(sys.argv[3])" "$CONF" "$1" "$2" 2>/dev/null || echo "$2"
 }

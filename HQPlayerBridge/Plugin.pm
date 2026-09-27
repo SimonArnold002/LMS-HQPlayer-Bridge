@@ -493,9 +493,10 @@ sub _restartNow {
 # audio/x-flac -> FLAC.  HQPlayer reports the source container as a MIME type;
 # the bare subtype is what a listener recognises.
 #
-# It lives HERE, not in Settings.pm, because BOTH surfaces need it and
-# Settings.pm is only required under main::WEBUI - calling it from the feed
-# would die on a headless build.
+# It lives HERE because BOTH surfaces reach it through signalPathFor - the
+# Apps feed and the live view's query - and neither is loaded only under
+# main::WEBUI.  (It moved out of the old Settings.pm, which was WEBUI-only,
+# for that reason; that page went in 0.2.60-0.2.76.)
 sub _shortMime {
     my $mime = shift or return undef;
 
@@ -1304,7 +1305,13 @@ sub _onLinkState {
         # closing the socket - see _statusWatchdog in Player.pm.
         $client->_startPolling;
 
-        _probeRestart( ( $b->{instance} || {} )->{ip} );
+        # THROTTLED, exactly as the feed's call is.  1.0.24's reconnectNow
+        # retries a refusing instance once per discovery round, and every
+        # accept reaches this branch - so an unthrottled probe is one 3s GET to
+        # a dead :8090 every ~10s for ever on a host with no helper installed,
+        # where $restartable is never set to stop it.  $probedAt was already
+        # written here and never read; REPROBE_AFTER is what it is for.
+        _probeRestart( ( $b->{instance} || {} )->{ip}, 1 );
     }
     else {
         $client->_stopPolling;
@@ -1381,7 +1388,16 @@ sub _teardown {
         eval {
             $client->_stopPolling;
 
-            $client->controller->stop if $client->controller;
+            # ONLY A CONTROLLER THIS PLAYER HAS TO ITSELF.  controller->stop is
+            # StreamingController::_Stop, which stops EVERY player in a sync
+            # group.  Sync is not supported here (CLAUDE.md, `sync groups are
+            # not supported`), but that is no reason to silence another room:
+            # forgetClient below runs LMS's own unsync first, which stops just
+            # the one it removes and hands it a controller of its own - the
+            # same path `client forget` takes.  A solo player is stopped here
+            # exactly as before.
+            my $ctl = $client->controller;
+            $ctl->stop if $ctl && !( $ctl->can('allPlayers') && $ctl->allPlayers > 1 );
         };
         eval { $client->forgetClient };
     }

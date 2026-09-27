@@ -420,7 +420,29 @@ print "-- reconnectNow: discovery heard it, so try now --\n";
     is(scalar @connects, 1, 'a down link connects now');
     is(scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
        'and the pending backoff retry is dropped, not left to connect again');
-    is($c->{backoff}, 60, 'the backoff is left where it was, so a failure waits as long as before');
+    is($c->{backoff}, 60, 'reconnectNow itself does not touch the backoff');
+
+    # AND WHAT IT DOES NOT DO - the corrected comment on reconnectNow.  It used
+    # to claim "the backoff itself is left where it is: if this attempt fails,
+    # the next scheduled retry is as far away as before".  Only the first half
+    # is true.  The attempt reconnectNow starts goes _dropLink ->
+    # _scheduleReconnect when it fails, which doubles the ladder like any other
+    # retry.  The assertion above could never catch that: it runs at
+    # BACKOFF_MAX (60), where doubling is a no-op.  Pin it from the BOTTOM of
+    # the ladder, where a double is visible.
+    {
+        Slim::Utils::Timers::_reset();
+        my $e   = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+        my $min = $e->{backoff};
+
+        $e->reconnectNow;
+        is($e->{backoff}, $min, 'CONTROL: from the bottom of the ladder too, reconnectNow leaves it alone');
+
+        $e->{connecting} = 1;                      # the attempt it just started
+        $e->_dropLink('connect: refused');         # ...and that attempt fails
+        is($e->{backoff}, $min * 2,
+           'but the FAILURE it leads to doubles it - the pace is one attempt per discovery round, the ladder is NOT held');
+    }
 
     @connects = ();
     $c->{sock} = 'up';
@@ -470,6 +492,19 @@ print "-- ONE warning per outage, not one per retry --\n";
     my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
     $d->_connectTimeout;
     is(scalar @warned, 4, 'CONTROL: the very first failure is reported');
+
+    # A PROVEN link that stops answering is ONE event, and was two WARNs:
+    # "no reply to <X> after 30s", then "control link down - reply timeout".
+    # The reason now rides on _dropLink's own line, text intact for log greps.
+    @warned = ();
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $e->{connected} = 1;
+    $e->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $e->{inflight} = { verb => 'PlaylistAdd' };
+    $e->_replyTimeout;
+    is(scalar @warned, 1, 'a proven link timing out warns ONCE');
+    is(( $warned[0] // '' ) =~ /control link down - no reply to <PlaylistAdd> after 30s/ ? 1 : $warned[0], 1,
+       'and that one line names the command it was waiting on');
     Slim::Utils::Timers::_reset();
 }
 

@@ -19,7 +19,7 @@ refused if it does not hold.
 
 usage: python3 tools/t_installers.py [install.sh]
 """
-import json, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
+import json, os, pty, re, select, shutil, signal, subprocess, sys, tempfile, time
 
 _here = os.path.dirname(os.path.abspath(__file__))
 HQ = os.path.join(_here, 'hqrestart')
@@ -137,8 +137,48 @@ def pty_sh(installer, args, env, keys):
         if b'IP address' in out.split(b'\n')[-1] and sent < len(keys):
             k = keys[sent]; sent += 1
             os.write(fd, b'\x03' if k is None else (k + '\n').encode())
-    _, status = os.waitpid(pid, 0)
-    return status, out.decode(errors='replace')
+    # NOT an unconditional waitpid.  The read loop above also exits on the 60s
+    # deadline with the child STILL ALIVE - a prompt that never returns, a
+    # blocking `launchctl bootstrap`, the token wait - and os.waitpid(pid, 0)
+    # then blocked for ever.  run_checks.sh runs this file under `set -e` with
+    # no timeout, so the whole suite stopped with no output and no failing
+    # assertion, which reads as a HANG (see the fleet note on suites that hang).
+    # run_sh directly above bounds itself with timeout=120; same rule here.
+    #
+    # `signal` was already imported and never used, which is where the kill was
+    # meant to go.
+    def reap(secs):
+        for _ in range(int(secs * 10)):
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                return st
+            time.sleep(0.1)
+        return None
+
+    status = reap(4)
+
+    if status is None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+            status = reap(2)
+            if status is not None:
+                break
+
+        # A killed child is a FAILED case, not a quiet one: the installer did
+        # not finish, so whatever the assertions below read out of `out` is
+        # describing a run that never completed.  Say so where it counts.
+        ok(False, 'pty_sh: the installer child had to be killed - this case did'
+                  ' not complete, and the assertions below judge a partial run')
+
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+    return -1 if status is None else status, out.decode(errors='replace')
 
 if not shutil.which('sh'):
     print('  skip install.sh: no sh')
@@ -183,6 +223,28 @@ else:
            'an answered prompt comes before the stop, and the helper starts')
         ok(lambda: json.load(open(conf_path(home))).get('allow') == ['192.168.1.234'],
            'and the answer is written')
+
+        # --- read_key, lifted out of install.sh and run by sh on its own.  A
+        # JSON null has to read as UNWRITTEN: the helper treats a null token as
+        # missing and generates one, but read_key printed Python's `None`, so
+        # the wait loop took "None" for a token, stopped waiting, and printed
+        # `token:   None` and a curl line with `Bearer None` in it.  Not
+        # reachable through the whole-install run above - the stub writes the
+        # token synchronously, before the loop starts - so tested here.
+        src = open(INSTALL_SH).read()
+        fn = re.search(r'^read_key\(\) \{\n.*?^\}\n', src, re.S | re.M)
+        ok(fn, 'read_key is found in install.sh')
+        if fn:
+            def read_key(conf, key, dflt):
+                return subprocess.run(
+                    ['sh', '-c', fn.group(0) + 'read_key "$1" "$2"', 'sh', key, dflt],
+                    env=dict(os.environ, PY=sys.executable, CONF=conf),
+                    capture_output=True, text=True).stdout.rstrip('\n')
+            kc = os.path.join(tempfile.mkdtemp(), 'k.json')
+            json.dump({'token': None, 'port': 9000}, open(kc, 'w'))
+            ok(read_key(kc, 'token', '') == '', 'a null token reads as EMPTY, so the wait loop keeps waiting')
+            ok(read_key(kc, 'nope', '8090') == '8090', 'a missing key reads as its default')
+            ok(read_key(kc, 'port', '8090') == '9000', 'CONTROL: a real value is read as itself')
 
         # --- uninstall asks nothing and stops it
         env, home, stubs = sh_env()

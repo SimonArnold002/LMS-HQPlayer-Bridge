@@ -2312,9 +2312,12 @@ sub assertPendingVolume {
     # refreshInfo subscribes with, so where a held level and a knob turned on
     # the endpoint meet in the SAME outage, the held level WINS - HQPlayer is
     # moved to it and the Status that follows reports it.  That is the settled
-    # intent (only a level LMS set during an outage is replayed).  The rule that
-    # a knob turn is FOLLOWED, not overridden, covers the case where LMS set no
-    # level at all, which is the usual one and where nothing is held to assert.
+    # intent (only a level LMS set during an outage is replayed).  With nothing
+    # held, a knob turned while the link is UP is followed.  One turned DURING
+    # the outage is not: it is the first level the new link reports, which
+    # cannot be told from HQPlayer's startup level, so _followVolume latches it
+    # (hqVolStartup) and LMS re-asserts its own level at the next play - the
+    # idle divergence the ledger records as by design.
     #
     # Optimistic, exactly as in volume(): hqVolDb is what the anti-snap rule
     # and _followVolume compare against, and the level is on its way.

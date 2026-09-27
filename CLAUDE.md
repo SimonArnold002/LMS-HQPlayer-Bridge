@@ -92,9 +92,11 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 | `%BENIGN`, `_dispatch`'s `$msg`, a benign `<Volume>` error logged at WARN | **FIXED** 2026-09-26 (round 2) — `/>([^<]*)</` matched the empty string after the XML declaration, so `%BENIGN` never fired and never had a test | `%BENIGN` never fired` |
 | `volume()` reading `Control::send`'s **1** as delivery; a level set during a reconnect HANDSHAKE (`up` = `sock \|\| connecting`); `volumeAsserted` releasing the hold on any first reply | **FIXED** 2026-09-26 (round 3) — `send` answers 1 for a command it has only QUEUED, and a failed connect drains that queue; `<Volume>` had no callback, so the hold was released and the level recorded as applied. Released by the command's OWN reply now (`_volumeDelivered`) | `THE HOLD IS RELEASED BY A REPLY, NOT BY send() ANSWERING 1` |
 | the helper's installer "installing Python" on macOS; treating Apple's Command Line Tools prompt as something `install.sh` does | **MEASURED 2026-09-26 — IT IS APPLE'S PROMPT, NOT OURS.** `install.sh` never installs anything: no `python3` means exit 1 and an untouched system. macOS ships no Python; `/usr/bin/python3` is a STUB sharing one inode with `/usr/bin/git` and `/usr/bin/clang`, and invoking it is what makes macOS offer the Command Line Tools. Linux has no equivalent | `THE PYTHON PROMPT IS APPLE'S, NOT THE INSTALLER'S` |
+| a volume set while LMS is NOT PLAYING appearing to be forgotten across an HQPlayer restart; `_followVolume` reading `$serverPrefs->client->get('volume')` rather than `$self->volume` | **NOT OURS** 2026-09-26, Simon's call: *"I adjust volume previously when LMS was not playing, this did not get saved, that's the difference and is an LMS issue not ours."* The bridge reads the PERSISTED level BY DESIGN. Do not "fix" it by reading the live value - that breaks `_Resume`'s temporary 0 | `THE LATCH HELD, AND THE 45 WAS LMS NOT SAVING THE LEVEL` |
 | the LMS slider dropping back to HQPlayer's startup level after a restart | **REVERSED 2026-09-26 (same day), Simon's call — FIXED in 1.0.28.** Recorded as correct behaviour in the morning, on the reading that LMS follows any level it did not set; Simon's account of WHY made it a defect — HQPlayer's startup volume (−36 dB) is a restart artefact, not a user action, and following it overwrote LMS's stored level before the user could play | `HQPlayer's STARTUP VOLUME DOES NOT CAPTURE THE SLIDER` |
 | the LMS slider and HQPlayer's actual level DIVERGING while idle after a restart, until something plays (`hqVolStartup`) | **BY DESIGN** 2026-09-26, Simon's call: *"thats fine and what I would expect its behaviour to be."* The slider shows the user's intent; HQPlayer keeps its own startup level until LMS plays, and LMS's Bug-10310 re-assert aligns them then. Aligning at link-up instead was offered and declined - it would override HQPlayer's startup volume even when HQPlayer is used standalone | `THE IDLE DIVERGENCE IS BY DESIGN` |
 | the 0.2.31 re-registration guard, refusing/pulling back a level just after a link-up | **STILL REVERSED for an NAA re-registering mid-link; the LINK-UP case is now guarded** (1.0.28, `hqVolStartup`). The 2026-08-30 reversal asked for "a trigger that means the endpoint re-registered and nothing else" — `onProven` is that trigger for a NEW CONTROL LINK, and a track boundary cannot produce one. There is still no such signal for an NAA re-registering, so that half stands | `An endpoint re-registering announces its own level` |
+| a bridge player in a SYNC GROUP - a synced member not reloading, any sync-group failure scenario | **NOT SUPPORTED** 2026-09-27, Simon's call - no LMS bridge supports sync groups; *Not in v1* already says so. (`_teardown` no longer stops a shared controller - hardened anyway, harmless) | `sync groups are not supported` |
 
 **Two standing rules that kill most repeat findings:**
 
@@ -163,7 +165,11 @@ belief is the thing a fresh review will re-derive from the code and propose agai
 | The live page's service badge is drawn only where Material is installed: `loadEmblems()` fetches `/material/html/misc/emblems.json` and the logo comes from `/material/svg/<name>`, so on a server without Material the fetch 404s, `EMBLEMS` stays null and no badge is ever drawn (`Live.pm`, `np-badge`) | **BY DESIGN** 2026-09-20, Simon's call: "only material shows badges so this is expected" - badge itself **VERIFIED LIVE** on 1.0.3 | **Only Material shows badges, and that is the whole point** — the badge exists to match the one Material already draws on LMS-Listen-to-Later and LMS-Pitchfork-Reviews rows, so it uses Material's own emblem table and its own recoloured logos rather than a copy that would drift the moment Material changes a colour or adds a service. A skin that draws no badges anywhere has nothing to match, and a fallback drawn from some other asset would be a second, divergent badge. The fetch failing costs the badge and nothing else on the page. **Not a defect, and not a gap to fill with a fallback.** |
 | One host on TWO interfaces (Ethernet + Wi-Fi) splitting into two players (`_idsFor`, `tools/probe_identity.py`) | **DECLINED** 2026-09-20, Simon's call | Superseded the PARKED entry of the same day. The split is REAL and was reproduced live - see `A CORPSE IS NOT AN INSTANCE` - but running HQPlayer with more than one interface active is documented upstream as unsupported, so the plugin does not defend against it. The DHCP-move half of the same bug IS fixed. |
 | The licence `fingerprint` identifies the MACHINE, so it can key a player across a rename or a move | **WRONG, MEASURED** 2026-09-20 | `the fingerprint is not a machine identity` |
+| "a connected player outranks discovery" having no counterpart in `Discovery::_probe`, so a player kept by its link goes unprobed once its address ages out of `%found` | **WRONG, WITHDRAWN 2026-09-27 the same session it was raised.** `_probe` unicasts to every address in `%found` EVERY round and any reply refreshes `lastSeen`, so the reliable path sustains itself: losing multicast cannot age an address out. It needs ALL UDP to the host to fail for 5 unbroken minutes while TCP 4321 keeps working, and no writer was named for that | `the unicast probe sustains its own entry` |
+| the discovery pace / `_settled` / the 2-4-8-10 ladder / `INSTANCE_TTL` as a liveness rule | **PLANNED, do not re-argue from scratch** - the pace has been reversed TWICE, both at Simon's call (flat 5s to follow Lyrion 2026-09-23; back to a ladder 2026-09-25 because discovery was 92% of HQPlayer's log). Root cause: `%found` is the address book AND the liveness register. Design in `docs/discovery-simplification-plan.md` | `one address book, one liveness signal` |
 | The bridge should detect the Eversolo NAA coming back and press HQPlayer's **Refresh devices** itself, because after the endpoint is powered off and on hqplayerd does not use it until that button is pressed — the NAA vanishes and a refresh drops DSD | **DECLINED** 2026-09-21, Simon's call: *"This is for Eversolo to fix"* | Measured in hqplayerd's `:8088/log` 2026-09-21. **(1) hqplayerd never noticed the endpoint was gone:** it sat idle holding the NAA TCP link, and logged **zero** of its 2-second `NAA output discovery` scans all morning; it found out only when the next command failed — `11:28:35 Stop` → `clNetEngine::Stop(): send(): Broken pipe`, then `PushSDM(): not connected to adapter`. **(2) Its own reconnect stalled:** it rediscovered and connected to `192.168.1.197:43210` by itself at 11:28:38 (`attempting to reinitialize...`) but never logged `NAA output network engine started`; Play at 11:28:47 ran with `hardware: 0`. **(3) Refresh devices fixes the link but drops the user's mode:** the button is `GET /config/refresh` behind HTTP Digest auth (`/` and `/log` need none). After it, HQPlayer came back in **PCM 768k / TPDF / poly-sinc-gauss-long** while the saved config says **SDM / LNS15 / poly-sinc-gauss-hires-lp**, and it had been running SDM at 5.6 MHz before. The bridge sends no `SetMode`/`SetRate`/`SetFilter`/`SetShaping`/`SetTransport` — none has a call site, `%KNOWN` in `Control.pm` only whitelists — so the refresh itself did it. The Eversolo still advertised DSD 2.8–22.5 MHz on reconnect. **Also no route on the control socket:** there is no rescan verb, and `ConfigurationLoad` needs Signalyst's Ed25519 client key plus a session key. An auto-refresh would recover the endpoint and silently drop DSD, and would need the web login stored in the plugin plus HTTP brought back (removed 0.2.54). **A full daemon restart DOES restore the mode** (Simon, 11:48 same day): the startup applies the saved settings explicitly — `Set dither: 9`, `Set modulator: 18` right after `HQPlayer Engine version` — and it came back SDM 5.6 MHz, ASDM7EC-light, `NAA output network engine started at: 5644800`. The `/config/refresh` restart logs no such `Set` lines. Untested, and the only thing that could reopen this: whether re-POSTing the unchanged `/config` form (Apply) straight after restores SDM. **DISPROVEN 2026-09-21: `http://<hq>:8088/restart` is NOT a remote restart.** Tried unauthenticated from LAN and from 127.0.0.1, and by Simon logged in via curl and in the browser: every one `200` + an empty page, PID unchanged, no `Server stopping...`. The 15:20:04 restart it was credited with was a **Dock-tile Quit**: macOS log `15:20:03.556 DockHelper spawned` → `15:20:04.641 Dock: Calling force quit` → `libquit: hqplayerd [85837] force quit` → launchd respawned it as pid 20799 at 15:20:08 (Chrome was frontmost, hence the mix-up). That restart DID restore SDM (`Set dither: 9`/`Set modulator: 18`, then `engine started at: 5644800`), so a daemon restart remains the manual fix, but there is still NO HTTP route to it. Check a claimed restart by the PID and the macOS `libquit` line, not by timing. **MANUAL RESTART BUILT 2026-09-21 (on top of the uncommitted 1.0.9), Simon's brief:** `tools/hqrestart/` is a stdlib-Python webhook on the HQPlayer host (:8090) that restarts HQPlayer the way it was started, app or service, on macOS/Linux/Windows; macOS app mode verified live (7.1s, SDM restored). The Bridge gets a **Restart HQPlayer** row per instance in the Apps feed, confirm-then-act, shown only once `http://<instance ip>:8090/ping` has answered as the helper (`%restartable`, never shrinks in a run, because `item_id` is positional). **Still no settings page:** the helper authorises the LMS server by its `allow` list, not a token. **Still manual:** the bridge never restarts on its own, so the auto-refresh DECLINE above stands. Bridge side offline-tested only (t_plugin.pl, 25 assertions). Build, twenty review rounds and the live verification: see `## 1.0.10-1.0.13 (2026-09-21): Restart HQPlayer from LMS`. |
+| `assertPendingVolume` calling `_lmsOwnsVolume` disarms the 1.0.28 startup latch before HQPlayer has reported anything on the new link, so the held-level + HQPlayer-restart case loses the protection 1.0.28 exists to give | **DISPROVEN 2026-09-27, and the proposed fix was ALREADY APPLIED AND REVERTED BY HAND.** The held-level path IS the 19:09 live run where the level survived; clearing the latch there is load-bearing, or a CLAMPED reply to our own assert is ignored as "still the startup level" | `_lmsOwnsVolume in the replay is BY DESIGN` |
+| `explain_refusal` stamping its 60s per-address throttle before deciding whether it will log, so a refusal that says nothing buys 60s of silence for the next one that would | **DISPROVEN 2026-09-27** — the silent branch needs POST + JSON + in-`allow` + `direct_host()`, which is precisely the combination that makes `trusted` true, so that request is SERVED and never reaches `explain_refusal` | `explain_refusal's silent branch is unreachable` |
 
 
 Presents each HQPlayer instance on the network as a native Lyrion player,
@@ -2241,8 +2247,13 @@ Two rules that fall out of it, both pinned in `t_player.pl`:
   would drop the hold on the strength of our own guess.
 * **Where a held level and an endpoint knob turned in the SAME outage meet, the
   held level wins**, because it is asserted ahead of the Status that would report
-  the knob. With nothing held, a knob turn is followed as always — that is the
-  rule in `_followVolume`, and it covers the case where LMS set no level at all.
+  the knob. With nothing held, a knob turned while the link is UP is followed —
+  the rule in `_followVolume`. **Corrected 2026-09-27:** this used to say "as
+  always", and since 1.0.28 that is wrong for a knob turned DURING an outage: it
+  is the first level the new link reports, indistinguishable from HQPlayer's
+  startup level, so it is latched (`hqVolStartup`) and not followed; LMS
+  re-asserts its stored level at the next play. Behaviour unchanged and by design
+  (`THE IDLE DIVERGENCE IS BY DESIGN`) - the prose was the defect.
 
 ### HQPlayer's STARTUP VOLUME does not capture the LMS slider (1.0.28)
 
@@ -2527,6 +2538,11 @@ leaves a corpse, which it does collapse.
 `<GetInfo/>` answers `name`, `product`, `version`, `platform` and `engine`, and
 its `name` is the SAME string discovery reports - `ManCave` after the rename,
 `HQPlayerEmbedded` before it. It buys nothing over what `_idsFor` already has.
+**Desktop too, measured 2026-09-27:** HQPlayer Desktop 6.2.3 answers `name="Mac"` to
+a unicast discovery probe AND to `<GetInfo/>`. Being the SAME key is what the
+discovery plan (`docs/discovery-simplification-plan.md` §4.3) relies on: a
+configured address is keyed from `GetInfo`'s `name`, so it gets the id discovery
+would have given it and no player is ever re-keyed.
 (`probe_identity.py`'s first version compared `name` against `product` instead
 of against the DISCOVERY name and would have reported a useless key as a cheap
 one; corrected the same day, with the reason in the code.)
@@ -2534,25 +2550,25 @@ one; corrected the same day, with the reason in the code.)
 ## Testing without LMS
 
 `sh tools/run_checks.sh` — syntax-checks all six modules against the stub Slim
-tree, runs the five Perl suites (1,015 assertions: `t_control` 101, `t_player`
-501, `t_stream` 64, `t_plugin` 190, `t_live` 159) plus the live page EXECUTED
+tree, runs the five Perl suites (1,023 assertions: `t_control` 105, `t_player`
+501, `t_stream` 64, `t_plugin` 194, `t_live` 159) plus the live page EXECUTED
 under osascript (17, run from `t_live.pl` and skipped out loud without it) and
-the helper's Python suite (162) and the installer run end to end (13), checks
-`install.sh` parses, and sweeps called-vs-defined subs. 1,207 in total. Counts
-as of 2026-09-26; they move every round, and the run prints them. (The
+the helper's Python suite (169) and the installer run end to end (17), checks
+`install.sh` parses, and sweeps called-vs-defined subs. 1,226 in total. Counts
+as of 2026-09-27; they move every round, and the run prints them. (The
 PowerShell parse check and the install.ps1 half of the installer suite went with
 Windows support.)
 
 | file | covers |
 |---|---|
-| `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads** |
+| `t_control.pl` | XML framing, attribute parsing, escaping, **real captured hqplayerd payloads**; one WARN per event, a proven link's reply timeout included |
 | `t_player.pl` | player construction, `<metadata>`/artwork, the controller handshake, seek accounting, two-way transport, volume, **track changes and fade duration** |
 | `t_stream.pl` | the tier 4 endpoint: path-only urls, the socket handover, the stale-connection and end-of-stream-marker traps, **the synthesised FLAC header** |
-| `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper) |
+| `t_plugin.pl` | player identity across a DHCP move and duplicate names, version drift, **the Restart rows** (append-only positions, the probe and its throttle, the JSON POST, `BRIDGE_WAIT` against the helper); the REAL `_teardown`, which stops only a controller the player has to itself |
 | `t_live_page.js` | the live page EXECUTED, not grepped: a DOM shim plus JavaScriptCore (`osascript`), driving the instance chooser end to end. Run from `t_live.pl`; skipped, out loud, where there is no osascript |
 | `t_live.pl` | the standalone live page: **the status code on the response object**, that the document owes nothing to the skin, and that the poller never stops itself |
-| `t_installers.py` | `install.sh` RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt and no Python all leave the old helper running. Refuses to run unless the stub `launchctl` wins on PATH |
-| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS), the refusal of any other OS at start, config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log) |
+| `t_installers.py` | `install.sh` RUN end to end with the service managers stubbed, so the ORDER of stop / ask / start is asserted: a typo, Ctrl-C at the prompt and no Python all leave the old helper running. Refuses to run unless the stub `launchctl` wins on PATH; `read_key` lifted out and run by sh, so a JSON null token reads as unwritten |
+| `t_hqrestart.py` | the helper, against the REAL module with the OS stubbed: the restart's pre-flight (every "LEFT RUNNING" refusal, Linux/macOS), the refusal of any other OS at start, config coercion, a failed command, bind failures and exit 2, the endpoint over a REAL v4/v6 socket, and **`--allow`, the one thing a user must set** (a host name and a half-written address both refused, the token and every other key surviving the write, a refusal naming the address in the log); `write_config` 0600 DURING the write and closing its fd on failure, an empty `--allow` refused, and the refusal hint naming a v4 client without `::ffff:` |
 
 The stub `Slim::Utils::Accessor` is deliberately array-based, mirroring the real
 one, so hash-slot mistakes fail here rather than on the server.
@@ -6604,6 +6620,46 @@ case. Comment narrowed at both sites, and the precedence is now pinned.
 `t_installers.py` 13, `perl -c` on every module, sweep clean. (1.0.28 takes `t_player.pl` to 501
 and the total to 1,207.)
 
+### THE LATCH HELD, AND THE 45 WAS LMS NOT SAVING THE LEVEL
+
+**1.0.28 VERIFIED LIVE 2026-09-26.** LMS at 48 (= -31.2 dB on Simon's **-60..0** range), HQPlayer
+restarted, **the slider held at 48** - read back from the server, not taken on report.
+
+**The first attempt looked like a failure and was not.** Simon set the slider to 48, restarted
+HQPlayer, and the slider read **45**. Three sessions-worth of wrong theories were proposed from
+those two numbers before he gave the answer: *"the difference was I adjusted volume previously when
+LMS was not playing, this did not get saved, that's the difference and is an LMS issue not ours."*
+
+So LMS never PERSISTED the 48. Its stored level was still 45, the latch correctly declined to adopt
+HQPlayer's startup level, and the slider therefore showed 45 - LMS's own stored value. The bridge
+did exactly what it should.
+
+**Why the arithmetic never fitted, and should have stopped the guessing sooner.** On -60..0:
+slider 45 = **-33.0 dB**, slider 48 = -31.2 dB, and Simon's -36 dB startup level = **slider 40**.
+45 matched HQPlayer's startup level, LMS's target and the user's setting NONE of them. That was the
+signal that the premise was wrong, not that the latch had failed.
+
+**`_followVolume` reads the PERSISTED volume deliberately** (`$serverPrefs->client($self)->get('volume')`,
+not `$self->volume`) because `_Resume` parks a temporary 0 before its fade-in and a push landing in
+that window would read as "the endpoint just dropped to the floor". **Do not "fix" this by reading
+the live value.** Whether LMS persists a level set while stopped is LMS's business - Simon's call,
+not a bridge defect.
+
+### A PROCESS FAILURE WORTH MORE THAN THE BUG
+
+There was no bug, and a fix was written anyway. From two numbers and no log, three mechanisms were
+asserted in turn - the latch failing, the 1.0.27 hold pushing the level back, and a track reload
+re-asserting it - each stated as fact, each wrong, each corrected by Simon: *"your assuming
+things"*, twice. An edit moving `_lmsOwnsVolume` from the send to the delivery callback was applied
+to `Player.pm` on the strength of the first of them, and reverted by hand (never `git checkout` - see
+the standing rules).
+
+`plugin.hqplayerbridge` was at **Warn** the whole time, and BOTH decisive lines are INFO:
+`volume changed outside LMS to XdB - following` and `HQPlayer is at XdB on this link - not following
+it`. **The log level was the cheap first move and it was skipped.** With it at Info the first test
+would have answered itself. When a volume symptom is reported, raise the log level before forming a
+theory, and do not touch code until a line in the log names the path taken.
+
 ### 1.0.27 INSTALLED on the rig 2026-09-26 - steady state verified, the outage NOT
 
 `http://plex:9000/hqplive` reports `v1.0.27`; the player `HQPlayer (MacMini)`
@@ -6784,11 +6840,10 @@ which is a diagnostic that did not exist when this class of bug was last chased.
 * **1.0.16's discovery timing is unverified live**: a second HQPlayer
   appearing within ~5s while the first is connected, and a switched-off one's
   player going ~5 min after it went quiet. Offline-tested only.
-* **The startup-volume latch (1.0.28) is unverified live.** BUILT, not installed —
-  the rig is on 1.0.27. It needs: restart HQPlayer so it applies its −36 dB
-  startup level, check the LMS slider does NOT move to it while idle, then play
-  and check HQPlayer is set to LMS's level. Offline-tested only, with the
-  before/after measured against `_followVolume` directly.
+* ~~The startup-volume latch (1.0.28) is unverified live.~~ **VERIFIED LIVE
+  2026-09-26.** LMS at 48 (-31.2 dB on Simon's -60..0 range), HQPlayer restarted,
+  **the slider held at 48.** Read back independently, not reported. See
+  `THE LATCH HELD, AND THE 45 WAS LMS NOT SAVING THE LEVEL`.
 * **The volume hold across a reconnect HANDSHAKE is unverified live** (1.0.27
   INSTALLED 2026-09-26, steady state verified — see the live check below). The
   down-link half was verified on the rig at 1.0.25. The handshake half needs an
@@ -6815,6 +6870,150 @@ which is a diagnostic that did not exist when this class of bug was last chased.
 
 Reported 2026-09-06. **Not diagnosed - see the 0.2.72 note for what is
 established and the one test that splits it.**
+
+
+## Review round 2026-09-27: the 15 unpushed commits (1.0.16-1.0.28)
+
+Scope: `origin/dev` (30b1305, 1.0.15) .. HEAD (5b202a5, 1.0.28) plus the working tree. Suites
+green throughout: t_control 101 -> **103** (+2 pinned below), t_player 501, t_stream 64,
+t_plugin 190, t_live 159, t_hqrestart 162, t_installers 13, sweep clean.
+
+**FIXED:** the link-up `_probeRestart` now passes `$throttled` (it was one 3s GET to a dead
+`:8090` every ~10s for ever on a helperless host, and `$probedAt` was written and never read);
+`install.sh`'s `read_key` treats a JSON `null` as unwritten (`"token": null` printed the literal
+string `None`, `[ -n "None" ]` is true, so the wait loop broke on its first pass and the
+installer reported a bearer token of `None`); `set_allow` refuses an empty write (`--allow
+<config> ""` stored `allow: []` and exited 0, silently disabling the tokenless Restart row);
+`write_config` creates the temp file 0600 via `os.open`/`os.fchmod` (it was 0644 for the length
+of the write with the token already in it, and a swallowed `chmod` failure left 0644 LIVE);
+`pty_sh` reaps with `WNOHANG` and kills on the deadline (the unconditional `os.waitpid(pid, 0)`
+blocked for ever under `set -e` with no timeout, which reads as a hang - `signal` was imported
+and unused, which is where the kill was meant to be).
+
+**RAISED AND WITHDRAWN IN THE SAME SESSION - the unicast probe sustains its own entry.** The
+finding was that `Plugin.pm`'s "a connected player outranks discovery" removal guard has no
+counterpart in `Discovery::_probe`, which unicasts only to `keys %found` - so a player kept alive
+by its link would stop being probed once multicast stopped and `INSTANCE_TTL` dropped its address.
+**The premise is wrong.** `_probe` unicasts to every address in `%found` on EVERY round, and
+`_reply` refreshes `lastSeen` for any reply, multicast or unicast. Unicast is the VERIFIED-reliable
+path, so while the host answers it at all the entry renews itself and can never age out. Losing
+multicast alone is therefore harmless. The branch needs ALL UDP to that host to fail for 5 unbroken
+minutes while TCP 4321 keeps working - a firewall blocking UDP 4321 but not TCP, or HQPlayer's UDP
+listener dying while its control thread lives - and **no writer was named for either**, so it is
+not reported as live. Simon spotted it: *"This feels like you're already repeating whats in
+place."* He was right; the protection was already there.
+
+What does stand, on its own merits and not as a defect, is the shape: `%found` is both the address
+book and the liveness register, which is why the pace has been retuned every round. Simon: *"this
+seems like our discovery is overly complex compared to how LMS or HQplayers work"* - measured
+against the vendor's own client, which has ONE `discoverHosts()` call site behind `--discover`
+(probe, wait 1s, print, quit) and ZERO of `lastSeen`/`expire`/`forget`/`ttl`/`stale`. See
+`docs/discovery-simplification-plan.md`.
+
+### _lmsOwnsVolume in the replay is BY DESIGN - DISPROVEN, AND THE FIX WAS ALREADY REVERTED
+
+**The claim.** `Plugin::_onLinkState` arms `hqVolLinkNew(1)`, then `refreshInfo` ->
+`assertPendingVolume` replays the held level and calls `_lmsOwnsVolume`, clearing BOTH
+`hqVolLinkNew` and `hqVolStartup` before any `<Status/>` can arrive - so if HQPlayer ACKs the
+`<Volume>` while its audio engine is still initialising and its next Status still carries the
+startup level, `_followVolume` has no latch and drags the slider down.
+
+**Why it is void.** The structure is real; the failure is not.
+
+1. **The held-level path was MEASURED, and the level survived.** The 19:09 run on 1.0.25:
+   `LINK DOWN -> set volume 55` -> `RECONNECTED (proven) volume=55` -> `+6s volume=55` ->
+   `+14s, several Status pushes volume=55`. HQPlayer applies the replayed level before it
+   answers Status, so the branch the finding needs never opens. The 1.0.28 entry names that run
+   explicitly as the held-level half of the two paths.
+2. **Clearing the latch there is load-bearing, not incidental.** `_lmsOwnsVolume`'s own comment
+   says it: once LMS has asserted a level on this link, a CLAMPED reply to that assert must be
+   followable. Leave the latch armed and HQPlayer's clamp is ignored as "still the startup
+   level", so the slider shows a level HQPlayer is not at.
+3. **The proposed remedy has already been tried on this exact reasoning and reverted by hand**
+   ("an edit moving `_lmsOwnsVolume` from the send to the delivery callback was applied to
+   `Player.pm` on the strength of the first of them, and reverted by hand"). See
+   `A PROCESS FAILURE WORTH MORE THAN THE BUG`.
+4. The citation offered for the initialising window - *"it was initialising its audio engine"* -
+   is about **discovery datagrams being dropped**, not about the control socket answering a
+   command it has not applied. Wrong evidence for the claim.
+
+**To reopen it** you need a live capture where a replayed `<Volume>` is answered and the NEXT
+Status on that same link still reports the startup level. Re-deriving the code path is not
+enough: it has now been re-derived and killed twice.
+
+### explain_refusal's silent branch is unreachable - DISPROVEN, NOT A FINDING
+
+**The claim.** `explain_refusal` writes `SAID[who] = now` inside the lock BEFORE deciding
+whether it will log, so a refusal that prints nothing (address in `allow`, Host fine, only the
+token wrong) consumes the 60s `EXPLAIN_EVERY` window and silences the next refusal that would
+have explained itself.
+
+**Why it is void.** That combination cannot be refused in the first place. `explain_refusal` is
+reached only from `if not (trusted or self.authorised(url))`, and it returns early unless the
+request is a POST with `Content-Type: application/json`. Inside it, the silent path needs
+`any(same_addr(who, a) for a in allow)` **true** and `direct_host()` **true** - and
+`trusted = POST and in-allow and json and direct_host()` is then true as well, so the request is
+SERVED and never refused. Every path that reaches the stamp logs. `Handler.cfg` is one `Config`
+object assigned once at startup and `__getitem__` is a plain dict read, so the two evaluations
+cannot disagree mid-request either.
+
+The ordering is still untidy, and if `trusted` ever grows a fifth condition the branch becomes
+reachable - so **if that test changes, revisit this**. As the code stands it is not a defect.
+
+### the corrected reconnectNow prose, pinned
+
+`reconnectNow`'s comment claimed *"the backoff itself is left where it is: if this attempt fails,
+the next scheduled retry is as far away as before"*. Half true, and the false half matters: the
+attempt it starts goes `_dropLink -> _scheduleReconnect` on failure, which DOUBLES `{backoff}`
+like any other retry, so a refusing instance saturates at `BACKOFF_MAX` within a handful of
+rounds. Invisible while discovery keeps seeing the instance (`reconnectNow` sets the pace);
+it shows once discovery stops (`INSTANCE_TTL`), when the fallback ladder sits at 60s instead of
+where the outage left it. **Not "fixed"** - a slow ladder after a long outage is wanted, and
+restoring the backoff would need a rule for which failures count. A comment is not the contract:
+the prose was the defect. The old assertion could never have caught this because it ran at
+`BACKOFF_MAX`, where doubling is a no-op; there are now two assertions from the BOTTOM of the
+ladder in `t_control.pl`.
+
+### sync groups are not supported - NOT A FINDING
+
+**The claim** (review 2026-09-27): `_teardown`'s `controller->stop` runs LMS's
+`StreamingController::_Stop` over every player in the group, where `client forget` uses
+`playerInactive` to stop only the departing one - so removing a synced bridge player would
+silence the rest of the group.
+
+**Why it is void.** Simon, 2026-09-27: *"We don't support sync groups for this. No bridges in LMS
+support sync groups, and losing one in LMS would stop it as far as I know."* Already in *Not in
+v1* below (multi-room sync). **Do not report any finding whose failure scenario needs a bridge
+player in a sync group**, and do not propose sync handling as a fix for something else. The
+`_onLinkProven` rejoin code that exists is not a statement of support.
+
+**Hardened anyway, Simon: "fix the sync player anyway, won't do any harm."** Evaluated against
+LMS 9.0's source first, and the finding was NARROWER than raised: the `client forget` path was
+already safe, because LMS's `forgetClient` runs `unsync` BEFORE `_onForget` fires, and `unsync`
+hands the player a fresh controller of its own - so our `controller->stop` there hit an empty
+one. The real exposure was the teardowns that run before any forget (the removal pass, a DHCP
+move, the error path, `shutdownPlugin`). `_teardown` now stops the controller only when
+`allPlayers` is 1; otherwise `forgetClient`'s `unsync` stops just this player (`_stopClient`),
+exactly as `client forget` does. The solo path is unchanged, and the `Timer balance` guard
+still holds on both (`_stopClient` reaches `Player::stop` -> `_newGeneration`, and LMS's
+`forgetClient` runs `Timers::forgetTimer` as well). Pinned in `t_plugin.pl` on the REAL
+`_teardown`, which nothing drove before; fails with the old line restored.
+
+### Review round 2026-09-27 (second pass): 8 findings, 5 fixed, 3 dropped
+
+Run after the discovery rewrite was planned, with discovery findings excluded. Each fix was
+evaluated against the code first and each new test was run against the OLD code and FAILED.
+
+| # | finding | outcome |
+|---|---|---|
+| 1 | `_teardown` `controller->stop` silencing a sync group | hardened, see above |
+| 2 | `write_config` leaking the raw fd if `fchmod`/`fdopen` raises (this session's own fix) | FIXED - closed on the error path; pinned |
+| 3 | the link-up restart-probe throttle pinned only by a regex | DROPPED - that probe fires per discovery-driven reconnect, which the rewrite removes |
+| 4 | the 3 helper fixes (empty `allow`, 0600 during the write, null token) untested | FIXED - pinned in `t_hqrestart.py` and `t_installers.py` (`read_key` lifted out and run by sh: the whole-install run cannot reach it, the stub writes the token before the wait loop) |
+| 5 | `assertPendingVolume` comment: "a knob turn is followed" | PROSE FIXED at both sites - a knob turned DURING an outage is latched as the startup level, by design; already pinned by `t_player.pl`'s latch block |
+| 6 | the refusal hint naming `::ffff:a.b.c.d` on the dual-stack listener | FIXED - `plain_addr` for the logged address and throttle key; `same_addr` untouched |
+| 7 | a proven link's reply timeout logging two WARNs | FIXED - one line, `control link down - no reply to <X> after 30s`, text kept for log greps |
+| 8 | `volume()` / `assertPendingVolume` duplicated send block | DECLINED - volume is stable and is where one change breaks three |
 
 ## Not in v1
 

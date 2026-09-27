@@ -377,9 +377,13 @@ sub _replyTimeout {
     my $self = shift;
     my $verb = $self->{inflight} ? $self->{inflight}->{verb} : '(none)';
     my $msg  = "no reply to <$verb> after " . REPLY_TIMEOUT . 's';
-    # A link that had been answering going silent is news; an accept that
-    # never answered is one more failed attempt of an outage.
-    $self->{proven} ? $log->warn("$self->{name}: $msg") : $self->_outage($msg);
+    # A link that had been answering going silent is news - and _dropLink
+    # already WARNs for a proven link, so it carries the reason as its own
+    # line ("control link down - no reply to <X> after 30s") rather than a
+    # second WARN for the same event.  An accept that never answered is one
+    # more failed attempt of an outage.
+    return $self->_dropLink($msg) if $self->{proven};
+    $self->_outage($msg);
     $self->_dropLink('reply timeout');
 }
 
@@ -722,10 +726,26 @@ sub _reconnect {
 
 # Discovery has just heard this HQPlayer answer, so try now rather than wait
 # out the backoff - up to BACKOFF_MAX after a long outage, and Control::send no
-# longer connects on a command. The backoff itself is left where it is: if
-# this attempt fails, the next scheduled retry is as far away as before, so an
-# HQPlayer that answers discovery but refuses the link costs one attempt per
-# discovery round (Discovery::COLD_PERIOD), not a faster ladder.
+# longer connects on a command.
+#
+# WHAT IT DOES AND DOES NOT DO - corrected 2026-09-27, the comment was the
+# defect.  The PACE is as intended: an HQPlayer that answers discovery but
+# refuses the link costs one attempt per discovery round
+# (Discovery::COLD_PERIOD) and not a faster ladder, because the pending
+# _reconnect timer is KILLED here rather than added to.
+#
+# But this used to claim "the backoff itself is left where it is", and it is
+# not.  A connect started here that fails goes _dropLink -> _scheduleReconnect
+# like any other, which DOUBLES {backoff} - so a refusing instance saturates at
+# BACKOFF_MAX within a handful of rounds.  That is invisible while discovery
+# keeps seeing the instance, because reconnectNow sets the pace; it shows only
+# once discovery STOPS seeing it (Discovery::INSTANCE_TTL), when the fallback
+# ladder is at BACKOFF_MAX rather than where the outage left it.
+#
+# Deliberately NOT "fixed": a slow ladder after a long outage is the behaviour
+# we want, and restoring the backoff here would need a rule for which failures
+# count, which is a tuning question nobody has asked for.  Pinned in
+# t_control.pl so the prose and the code cannot drift apart again.
 sub reconnectNow {
     my $self = shift;
 

@@ -678,6 +678,49 @@ ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'],
    'CONTROL: a write that does not fail still lands')
 ok(lambda: oct(os.stat(CONF).st_mode & 0o777) == oct(0o600), 'and the config it lands is 0600 - it holds the token')
 
+# 0600 WHILE THE TOKEN IS BEING WRITTEN, not only once it lands.  open(tmp,'w')
+# then chmod passed the check above too: the file it landed was 0600, but the
+# token had been dumped into a 0644 file first.  Look at the temp file's mode
+# from INSIDE the dump.
+def mode_during_dump():
+    seen = []
+    def peek(data, f, **kw):
+        seen.append(os.stat(CONF + '.new').st_mode & 0o777)
+        return _realdump(data, f, **kw)
+    hq.json.dump = peek
+    try:
+        hq.set_allow(CONF, '192.168.1.234')
+    finally:
+        hq.json.dump = _realdump
+    return seen == [0o600]
+
+ok(mode_during_dump, 'the temp file is ALREADY 0600 when the token is written into it')
+
+# A failed fchmod must not leak the raw descriptor: nothing owns it until
+# os.fdopen succeeds, so write_config has to close it itself.
+def fd_closed_on_fchmod_failure():
+    closed, real_fchmod, real_close = [], os.fchmod, os.close
+    def boom(fd, mode): raise PermissionError('chmod refused')
+    def spy(fd): closed.append(fd); return real_close(fd)
+    hq.os.fchmod, hq.os.close = boom, spy
+    try:
+        try:
+            hq.set_allow(CONF, '192.168.1.234'); return False
+        except PermissionError:
+            pass
+    finally:
+        hq.os.fchmod, hq.os.close = real_fchmod, real_close
+    return len(closed) == 1 and not os.path.exists(CONF + '.new')
+
+ok(fd_closed_on_fchmod_failure, 'a failed fchmod closes the descriptor and removes the temp file')
+
+# `--allow <config> ""` - a wrapper interpolating an unset variable - stored
+# `allow: []` and exited 0, silently disabling the tokenless restart.
+ok(lambda: refuses(''), 'an EMPTY address list is refused, not written')
+ok(lambda: refuses(' , '), 'and so is one that is only separators')
+ok(lambda: json.load(open(CONF)).get('allow') == ['192.168.1.234'],
+   'and the previous list is left alone')
+
 # ---------------------------------------------------------------------------
 # `--allow` WITH NO CONFIG PATH.  main() matched the flag on `len(argv) > 2`,
 # so a bare `--allow` fell THROUGH to serve mode with sys.argv[1] as the config
@@ -838,6 +881,36 @@ def race():
     return errors
 
 ok(lambda: race() == [], 'twelve threads refusing at once raise nothing')
+
+# The default listener is dual-stack (`::`), so a v4 Lyrion server arrives as
+# ::ffff:a.b.c.d - and the refusal used to tell the user to run
+# `--allow ::ffff:192.168.1.234`. The hint must name the address they know.
+print('== a refusal names the address the way a user would type it')
+
+def refusal_from(ip):
+    class Fake:
+        command = 'POST'
+        SAID = hq.Handler.SAID
+        SAID_LOCK = getattr(hq.Handler, 'SAID_LOCK', None) or contextlib.nullcontext()
+        cfg = {'allow': []}
+        def __init__(self):
+            self.client_address = (ip, 0)
+            self.headers = {'Content-Type': 'application/json'}
+        def direct_host(self):
+            return True
+    Fake.explain_refusal = hq.Handler.explain_refusal
+    logged(); hq.Handler.SAID.clear()
+    try:
+        Fake().explain_refusal()
+        return logged()
+    finally:
+        hq.Handler.SAID.clear()
+
+_r = refusal_from('::ffff:192.168.1.234')
+ok('--allow 192.168.1.234 ' in _r and '::ffff' not in _r,
+   'a v4-mapped client is named as 192.168.1.234 (%r)' % _r[-90:])
+_r = refusal_from('fe80::1')
+ok('--allow fe80::1 ' in _r, 'CONTROL: a real v6 address is named as itself')
 
 # ---------------------------------------------------------------------------
 # A bad --allow on a RE-install. The running helper is stopped before the
