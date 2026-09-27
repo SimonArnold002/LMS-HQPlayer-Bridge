@@ -181,9 +181,7 @@ HQPlayer holds the real level in dB and decides how to split it between the endp
 
 **One LMS step is one dB, with LMS 100 being 0 dB.** The range is read from HQPlayer at connect, so a ceiling below 0 dB is handled.
 
-**A restart of HQPlayer no longer moves your slider.** HQPlayer applies its own configured startup volume whenever it restarts. The bridge does not treat that as something you did, so it leaves the LMS slider alone and re-applies *your* level to HQPlayer the next time you play something. Between the restart and that first play the two differ on purpose: the slider shows the level you chose, and HQPlayer is still at its startup level. A level you change on HQPlayer's own interface, or on the endpoint's remote, is still followed into LMS as it always was.
-
-To stop Lyrion driving the volume at all, set **Volume Control: fixed** on the player's Audio settings page; the plugin honours that and never changes it for you. HQPlayer's own "fixed volume" is a *startup level*, not a lock.
+The level you start with is **HQPlayer's own**, not one the plugin asserts. To stop Lyrion driving the volume at all, set **Volume Control: fixed** on the player's Audio settings page; the plugin honours that and never changes it for you. HQPlayer's own "fixed volume" is a *startup level*, not a lock.
 
 ---
 
