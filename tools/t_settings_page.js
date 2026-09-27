@@ -27,11 +27,13 @@ var TEXT = 'Checking that HQPlayer answers at %s - this can take a few seconds.'
 
 // One page load: the saved list, the radio chosen, the box as typed. Returns
 // the note and a way to fire each of the two ways a save starts.
-function page(saved, mode, typed, disabled) {
+function page(saved, mode, typed, disabled, held) {
     var listeners = { submit: [], beforeunload: [] };
     var note = {
         textContent: '', style: { display: 'none' },
-        getAttribute: function (k) { return k === 'data-text' ? TEXT : k === 'data-saved' ? saved : null; }
+        getAttribute: function (k) {
+            return k === 'data-text' ? TEXT : k === 'data-saved' ? saved : k === 'data-held' ? (held || '') : null;
+        }
     };
     var form = { addEventListener: function (e, fn) { listeners[e].push(fn); } };
     var box  = { value: typed, disabled: !!disabled, form: form };
@@ -93,6 +95,41 @@ try {
     p.submit();
     ok(shown(p) && p.note.textContent.indexOf('192.168.1.230') >= 0,
        'after a refusal, saving the same address again still says it is checking');
+
+    // THE SAME RULE AS THE SAVE (review finding 6, 2026-09-28): the line names
+    // exactly the addresses handler() will ask, and appears only when it asks.
+    print('== the save\'s own rule: normalised, de-duplicated, one bad entry refuses it all');
+    p = page('192.168.1.10', 0, '192.168.001.010');
+    p.submit();
+    ok(!shown(p), 'a saved address typed with leading zeros is the SAME address - nothing is checked');
+    p = page('', 0, '192.168.001.020');
+    p.submit();
+    ok(shown(p) && p.note.textContent.indexOf('192.168.1.20 ') >= 0,
+       'a new one is named as the save reads it, decimal (' + p.note.textContent + ')');
+    p = page('', 0, '10.0.0.2 10.0.0.2, 10.0.0.2');
+    p.submit();
+    ok(p.note.textContent === 'Checking that HQPlayer answers at 10.0.0.2 - this can take a few seconds.',
+       'named once, however often it is typed (' + p.note.textContent + ')');
+    p = page('', 0, 'nuc.local');
+    p.submit();
+    ok(!shown(p), 'a host name: the save refuses it at once, so no line');
+    p = page('', 0, '10.0.0.5, nuc.local');
+    p.submit();
+    ok(!shown(p), 'one bad entry beside a good one: the whole save is refused before any check - no line');
+    ['300.1.1.1', '0.1.2.3', '224.0.0.1', '10.0.0'].forEach(function (bad) {
+        p = page('', 0, bad);
+        p.submit();
+        ok(!shown(p), 'refused by the save, so no line: ' + bad);
+    });
+
+    print('== an address a CONNECTED player holds is not checked, so it is not named');
+    p = page('', 0, '10.0.0.7', false, '10.0.0.7');
+    p.submit();
+    ok(!shown(p), 'only a held address: the save completes at once - no line');
+    p = page('', 0, '10.0.0.7, 10.0.0.8', false, '10.0.0.7');
+    p.submit();
+    ok(p.note.textContent === 'Checking that HQPlayer answers at 10.0.0.8 - this can take a few seconds.',
+       'beside a new one: only the new one is named (' + p.note.textContent + ')');
 } catch (e) { ok(false, 'the script threw: ' + (e && e.message)); }
 
 print(pass + ' passed, ' + fail + ' failed');

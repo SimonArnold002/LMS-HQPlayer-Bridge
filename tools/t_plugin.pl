@@ -1131,7 +1131,7 @@ with_rig( { '127.0.0.1' => 'OldName' }, sub {
     ok( $reg->{$new} && !grep( { $_ eq "teardown $new" } @$ev ), 'the player it is now stays' );
 } );
 
-print "-- two typed addresses answering to one name: the live one keeps the plain id --\n";
+print "-- two typed addresses answering to one name: two players, one per address --\n";
 with_rig( { '10.5.0.20' => 'Twin', '10.5.0.21' => 'Twin' }, sub {
     my ( $ev, $asked, $reg ) = @_;
 
@@ -1142,6 +1142,61 @@ with_rig( { '10.5.0.20' => 'Twin', '10.5.0.21' => 'Twin' }, sub {
     ok( !$reg->{ Plugins::HQPlayerBridge::Plugin::_idFor('Twin') }, 'neither holds the plain id' );
 } );
 
+# A TYPED ADDRESS IS ITS NAME AND ITS ADDRESS (Simon, 2026-09-27, review
+# finding 2). The DHCP-move collapse (_liveOf) must never run across typed
+# addresses: with the first one DOWN its round stamp ages, and a second
+# same-named HQPlayer switched on used to take the first one's player - its
+# id, prefs and playlist - for as long as the first stayed down.
+print "-- a typed address that is DOWN never loses its player to a same-named one --\n";
+{
+    my %who = ( '10.5.0.30' => 'Twin2' );
+    with_rig( \%who, sub {
+        my ( $ev, $asked, $reg ) = @_;
+
+        save( addresses => '10.5.0.30, 10.5.0.31', autodiscover => 0 );
+        # The round clock, running as initPlugin leaves it: a round's START is
+        # when typed addresses are checked, and _round does nothing while the
+        # clock is stopped - so without this the second address is never
+        # re-asked. ($fullRound's END, the removal pass, runs either way.)
+        Plugins::HQPlayerBridge::Plugin::_startDiscovery();
+        $fullRound->();
+        my $plain = Plugins::HQPlayerBridge::Plugin::_idFor('Twin2');
+        ok( $reg->{$plain} && $reg->{$plain}{instance}{ip} eq '10.5.0.30',
+            'CONTROL: alone, the first holds the plain id' );
+
+        # Its link goes down; a round or two pass; then the second answers.
+        $reg->{$plain}{client}{ctl}{up} = 0;  $reg->{$plain}{client}{ctl}{proven} = 0;
+        $fullRound->() for 1 .. 2;
+        $who{'10.5.0.31'} = 'Twin2';
+        @$ev = ();
+        $fullRound->();
+
+        ok( !grep( { $_ eq "create $plain 10.5.0.31" } @$ev ),
+            'the second is NOT handed the first one\'s player' );
+        my %at = map { $reg->{$_}{instance}{ip} => $_ } keys %$reg;
+        is( join( ', ', sort keys %at ), '10.5.0.30, 10.5.0.31', 'each typed address has a player' );
+        is( scalar keys %$reg, 2, 'two players, one per address' );
+        is( $at{'10.5.0.31'} // '', Plugins::HQPlayerBridge::Plugin::_idFor('Twin2@10.5.0.31'),
+            'the second is keyed by its name and address' );
+    } );
+}
+
+
+print "-- the addresses held over a PROVEN link, for the settings page --\n";
+{
+    my $reg  = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+    %$reg = (
+        up    => { instance => { ip => '10.6.0.1' }, link_of(1, 1) },
+        down  => { instance => { ip => '10.6.0.2' }, link_of(0, 0) },
+        acc   => { instance => { ip => '10.6.0.3' }, link_of(1, 0) },
+    );
+    is( join( ',', sort( Plugins::HQPlayerBridge::Plugin::_heldAddresses() ) ), '10.6.0.1',
+        'only a connected player\'s address - not a down link, not an accept that never answered' );
+    is( join( ',', map { scalar( () = Plugins::HQPlayerBridge::Plugin::_linkStateAt($_) ) ? ( Plugins::HQPlayerBridge::Plugin::_linkStateAt($_) )[0] : 'none' } qw(10.6.0.1 10.6.0.2 10.6.0.3) ),
+        'up,down,down', 'CONTROL: the same answer _linkStateAt gives the save' );
+    %$reg = %keep;
+}
 
 print "-- one connected test: Player::connected, nowhere else --\n";
 {

@@ -73,7 +73,11 @@ sub answer_all { my @h = @HELD; @HELD = (); $_->() for @h }
 # answered through the same hook Plugin::_linkStateAt fills in live.
 our %HOLD;
 my $A = 'Plugins::HQPlayerBridge::Addresses';
-sub hold_rig { $A->can('reset')->(); $A->can('init')->( undef, sub { @{ $HOLD{ $_[0] } || [] } } ) }
+sub hold_rig {
+    $A->can('reset')->();
+    $A->can('init')->( undef, sub { @{ $HOLD{ $_[0] } || [] } },
+                       sub { grep { $HOLD{$_}[0] eq 'up' } sort keys %HOLD } );
+}
 
 sub reset_store {
     $prefs->set( addresses => '10.0.0.1' ); $prefs->set( autodiscover => 1 );
@@ -196,6 +200,20 @@ print "-- addresses only: a NEW address is saved only if HQPlayer answers there 
     is( scalar @ASKED, 0, 'removing an address asks nothing' );
     is( $SAVED . '/' . $prefs->get('addresses'), '1/10.0.0.1', 'and saves straight away' );
     is( $sync, 'rendered', 'synchronously' );
+}
+
+{
+    # SWITCHING FROM AUTOMATIC STARTS FRESH (Simon, 2026-09-27, review finding
+    # 4): the stored list is not in use in automatic mode, so nothing in it
+    # counts as already checked. reset_store leaves 10.0.0.1 in the pref with
+    # automatic on - only a hand-written `pref` puts it there, as the page
+    # clears it - and nothing is running at it.
+    reset_store();
+    my ( $p, $sync, $async ) = post( mode => 0, addresses => '10.0.0.1' );
+    is( join( ',', @ASKED ), '10.0.0.1', 'switching from automatic: an address the stale pref holds IS asked' );
+    answer_all();
+    is( $SAVED . '/' . $prefs->get('autodiscover'), '0/1', 'nothing answers there: NOTHING is saved, still automatic' );
+    ok( scalar( ( $p->{hqp_error} // '' ) =~ /10\.0\.0\.1\b/ ), 'and the error names it' );
 }
 
 {
@@ -396,8 +414,27 @@ print "-- the page's \"checking\" line is given the SAVED list --\n";
     is( $q->{hqp_saved} . ' / ' . $q->{hqp_addresses}, '10.0.0.1 / 10.0.0.1, 10.0.0.9',
         'a REFUSED page: still the SAVED list, while the box shows what was typed - so saving again says it is checking' );
 
+    # Stored AUTOMATIC: no list is in use, so the page's list is empty, as the
+    # save's is (review finding 4) - the stale 10.0.0.1 would be checked.
+    reset_store();    # 10.0.0.1 in the pref, automatic on
+    %p = ();
+    $S->handler( undef, \%p );
+    is( $p{hqp_saved}, '', 'stored automatic: NO saved list - a switch starts fresh, and says it is checking' );
+    ( $q ) = post( mode => 0, addresses => '10.0.0.1' );
+    answer_all();
+    is( $q->{hqp_saved} // '', '', 'and a REFUSED switch from automatic: still none' );
+
     my $tmpl = do { local ( @ARGV, $/ ) = ('../HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/settings/basic.html'); <> };
     ok( scalar( $tmpl =~ /id="hqp_checking"[^>]*data-saved="\[% hqp_saved \| html %\]"/ ), 'and the template hands it to the script' );
+
+    # The addresses a CONNECTED player holds: the save asks nothing there
+    # (review finding 6), so the page is told, and leaves them out.
+    reset_store();
+    %HOLD = ( '10.0.0.7' => [ 'up', 'Den' ], '10.0.0.8' => [ 'down', 'Loft' ] );
+    %p = ();
+    $S->handler( undef, \%p );
+    is( $p{hqp_held}, '10.0.0.7', 'the page is given the addresses held over a PROVEN link - not a down one' );
+    ok( scalar( $tmpl =~ /id="hqp_checking"[^>]*data-held="\[% hqp_held \| html %\]"/ ), 'and the template hands them to the script' );
 }
 
 # THE SCRIPT, EXECUTED - not grepped. JavaScriptCore via osascript (no node on

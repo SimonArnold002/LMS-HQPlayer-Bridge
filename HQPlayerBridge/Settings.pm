@@ -85,7 +85,11 @@ sub handler {
         # addresses it adds and so must check.
         my $stored  = $prefs->get('autodiscover');
         my $wasAuto = defined $stored ? ( $stored ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
-        my ($had)   = Plugins::HQPlayerBridge::Addresses::parse( $prefs->get('addresses') );
+
+        # The box IN USE. Coming from automatic there is none: whatever the
+        # pref holds was not in use, so each mode starts fresh and every
+        # address typed on the switch is new, and checked (Simon, 2026-09-27).
+        my ($had)   = $wasAuto ? ( [] ) : Plugins::HQPlayerBridge::Addresses::parse( $prefs->get('addresses') );
 
         # AUTOMATIC: the box is CLEARED - the typed players go on this save
         # (Plugin::_applySettings) and discovery finds again whatever it can
@@ -209,9 +213,8 @@ sub _savedLines {
 sub _refuse {
     my ( $class, $client, $params, $callback, $args, $error ) = @_;
 
-    $params->{hqp_error}      = $error;
-    $params->{hqp_typed}      = $params->{pref_addresses};
-    $params->{hqp_typed_auto} = 0;
+    $params->{hqp_error} = $error;
+    $params->{hqp_typed} = $params->{pref_addresses};
 
     delete $params->{saveSettings};
 
@@ -265,8 +268,10 @@ sub beforeRender {
     my ( $class, $params ) = @_;
 
     if ( $params->{hqp_error} ) {
+        # Only an addresses-only save is ever refused - an automatic one has
+        # no addresses to check - so a refused page is always addresses-only.
         $params->{hqp_addresses} = $params->{hqp_typed};
-        $params->{hqp_auto}      = $params->{hqp_typed_auto} ? 1 : 0;
+        $params->{hqp_auto}      = 0;
     }
     else {
         my $auto = $prefs->get('autodiscover');
@@ -278,7 +283,16 @@ sub beforeRender {
     # The addresses already SAVED - what handler() compares against to decide
     # what a save adds, and so what it will wait on. The page's "checking"
     # line uses the same list, so it appears exactly when the save will check.
-    $params->{hqp_saved} = $prefs->get('addresses') // '';
+    # Stored automatic means NONE, exactly as handler() reads it: the pref is
+    # not in use there, so a switch starts fresh (a refused switch included).
+    my $stored = $prefs->get('autodiscover');
+    my $wasAuto = defined $stored ? ( $stored ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
+    $params->{hqp_saved} = $wasAuto ? '' : $prefs->get('addresses') // '';
+
+    # And the addresses a CONNECTED player already holds: handler() names
+    # those from the player (Addresses::held) and asks nothing, so the line
+    # leaves them out as well.
+    $params->{hqp_held} = join ', ', @{ Plugins::HQPlayerBridge::Addresses::heldAll() };
 
     return;
 }

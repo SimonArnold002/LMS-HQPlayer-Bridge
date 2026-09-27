@@ -150,8 +150,9 @@ sub initPlugin {
     # A typed address answering for the first time is announced straight
     # away, as a new discovery reply is. Additive only - see _onInstances.
     # _linkStateAt also tells the settings page which addresses are already
-    # connected, so its check opens no second link to them.
-    Plugins::HQPlayerBridge::Addresses::init( sub { _onInstances( _table(), 1 ) }, \&_linkStateAt );
+    # connected, so its check opens no second link to them; _heldAddresses
+    # lists them all, so the page's "checking" line leaves them out too.
+    Plugins::HQPlayerBridge::Addresses::init( sub { _onInstances( _table(), 1 ) }, \&_linkStateAt, \&_heldAddresses );
     Plugins::HQPlayerBridge::Addresses::set( _boxAddresses() );
 
     _startDiscovery();
@@ -220,6 +221,14 @@ sub _linkStateAt {
     }
 
     return;
+}
+
+# Every address a player holds over a PROVEN link - where _linkStateAt says
+# 'up'. The same test, so the page's line and the save cannot disagree.
+sub _heldAddresses {
+    return map  { $_->{instance}->{ip} }
+           grep { $_->{instance} && defined $_->{instance}->{ip}
+                  && $_->{client} && $_->{client}->connected } values %bridges;
 }
 
 # THE ONE TABLE the players are reconciled against. With the two modes
@@ -1089,10 +1098,11 @@ sub _onInstances {
 
     for my $inst (@$instances) {
         # NO ENTRY MEANS DELIBERATELY NOT ACTED ON, and it is not an error.
-        # _idsFor drops an address that has stopped answering when EXACTLY ONE
-        # address still answers to the same name and that name is not already
-        # split into address-qualified players (it is then the same daemon,
-        # seen at the address a DHCP move left), and it defers a whole name
+        # _idsFor drops a DISCOVERED address that has stopped answering when
+        # EXACTLY ONE address still answers to the same name and that name is
+        # not already split into address-qualified players (it is then the same
+        # daemon, seen at the address a DHCP move left) - never a typed one,
+        # which keeps its own player down or not - and it defers a whole name
         # group on a PARTIAL list
         # because freshness cannot be judged until the round is complete.
         # Either way the address gets no player this round; a deferred group is
@@ -1337,7 +1347,19 @@ sub _idsFor {
         # leaves the PLAIN-id player in place, an established pair already
         # holds ADDRESS-QUALIFIED ones.  A pair keeps today's behaviour, and
         # its quiet member sits out INSTANCE_TTL's grace untouched.
-        if ( @$live == 1 && !_isSplit( $name, $group, $existing ) ) {
+        #
+        # AND NEVER ACROSS TYPED ADDRESSES (Simon, 2026-09-27): a typed address
+        # is its name AND its address - the user put each one there, and none
+        # of them moves. A typed address that is DOWN keeps its old round
+        # stamp (Addresses::verify stamps only a live link), so collapsing here
+        # handed its player - prefs, playlist - to a second same-named HQPlayer
+        # switched on meanwhile, for as long as the first stayed down. Nothing
+        # HQPlayer sends can tell one machine from two (CLAUDE.md, `NO HQPLAYER
+        # ID ON THE CONTROL API`), so the same HQPlayer typed at two addresses
+        # is two players - accepted, unsupported.
+        if ( @$live == 1
+             && !grep( { $_->{configured} } @$group )
+             && !_isSplit( $name, $group, $existing ) ) {
             delete $splitWarned{$name};
             my $inst = $live->[0];
 

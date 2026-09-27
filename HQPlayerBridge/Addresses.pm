@@ -22,10 +22,15 @@ package Plugins::HQPlayerBridge::Addresses;
 # An address never expires: its player stays for as long as it is in the box.
 # A connected one is stamped live each round with no traffic at all - the link
 # is the proof of life. One whose link is down is left to that link, which
-# reconnects on its own ladder; its stamp ages meanwhile, so of two typed
-# addresses answering to one name, only the live one keeps the plain id
-# (Plugin::_liveOf). Stamps use the discovery ROUND number, the plugin's one
-# clock, which keeps running with discovery off.
+# reconnects on its own ladder, and its stamp ages meanwhile. Stamps use the
+# discovery ROUND number, the plugin's one clock, which keeps running with
+# discovery off.
+#
+# TWO TYPED ADDRESSES ANSWERING TO ONE NAME ARE TWO PLAYERS, always - each is
+# keyed by its name AND its address, down or not (Simon, 2026-09-27). The
+# DHCP-move collapse in Plugin::_idsFor skips any group holding a typed
+# address (`configured`); an aged stamp here never hands one typed address's
+# player to another.
 
 use strict;
 use warnings;
@@ -62,6 +67,7 @@ my %failed;      # ip => 1 once a failure has been reported - one line per outag
 my %answered;    # ip => GetInfo's attributes, from the settings page's check - used once
 my $onChange;    # called with no arguments when an address is newly identified
 my $stateAt;     # Plugin::_linkStateAt - is a player already at this address?
+my $heldAt;      # Plugin::_heldAddresses - every address a player holds over a PROVEN link
 
 # ---------------------------------------------------------------------------
 # Parsing. One rule, used by the settings page to refuse a save and by the
@@ -118,7 +124,7 @@ sub normalise {
 # State
 # ---------------------------------------------------------------------------
 sub init {
-    ( $onChange, $stateAt ) = @_;
+    ( $onChange, $stateAt, $heldAt ) = @_;
     return;
 }
 
@@ -151,6 +157,7 @@ sub reset {
     %answered = ();
     $onChange = undef;
     $stateAt  = undef;
+    $heldAt   = undef;
     return;
 }
 
@@ -171,6 +178,13 @@ sub held {
     return undef unless defined $s && $s eq 'up';
 
     return defined $name && length $name ? $name : 'HQPlayer';
+}
+
+# Every address held() would answer for, for the settings page's "checking"
+# line: the save asks no HQPlayer at these, so the page names none of them.
+sub heldAll {
+    return [] unless $heldAt;
+    return [ $heldAt->() ];
 }
 
 # The settings page's own <GetInfo/> answer for an address it is about to
