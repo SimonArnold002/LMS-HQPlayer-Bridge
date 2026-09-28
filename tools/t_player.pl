@@ -3785,6 +3785,39 @@ print "-- play pressed while the link is down keeps the link-back stop --\n";
     is(join(',', @sent), '<Stop/>', 'link back, HQPlayer still playing LMS\'s track: it is stopped');
     is(join(',', @{$rc->{calls}}), '', 'and LMS is not moved or started');
 
+    # A SECOND DROP INSIDE THE RECONCILE STOP'S REPLY WINDOW. The reconcile is
+    # the THIRD stop-sender and recorded nothing, so this drop kept nothing
+    # (hqStarted/hqPlayAck are 0 and LMS is stopped, so linkDropped returns
+    # before it reads hqURL), set no hqReconcile, and NO further <Stop/> was
+    # ever sent: HQPlayer played on for good. Review 2026-09-28 round 7,
+    # finding 1.
+    ok(ref $p->hqUnstopped && grep( { $_ eq $X } @{ $p->hqUnstopped } ),
+       'and the uri the reconcile is stopping is KEPT until HQPlayer answers');
+    my @rcb = @sentCb;                        # the reconcile <Stop/>, unanswered
+    $p->hqControl( bless {}, 'DownCtl' );
+    @ex = ();
+    $p->linkDropped;                          # the listener runs BEFORE _dropLink fails it
+    $rcb[0]->( undef, undef ) if $rcb[0];
+    ok(ref $p->hqReconcile && grep( { $_ eq $X } @{ $p->hqReconcile } ),
+       'a SECOND drop before HQPlayer answers keeps it for the next link-back');
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '<Stop/>', 'and the link back stops HQPlayer AGAIN');
+
+    # CONTROL: HQPlayer ANSWERS the reconcile stop - nothing is kept, so a
+    # later drop of a stopped LMS has nothing to reconcile and sends no stop
+    ( $p, $rc ) = $mk->(6);
+    $load->($p, $rc, $X);
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '<Stop/>', 'CONTROL: the reconcile stop goes out');
+    my $scb = $sentCb[-1];                    # never dereference it blind: an
+    ok($scb ? 1 : 0, 'CONTROL: the reconcile stop asks for a reply');
+    $scb->( { result => 'OK' }, '<Stop result="OK"/>' ) if $scb;
+    is($p->hqUnstopped ? 1 : 0, 0, 'CONTROL: HQPlayer answered it - nothing is kept');
+    $p->hqControl( bless {}, 'DownCtl' );
+    @ex = ();
+    $p->linkDropped;
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: so a second drop keeps nothing');
+
     # 2. a DIFFERENT track picked: X is now hqPrevURL, so its pushes read as
     # stale - the reconcile runs AHEAD of the stale test, so the stop is not
     # held back STALE_LIMIT pushes

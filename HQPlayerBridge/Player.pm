@@ -3294,7 +3294,22 @@ sub _onStatus {
         {
             main::INFOLOG && $log->is_info && $log->info( $self->name
                 . ': HQPlayer played on through the link drop - stopping it to match LMS' );
-            $self->_send('<Stop/>');
+
+            # KEPT UNTIL HQPLAYER ANSWERS, exactly as stop()'s <Stop/> is - this
+            # is the THIRD stop-sender, and _keepUnstopped cannot be called
+            # here: _forgetTrack above has already cleared the
+            # hqStarted/hqPlayAck gate it tests. So the uri is recorded
+            # directly. Missed, a SECOND drop inside this stop's reply window
+            # kept NOTHING - hqStarted/hqPlayAck are 0 and LMS is stopped, so
+            # linkDropped returns on !$playing before it ever reads hqURL - set
+            # no hqReconcile, and no further <Stop/> was sent by any path:
+            # HQPlayer played on for good under a stopped LMS. Reachable by a
+            # restart, a link-back, and a second restart (tools/hqrestart).
+            # (Review 2026-09-28 round 7, finding 1.)
+            $self->hqUnstopped( [$uri] );
+
+            $self->_send( '<Stop/>',
+                sub { $self->hqUnstopped(undef) if defined $_[1] } );
         }
 
         return;
