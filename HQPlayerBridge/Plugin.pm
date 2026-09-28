@@ -67,7 +67,7 @@ sub version {
 
 my $log = Slim::Utils::Log->addLogCategory({
     'category'     => 'plugin.hqplayerbridge',
-    'defaultLevel' => 'INFO',
+    'defaultLevel' => 'WARN',
     'description'  => 'PLUGIN_HQPLAYER_BRIDGE',
 });
 
@@ -1309,8 +1309,25 @@ sub _idsFor {
         if ( @$group == 1 ) {
             delete $splitWarned{$name};
             my $inst = $group->[0];
+            my $id   = _idFor($name);
+
+            # A PARTIAL LIST CREATES NO NEW PLAYER FROM DISCOVERY. One reply is
+            # not yet evidence that the name is unique: a same-named sibling
+            # (two HQPlayer Embedded boxes left at the default name) may answer
+            # a few ms later. Created here, the first box got the PLAIN id -
+            # init restoring that player's old prefs and playlist, a control
+            # link, its volume followed - and the complete round ~LISTEN_TIME
+            # later split the pair into name@ip and tore it down again
+            # (review 2026-09-28, finding 3; reproduced through this sub).
+            # So creation waits for the round's end, at most LISTEN_TIME (1.5s).
+            # An EXISTING player still takes its update at once (an address
+            # change reconnects immediately), and a TYPED address is never
+            # deferred - it is its own name and address, and Addresses
+            # announces it with a partial list.
+            next if $partial && !$inst->{configured} && !( $existing && $existing->{$id} );
+
             $id{ $inst->{ip} } = {
-                id   => _idFor($name),
+                id   => $id,
                 name => _nameFor( $inst, 0 ),
             };
             next;
@@ -1536,7 +1553,8 @@ sub _onLinkState {
         # playlist. Out of it, the others play on; `_onLinkProven`'s playerActive
         # brings it back at the group's position (_JumpToTime restarts the
         # group, as a Lyrion player rejoining does). A solo player is left
-        # active, Slimproto's rule, so a restart never stops a lone player here.
+        # active, Slimproto's rule - its PLAYBACK is stopped instead
+        # (Player::linkDropped), the player stays in the active set.
         #
         # playerInactive's _stopClient reaches Player::stop, whose <Stop/> is
         # failed quietly on the dead link (Control::send) - no reconnect, nothing
@@ -1546,6 +1564,11 @@ sub _onLinkState {
         if ($wasProven) {
             $client->disconnected(1);
             Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
+
+            # NO LINK: LMS stops, nothing is sent until the link is back, and
+            # the next play is the listener's - see Player::linkDropped.
+            eval { $client->linkDropped; 1 }
+                or $log->error( ( $b->{name} || $id ) . ": could not stop after the link drop: $@" );
 
             # Look NOW: if HQPlayer moved (DHCP), this is how the new address
             # is heard without waiting for the next round. One probe however

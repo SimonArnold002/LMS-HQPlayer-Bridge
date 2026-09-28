@@ -336,16 +336,16 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     # track the group plays, and LMS skips the whole group for it.
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 );
-    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, playerInactive',
-       'down after proven, others active: flagged, announced, then made inactive');
+    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, linkDropped, playerInactive',
+       'down after proven, others active: flagged, announced, paused (linkDropped), then made inactive');
 
     # a SOLO player stays active (Slimproto's rule): nothing to leave, and
     # playerInactive on the last active player would _Stop the controller
     $ctrl->{only} = 1;
     @ev = ();
     Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 );
-    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect',
-       'down after proven, the only active player: NOT made inactive');
+    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, linkDropped',
+       'down after proven, the only active player: paused (linkDropped), NOT made inactive');
     $ctrl->{only} = 0;
 
     # playerInactive DYING must not escape the link-down listener, which runs
@@ -354,7 +354,7 @@ print "-- Lyrion's disconnect/reconnect bookkeeping, on the PROVEN link --\n";
     @ev = ();
     my $okDown = eval { Plugins::HQPlayerBridge::Plugin::_onLinkState( 'x', 0, 1 ); 1 };
     ok($okDown, 'a playerInactive that dies does not escape _onLinkState');
-    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, playerInactive',
+    is(join(', ', @ev), 'stopPolling, disconnected 1, notify disconnect, linkDropped, playerInactive',
        'and the disconnect was announced regardless');
     $ctrl->{dieInactive} = 0;
 
@@ -431,6 +431,14 @@ print "-- forgetClient clears the literal tcpsock first (LMS < 9.1 dies on it) -
        'every forget in Plugin.pm is a METHOD call, so the override runs');
 }
 
+print "-- the log is at WARN by default --\n";
+{
+    # The per-round discovery lines are INFO; a new install must not write one
+    # every few seconds while an HQPlayer is off. INFO is one click away.
+    my $cat = $Slim::Utils::Log::CATEGORY{'plugin.hqplayerbridge'} || {};
+    is( $cat->{defaultLevel} // 'none', 'WARN', 'plugin.hqplayerbridge defaults to WARN' );
+}
+
 print "-- _teardown stops only a controller the player has to itself --\n";
 {
     # The REAL _teardown, which no other block here drives. controller->stop
@@ -495,6 +503,7 @@ print "-- the removal pass reads PROVEN, as Player::connected does --\n";
     sub refreshInfo  { push @{ $_[0]->{ev} }, 'refreshInfo' }
     sub _startPolling { push @{ $_[0]->{ev} }, 'startPolling' }
     sub _stopPolling  { push @{ $_[0]->{ev} }, 'stopPolling' }
+    sub linkDropped   { push @{ $_[0]->{ev} }, 'linkDropped' }
 
     package LoopReq;
     sub new           { bless { loop => {} }, $_[0] }
@@ -749,7 +758,7 @@ print "-- a PROVEN link dropping asks for one probe now --\n";
 {
     package ProbeClient;
     sub new { bless { ev => [] }, shift }
-    sub _stopPolling {} sub disconnected {} sub controller { undef }
+    sub _stopPolling {} sub disconnected {} sub controller { undef } sub linkDropped {}
     package main;
 
     no warnings qw(redefine once);
@@ -1248,6 +1257,61 @@ print "-- reconcile: a partial list must never remove a player --\n";
 
     is(scalar keys %{ Plugins::HQPlayerBridge::Plugin::bridges() } >= scalar keys %b ? 1 : 0,
        1, 'a partial round removes nothing');
+}
+
+print "-- a partial list creates no new player from discovery --\n";
+{
+    # REVIEW 2026-09-28, finding 3. A same-named PAIR on a fresh table (LMS
+    # start, or a switch back to automatic): the first reply is a partial list
+    # of ONE, which took the PLAIN id - init restoring that player's old prefs
+    # and playlist, a control link to box A - and the complete round 1.5s later
+    # split the pair into name@ip and tore it down. Creation now waits for the
+    # round's end.
+    my @ev;
+    no warnings qw(redefine once);
+    my $reg  = Plugins::HQPlayerBridge::Plugin::bridges();
+    my %keep = %$reg;
+    %$reg = ();
+    local *Plugins::HQPlayerBridge::Plugin::_create   = sub { push @ev, "create $_[1]{ip}" . ( $_[0] =~ /^02:/ ? '' : '' ) . " as $_[0]"; $reg->{ $_[0] } = { instance => $_[1], name => $_[2] }; };
+    local *Plugins::HQPlayerBridge::Plugin::_teardown = sub { push @ev, "teardown $_[0]"; delete $reg->{ $_[0] }; };
+
+    my $plain = Plugins::HQPlayerBridge::Plugin::_idFor('HQPlayerEmbedded');
+    my $A = { ip => '10.7.0.1', name => 'HQPlayerEmbedded', round => 1, lastSeen => time };
+    my $B = { ip => '10.7.0.2', name => 'HQPlayerEmbedded', round => 1, lastSeen => time };
+
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $A ], 1 );
+    is( join( ', ', @ev ), '', 'first reply of a fresh table (partial, one member): NO player yet' );
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $A, $B ], 1 );
+    is( join( ', ', @ev ), '', 'second reply (partial, the pair): still none' );
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $A, $B ] );
+    is( scalar( grep { /^create/ } @ev ), 2, 'round end: the pair gets its two players' );
+    ok( !grep( { /\Q$plain\E/ } @ev ), 'and the PLAIN-id player is never created, so never torn down' );
+
+    # CONTROL: a unique name still appears - at the round's end
+    @ev = (); %$reg = ();
+    my $U = { ip => '10.7.0.9', name => 'Solo', round => 1, lastSeen => time };
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $U ], 1 );
+    is( join( ', ', @ev ), '', 'CONTROL: a unique name is not created from the partial list either' );
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $U ] );
+    is( join( ', ', @ev ), 'create 10.7.0.9 as ' . Plugins::HQPlayerBridge::Plugin::_idFor('Solo'),
+        'CONTROL: it is created at the round end, at most LISTEN_TIME later' );
+
+    # CONTROL: an EXISTING player still takes an address change at once
+    @ev = ();
+    my $U2 = { %$U, ip => '10.7.0.10' };
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $U2 ], 1 );
+    is( join( ', ', @ev ), 'teardown ' . Plugins::HQPlayerBridge::Plugin::_idFor('Solo') . ', create 10.7.0.10 as '
+        . Plugins::HQPlayerBridge::Plugin::_idFor('Solo'),
+        'CONTROL: an existing player moving address reconnects from the partial list at once' );
+
+    # CONTROL: a TYPED address is never deferred - Addresses announces partially
+    @ev = (); %$reg = ();
+    my $T = { ip => '10.7.0.20', name => 'Typed', configured => 1, round => 1, lastSeen => time };
+    Plugins::HQPlayerBridge::Plugin::_onInstances( [ $T ], 1 );
+    is( join( ', ', @ev ), 'create 10.7.0.20 as ' . Plugins::HQPlayerBridge::Plugin::_idFor('Typed'),
+        'CONTROL: a typed address is created from its partial list at once' );
+
+    %$reg = %keep;
 }
 
 print "-- the watchdog is armed by the LINK, not by a track --\n";

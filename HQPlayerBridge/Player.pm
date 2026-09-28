@@ -44,7 +44,7 @@ __PACKAGE__->mk_accessor( 'rw', qw(
     hqControl hqInstance
     hqTier hqRate hqBits hqMime hqPathData hqTransport hqEngine hqProduct
     hqStarted hqExpectStop hqPosition hqLastStatus hqSeekOffset
-    hqWanted hqVolDb hqVolMin hqVolMax
+    hqWanted hqReconcile hqForeign hqVolDb hqVolMin hqVolMax
     hqVolSent hqVolSentAt
     hqGen hqPlayAck hqURL hqPrevURL
     hqNext hqArmNext hqTrackNo hqTrackSerial hqStaleRun hqStartedAt hqFailRun
@@ -158,6 +158,8 @@ sub new {
         hqLastStatus => 0,
         hqSeekOffset => 0,
         hqWanted     => 'stop',
+        hqReconcile  => 0,
+        hqForeign    => 0,
         hqGen        => 0,
         hqPlayAck    => 0,
         hqNext       => undef,
@@ -1309,6 +1311,11 @@ sub _startTrack {
     $self->hqSeekOffset( 0 );
     $self->hqWanted( 'play' );
 
+    # A new load is what a link drop was waiting for - see linkDropped - and
+    # what ends HQPlayer playing something of its own (see hqForeign).
+    $self->hqReconcile(0);
+    $self->hqForeign(0);
+
     # HQPlayer owns the buffer, so LMS can never learn about it from a STAT.
     # We assert it ourselves once HQPlayer has the URI and is playing - see
     # _queueTrack.  Until then it must read false, or a stale 1 from the
@@ -1941,6 +1948,20 @@ sub pause {
 sub resume {
     my $self = shift;
 
+    # HQPlayer has played something of its own since LMS paused, so it no
+    # longer holds LMS's track and a <Play/> would resume the wrong thing (or
+    # nothing). Play in LMS is a fresh load of LMS's track from its start, as
+    # after a stop - Simon's call 2026-09-28. See hqForeign in _onStatus.
+    if ( $self->hqForeign ) {
+        $self->hqForeign(0);
+
+        Slim::Utils::Timers::killTimers( $self, \&_reloadTrack );
+        Slim::Utils::Timers::setTimer( $self,
+            Time::HiRes::time(), \&_reloadTrack, $self->hqGen || 0 );
+
+        return 1;
+    }
+
     $self->_send('<Play/>') unless ( $self->hqWanted || '' ) eq 'play';
     $self->hqWanted('play');
 
@@ -1964,11 +1985,122 @@ sub stop {
     # Nothing is waiting to start any more.
     $self->_cancelStartDeadline;
 
-    $self->_send('<Stop/>');
+    # What HQPlayer is playing is not LMS's (hqForeign): stopping LMS must not
+    # stop it. LMS's own state above is still reset.
+    $self->_send('<Stop/>') unless $self->hqForeign;
 
     # DELIBERATELY NOT stopping the watchdog here.  Its lifetime is the CONTROL
     # LINK's, not the track's - see _statusWatchdog.
     return 1;
+}
+
+# A LINK DROP STOPS LMS, AND THE NEXT PLAY IS THE LISTENER'S.
+# Simon's rule, 2026-09-28: "do not send any commands until it resumes the
+# link, playback should be a user intervention, no resume as that cant be
+# supported due to HQPlayer clearing queue"; then "lets make a restart stop and
+# not pause". A first cut PAUSED instead, and a paused LMS follows a PLAYING
+# HQPlayer as "resumed outside LMS" - so a local file played from HQPlayer's own
+# UI after a restart started LMS's track over it, with LMS's stored volume
+# (1.0.35 regression, seen live). A STOPPED LMS follows nothing, as the release
+# never did.
+#
+# Called by Plugin::_onLinkState when a PROVEN link goes down. What HQPlayer is
+# doing across the gap is unknowable - a settings change can drop the link and
+# play on, a restart or config save clears its queue - so:
+#
+#   now          LMS stops (a track that was playing, or one held paused; a
+#                load still in flight is failed by _dropLink and stopped by
+#                _loadFailed, as before). The <Stop/> that stop() sends is
+#                failed on the dead link - nothing is queued.
+#   link back    the first push is not followed - see hqReconcile in _onStatus.
+#   play         an ordinary fresh load from LMS, as after any stop. A position
+#                is never resumed (CLAUDE.md, `RESUME AFTER AN OUTAGE IS
+#                DECLINED`).
+sub linkDropped {
+    my $self = shift;
+
+    my $controller = $self->controller or return;
+
+    # Only a track HQPlayer was actually playing, or one LMS holds paused.
+    # Stopped has nothing to stop.
+    return unless $self->hqStarted || $controller->isPaused;
+
+    # The uris LMS handed HQPlayer - the playing track and any pre-queued next
+    # one, which HQPlayer may advance into during the gap - kept NOW, because
+    # the stop below clears hqNext. See hqReconcile in _onStatus.
+    $self->hqReconcile( [ grep { defined && length }
+        $self->hqURL, ( $self->hqNext || {} )->{url} ] );
+
+    # Deferred one turn, as _tripStop is: this runs inside Control::_dropLink.
+    Slim::Utils::Timers::killTimers( $self, \&_linkStop );
+    Slim::Utils::Timers::setTimer( $self,
+        Time::HiRes::time(), \&_linkStop, $self->hqGen || 0 );
+
+    return;
+}
+
+# TRAP: setTimer calls back as ($obj, @args) - see _startDeadline.
+sub _linkStop {
+    my ( $self, $gen ) = @_;
+
+    return if $self->_superseded( $gen, 'link-drop stop' );
+
+    my $controller = $self->controller or return;
+
+    return if $controller->isStopped;
+
+    $log->warn( $self->name . ': control link lost - stopping' );
+
+    # The user's own stop, as _tripStop's: it has to reach the CONTROLLER.
+    $self->execute( ['stop'] );
+
+    return;
+}
+
+# Play pressed in LMS after HQPlayer played something of its own - see resume().
+# An ABSOLUTE index: `playlist jump N` is controller->play(N), a full load from
+# the track's start. ('+0' would be jumpToTime - a seek, which is not a load.)
+# TRAP: setTimer calls back as ($obj, @args) - see _startDeadline.
+sub _reloadTrack {
+    my ( $self, $gen ) = @_;
+
+    return if $self->_superseded( $gen, 'reload of LMS\'s track' );
+
+    my $controller = $self->controller or return;
+    my $song       = $controller->playingSong or return;
+
+    main::INFOLOG && $log->is_info && $log->info( $self->name
+        . ': play after HQPlayer played its own - loading LMS\'s track again from its start' );
+
+    $self->execute( [ 'playlist', 'jump', $song->index ] );
+
+    return;
+}
+
+# Is this uri one LMS handed HQPlayer - the current track or the pre-queued one?
+# HQPlayer strips the query string from every uri it REPORTS (tier 5, measured
+# 2026-08-30 - see _handedOver), so both sides are compared without it.
+sub _isOurUri {
+    my ( $self, $uri ) = @_;
+
+    return 0 unless defined $uri && $uri ne '';
+
+    ( my $u = $uri ) =~ s/\?.*\z//s;
+
+    # ...and the ones a link drop kept (hqReconcile): the stop that followed the
+    # drop cleared hqNext, but a pre-queued track HQPlayer advanced into during
+    # the gap is still LMS's, and must reach the reconcile stop, not read as
+    # HQPlayer's own playback.
+    my $kept = $self->hqReconcile;
+
+    for my $mine ( $self->hqURL, ( $self->hqNext || {} )->{url},
+                   ( ref $kept eq 'ARRAY' ? @$kept : () ) ) {
+        next unless defined $mine && $mine ne '';
+        ( my $m = $mine ) =~ s/\?.*\z//s;
+        return 1 if $m eq $u;
+    }
+
+    return 0;
 }
 
 # Volume is shared, not owned.  HQPlayer holds the real level in dB and splits
@@ -2799,6 +2931,39 @@ sub _onStatus {
     # describe a track we have already moved on from.
     return if $stale;
 
+    # HQPLAYER PLAYING SOMETHING THAT IS NOT LMS'S - a local file from its own
+    # UI, another controller - while LMS is not playing. Simon's rule
+    # 2026-09-28: "I played directly from HQPlayer - this should never affect
+    # LMS." The PLAYING branch below read "LMS paused + HQPlayer playing" as a
+    # resume on HQPlayer's remote WHATEVER was playing (release behaviour since
+    # the follow was written), so LMS resumed its own track - and its stored
+    # volume went out with it. Now: once a push names a uri LMS never handed
+    # over, HQPlayer is DETACHED from LMS's transport until LMS next loads a
+    # track - no resume, no clock, no end-of-track, and stop() sends no <Stop/>.
+    # Only the volume (above) is still followed: HQPlayer is the master. The
+    # next play in LMS reloads LMS's track - see resume().
+    if (   !$self->hqForeign
+        && ( $self->hqWanted || '' ) ne 'play'
+        && ( $state == HQP_PLAYING || $state == HQP_PAUSED ) )
+    {
+        my $uri = $meta ? $meta->{uri} : undef;
+
+        if ( defined $uri && $uri ne '' && !$self->_isOurUri($uri) ) {
+            main::INFOLOG && $log->is_info && $log->info( $self->name
+                . ": HQPlayer is playing something LMS did not hand it ($uri) - not following" );
+
+            $self->hqForeign(1);
+            $self->hqStarted(0);
+            $self->hqPlayAck(0);
+            $self->hqNext(undef);
+            $self->hqArmNext(0);
+            $self->_cancelEndOfStream;
+            $self->_cancelStartDeadline;
+        }
+    }
+
+    return if $self->hqForeign;
+
     # Did HQPlayer advance into a track we handed it early?  This has to run
     # before the position below, because from this push on the position belongs
     # to the NEW track.
@@ -2886,6 +3051,42 @@ sub _onStatus {
         $self->SUPER::songElapsedSeconds( $rel > 0 ? $rel : 0 );
     }
 
+    # THE FIRST PUSH AFTER A LINK DROP - see linkDropped. LMS stopped at the
+    # drop, and HQPlayer's own state is not followed now: a settings change can
+    # leave it PLAYING (the link drops, the audio does not), a restart leaves it
+    # STOPPED with its queue cleared. Nothing below may read this push as a
+    # change made outside LMS.
+    #
+    # The one command sent is <Stop/>, and ONLY to an HQPlayer still playing a
+    # track LMS handed it (the uris linkDropped kept), so LMS's music does not
+    # play on under a stopped LMS. Anything else HQPlayer is playing - a local
+    # file from its own UI, another controller - is not LMS's, and is left
+    # alone. It goes out only now, on the link that has come back.
+    if ( my $ours = $self->hqReconcile ) {
+        $self->hqReconcile(0);
+
+        $self->hqStarted(0);
+        $self->hqPlayAck(0);
+        $self->hqNext(undef);
+        $self->hqArmNext(0);
+        $self->_cancelEndOfStream;
+
+        my $uri = $meta ? $meta->{uri} : undef;
+
+        if (   $state == HQP_PLAYING
+            && ( $self->hqWanted || '' ) ne 'play'
+            && defined $uri
+            && ref $ours eq 'ARRAY'
+            && grep { $_ eq $uri } @$ours )
+        {
+            main::INFOLOG && $log->is_info && $log->info( $self->name
+                . ': HQPlayer played on through the link drop - stopping it to match LMS' );
+            $self->_send('<Stop/>');
+        }
+
+        return;
+    }
+
     if ( $state == HQP_PLAYING ) {
 
         # Playing again, so any stop we were holding was a track boundary.
@@ -2968,6 +3169,32 @@ sub _onStatus {
 
         if ( $self->hqStarted && !$self->hqExpectStop ) {
 
+            # LMS IS PAUSED: A STOP NOW IS HQPLAYER'S OWN, NOT THE END OF LMS'S
+            # TRACK. Seen live 2026-09-28, twice, HQPlayer HUNG both times:
+            # LMS paused, a library item played from HQPlayer's own UI -
+            # HQPlayer reports STOPPED as it switches, with no uri to tell the
+            # bridge it is not LMS's (hqForeign needs one) - and this branch
+            # either followed it (controller->stop, whose stop() echoed a
+            # <Stop/>) or reported the end of the track (LMS loading its next
+            # one: Stop/PlaylistClear/PlaylistAdd/Play). Either way a command
+            # landed mid-switch, `no reply to <Stop> after 30s`. A paused LMS is
+            # not expecting its track to progress, so: follow nothing, send
+            # nothing, detach as for HQPlayer's own playback (hqForeign) - LMS
+            # stays paused and its next play reloads LMS's track.
+            if ( ( $self->hqWanted || '' ) eq 'pause' ) {
+                main::INFOLOG && $log->is_info && $log->info( $self->name
+                    . ': HQPlayer stopped while LMS is paused - not following, LMS stays paused' );
+
+                $self->hqForeign(1);
+                $self->hqStarted(0);
+                $self->hqPlayAck(0);
+                $self->hqNext(undef);
+                $self->hqArmNext(0);
+                $self->_cancelEndOfStream;
+
+                return;
+            }
+
             # START-UP NOISE, NOT THE END.  HQPlayer reports PLAYING as soon as
             # it accepts the stream and can then drop back to STOPPED for a
             # moment while the first bytes arrive - measured at 0.33s live on a
@@ -2995,9 +3222,16 @@ sub _onStatus {
             #
             # The bridge's OWN stops never reach here - `hqExpectStop` covers
             # those - so this is a stop nothing on our side asked for. Follow it
-            # the way the PAUSED branch follows an outside pause: say what we
-            # now want FIRST, so the controller calling back into stop() does
-            # not bounce, then let LMS stop. The playlist is left intact.
+            # the way the PAUSED branch follows an outside pause, then let LMS
+            # stop. The playlist is left intact.
+            #
+            # AND DO NOT ECHO IT. stop() never read hqWanted, so setting it
+            # first did NOT stop the bounce, whatever this comment used to
+            # claim: controller->stop -> stop() sent <Stop/> to an HQPlayer
+            # that had already stopped - harmless alone, fatal if the listener
+            # is already starting something else at HQPlayer (see the paused
+            # case above). HQPlayer is detached (hqForeign) first, which is
+            # what stop() checks; LMS's next play is a fresh load either way.
             #
             # AND IT IS TESTED FIRST, ahead of the held-track branch below.
             # A stop made at HQPlayer's own UI can land with a tier 4 track
@@ -3017,6 +3251,7 @@ sub _onStatus {
                 $self->hqStarted( 0 );
                 $self->hqNext( undef );
                 $self->hqArmNext( 0 );
+                $self->hqForeign(1);
 
                 $controller->stop;
 

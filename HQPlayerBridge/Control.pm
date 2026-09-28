@@ -197,10 +197,8 @@ sub up        { ( $_[0]->{sock} || $_[0]->{connecting} ) ? 1 : 0 }
 #   $opts->{scope} groups commands which may be cancelled before they reach
 #        the wire; the player uses 'track' for generation-bound load work.
 #
-# RETURNS 1 if the command was accepted onto the queue, 0 if it was refused -
-# an unverified verb, or a link that is down. No caller reads it today (the
-# volume hold that did was reverted to the release behaviour, 2026-09-27):
-# every caller is driven by its $cb, which is failed either way.
+# Returns nothing: every caller is driven by its $cb, which is failed on a
+# refusal as well as on a drop.
 # ---------------------------------------------------------------------------
 sub send {
     my ($self, $cmd, $cb, $opts) = @_;
@@ -211,7 +209,7 @@ sub send {
     if ( !$verb || !$KNOWN{$verb} ) {
         $log->error("refusing to send unverified command (would drop the link): $cmd");
         $cb->(undef, undef) if $cb;
-        return 0;
+        return;
     }
 
     # THE LINK IS DOWN: fail the command, and do NOT connect. A reconnect is
@@ -231,7 +229,7 @@ sub send {
     if ( !$self->{sock} && !$self->{connecting} ) {
         main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: link down, not sending <$verb>");
         Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_failLater, $cb ) if $cb;
-        return 0;
+        return;
     }
 
     push @{ $self->{queue} }, {
@@ -244,7 +242,7 @@ sub send {
 
     $self->_pump;
 
-    return 1;
+    return;
 }
 
 sub _failLater {

@@ -277,6 +277,12 @@ sub _reply {
     # list is still being collected. Without it the caller's reconcile would
     # read "not in the list" as "gone" and tear down every OTHER instance's
     # player simply because it had not answered yet in this round.
+    #
+    # The caller UPDATES from it at once (an existing player's address change)
+    # but CREATES no player from it: one reply cannot say the name is unique,
+    # and a same-named pair's first box took the plain id and was torn down at
+    # the round end (Plugin::_idsFor, review 2026-09-28 finding 3). A new
+    # HQPlayer therefore appears at the round end, at most LISTEN_TIME later.
     main::INFOLOG && $log->is_info && $log->info("discovery: found '$name' at $ip");
 
     $onChange->( instances(), 1 ) if $onChange;

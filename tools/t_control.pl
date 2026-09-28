@@ -436,6 +436,44 @@ print "-- up(): will send() accept a command? --\n";
     Slim::Utils::Timers::_reset();
 }
 
+print "-- send() answers through its callback only --\n";
+{
+    # Nothing reads a return value; every caller is driven by $cb. A value here
+    # would invite a caller to trust "queued" as "delivered" again.
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    my @down = $e->send('<Stop/>');
+    is(scalar @down, 0, 'a down link: send() returns nothing');
+    my @bad = $e->send('<NoSuchVerb/>');
+    is(scalar @bad, 0, 'a refused verb: send() returns nothing');
+    $e->{sock} = 'pending';
+    { no warnings 'redefine'; local *Plugins::HQPlayerBridge::Control::_pump = sub {};
+      my @up = $e->send('<Stop/>');
+      is(scalar @up, 0, 'a queued command: send() returns nothing'); }
+    is(scalar @{ $e->{queue} }, '1', 'CONTROL: that command WAS queued');
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- the timer stub keys undef as LMS does --\n";
+{
+    # LMS turns an undef object into '' (Timers.pm, 8.0-9.1): one key, not a
+    # wildcard. A stub that killed every timer for the sub let a test pass
+    # that LMS would fail.
+    Slim::Utils::Timers::_reset();
+    my $cb  = sub {};
+    my $obj = bless {}, 'TimerObj';
+    Slim::Utils::Timers::setTimer( undef, 1, $cb );
+    Slim::Utils::Timers::setTimer( $obj,  1, $cb );
+    Slim::Utils::Timers::killTimers( undef, $cb );
+    is(Slim::Utils::Timers::_pending(), '1', 'killTimers(undef) leaves the timer set WITH an object');
+    Slim::Utils::Timers::killTimers( $obj, $cb );
+    is(Slim::Utils::Timers::_pending(), '0', 'CONTROL: killing by the object removes it');
+    my @got;
+    Slim::Utils::Timers::setTimer( undef, 1, sub { push @got, $_[0] } );
+    Slim::Utils::Timers::_fireAll();
+    is($got[0] // 'undef', '', "an undef-object timer is called back with '', as LMS does");
+    Slim::Utils::Timers::_reset();
+}
+
 print "-- the link keeps itself alive: no discovery in the loop --\n";
 {
     # reconnectNow is GONE (2026-09-27). Discovery used to poke a down link

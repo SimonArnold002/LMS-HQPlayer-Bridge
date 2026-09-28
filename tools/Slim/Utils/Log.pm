@@ -2,7 +2,9 @@ package Slim::Utils::Log;
 use strict; use warnings;
 use Exporter 'import';
 our @EXPORT = qw(logger);
-sub addLogCategory { return __PACKAGE__->_l }
+# Records each category as LMS would register it, so a suite can assert on it.
+our %CATEGORY;
+sub addLogCategory { my ( undef, $a ) = @_; $CATEGORY{ $a->{category} } = {%$a} if ref $a; return __PACKAGE__->_l }
 sub logger { return __PACKAGE__->_l }
 sub _l { my $o = bless {}, 'Slim::Utils::Log::Obj'; return $o }
 package Slim::Utils::Log::Obj;
