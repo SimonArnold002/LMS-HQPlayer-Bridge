@@ -902,14 +902,14 @@ print "-- the default mode, and OFF IS OFF --\n";
     my $default = Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
     is( $default, 1, 'the default is ON - a new install or an update from main finds HQPlayer as before (Simon, 2026-09-27)' );
     $prefs->set( autodiscover => undef );
-    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), $default, 'never set means AUTO_DEFAULT' );
+    is( Plugins::HQPlayerBridge::Addresses::autoDiscover(), $default, 'never set means AUTO_DEFAULT' );
     $prefs->set( autodiscover => 1 );
-    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 1, 'an explicit 1 is on' );
+    is( Plugins::HQPlayerBridge::Addresses::autoDiscover(), 1, 'an explicit 1 is on' );
     $prefs->set( addresses => '10.0.0.1' );
     $prefs->set( autodiscover => 0 );
-    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 0, 'an explicit 0 with an address is off' );
+    is( Plugins::HQPlayerBridge::Addresses::autoDiscover(), 0, 'an explicit 0 with an address is off' );
     $prefs->set( addresses => '' );
-    is( Plugins::HQPlayerBridge::Plugin::_autoDiscover(), 0,
+    is( Plugins::HQPlayerBridge::Addresses::autoDiscover(), 0,
         'and with an EMPTY box STILL off (Simon: no player without an IP added) - it never falls back to discovering' );
     my $src = do { local ( @ARGV, $/ ) = ('Plugins/HQPlayerBridge/Plugin.pm'); <> };
     ok( scalar( $src =~ /\$prefs->init\(\s*\{[^}]*autodiscover\s*=>\s*Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT\(\)/ ),
@@ -927,6 +927,21 @@ print "-- the default mode, and OFF IS OFF --\n";
     }
     is( join( '; ', @writes ) || 'none', 'none',
         'nothing in the plugin writes autodiscover or addresses - only the settings page saves them, so an update keeps a user\'s mode and list' );
+
+    # ONE READING OF THE STORED MODE (review 2026-09-28, finding 5): it was
+    # written out four times - Plugin::_autoDiscover, Settings::handler and
+    # twice in beforeRender - so a change to how an odd stored value reads had
+    # to be made in four places, or the plugin, the save and the page would
+    # disagree about the mode. Every reader now asks Addresses::autoDiscover.
+    my @reads;
+    for my $f ( map { "Plugins/HQPlayerBridge/$_.pm" } qw(Plugin Addresses Discovery Control Player Live Stream Settings) ) {
+        my $code = do { local ( @ARGV, $/ ) = ($f); <> } // next;
+        $code =~ s/^\s*#.*$//mg;
+        my $n = () = $code =~ /->get\(\s*['"]autodiscover['"]/g;
+        push @reads, "$f: $n" if $n;
+    }
+    is( join( '; ', @reads ), 'Plugins/HQPlayerBridge/Addresses.pm: 1',
+        'the stored mode is read in ONE place, Addresses::autoDiscover' );
     my ($init) = $src =~ /(\$prefs->init\([^;]*\);)/s;
     is( scalar( () = $src =~ /\$prefs->init\(/g ), 1, 'and init is called ONCE - one place a default can come from' );
     ok( scalar( ( $init // '' ) !~ /\bset\b/ ), 'CONTROL: that one init is an init, not a set' );
@@ -1144,9 +1159,10 @@ with_rig( { '10.5.0.20' => 'Twin', '10.5.0.21' => 'Twin' }, sub {
 
 # A TYPED ADDRESS IS ITS NAME AND ITS ADDRESS (Simon, 2026-09-27, review
 # finding 2). The DHCP-move collapse (_liveOf) must never run across typed
-# addresses: with the first one DOWN its round stamp ages, and a second
-# same-named HQPlayer switched on used to take the first one's player - its
-# id, prefs and playlist - for as long as the first stayed down.
+# addresses: with the first one DOWN, a second same-named HQPlayer switched on
+# used to take the first one's player - its id, prefs and playlist - for as
+# long as the first stayed down. The `configured` guard in _idsFor is the rule
+# (typed entries carry no round stamp since 2026-09-28).
 print "-- a typed address that is DOWN never loses its player to a same-named one --\n";
 {
     my %who = ( '10.5.0.30' => 'Twin2' );
@@ -1208,6 +1224,15 @@ print "-- one connected test: Player::connected, nowhere else --\n";
     $src =~ s/^\s*#.*$//mg;
     my @copies = $src =~ /(->proven\b)/g;
     is(scalar @copies, 0, 'Plugin.pm has no copy of the connected test of its own');
+
+    # ...and asks it about a BRIDGE in one place, _linkUp (review 2026-09-28,
+    # finding 6): _linkStateAt, _heldAddresses and the removal pass each
+    # inlined `$b->{client} && $b->{client}->connected`, and the settings
+    # page's held list and the save must never disagree about "up".
+    my @inline = $src =~ /(\{client\}->connected)/g;
+    is(scalar @inline, 1, 'a bridge\'s link is tested in ONE place (_linkUp), not inlined');
+    my @users = $src =~ /(_linkUp\()/g;
+    is(scalar @users, 3, 'and _linkStateAt, _heldAddresses and the removal pass all call it');
 }
 
 print "-- reconcile: a partial list must never remove a player --\n";

@@ -52,14 +52,19 @@ if [ $SYSTEM = 1 ] && [ "$(id -u)" != 0 ]; then echo "--system needs sudo" >&2; 
 # the helper, tapped Restart, and got a refusal with nothing to tell them why.
 # It is asked for here instead.
 # ---------------------------------------------------------------------------
-# Reading and writing that key is done by the helper itself (`--allow`), not
-# reimplemented here: one rule, one validator. It refuses a host name -
-# `allow` is matched against the address a request arrives from - and never
-# rewrites a config that does not parse, because the token lives in that file.
+# Reading and writing that key is done by the helper itself, not reimplemented
+# here: one rule, one validator. WRITING goes through `--allow`, which refuses
+# a host name - `allow` is matched against the address a request arrives from -
+# and never rewrites a config that does not parse, because the token lives in
+# that file. READING goes through `--get`, like read_key below: the helper's own
+# Config and `_coerce`, so what is shown is what the running helper admits. It
+# read through `--allow` once, whose raw read has no coercion - a hand-edited
+# string `"allow": "192.168.1.234"`, which the helper accepts as one entry,
+# read as "not set" and the closing lines said the Restart row would be refused.
 # Its errors are silenced here only because a config that does not parse has
 # already been refused by the check below, before this is first called.
 read_allow() {
-  "$PY" "$SRC" --allow "$1" 2>/dev/null || true
+  "$PY" "$SRC" --get "$1" allow 2>/dev/null || true
 }
 
 write_allow() {

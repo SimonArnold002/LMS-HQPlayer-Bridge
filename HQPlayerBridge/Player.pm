@@ -1666,9 +1666,20 @@ sub _queueTrack {
 
             return if $self->_superseded( $gen, 'PlaylistAdd' );
 
+            # NO REPLY IS NOT A REFUSAL.  HQPlayer refusing the track answers
+            # result="Error", so $raw is set.  $raw undef means nothing answered:
+            # Control::_dropLink failed the command because the link went (a
+            # restart, a config save, a connect in flight that then failed, a
+            # reply timeout).  _queueTrack's `up` test cannot see that coming -
+            # `up` is true while a reconnect is connecting - so the same missing
+            # link is met here, and it is a stop, not a skip.
+            if ( !$res && !defined $raw ) {
+                $self->_loadFailed( 'no reply to PlaylistAdd - control link lost', 1 );
+                return;
+            }
+
             if ( !$res ) {
-                $log->error( $self->name . ': HQPlayer would not accept the track URI: '
-                    . ( defined $raw ? $raw : 'no reply' ) );
+                $log->error( $self->name . ": HQPlayer would not accept the track URI: $raw" );
                 $self->_loadFailed('PlaylistAdd refused');
                 return;
             }
@@ -1690,9 +1701,14 @@ sub _queueTrack {
             # whatever is playing now.
             return if $self->_superseded( $gen, 'Play' );
 
+            # No reply at all is the link, not the track - see PlaylistAdd above.
+            if ( !$r2 && !defined $raw2 ) {
+                $self->_loadFailed( 'no reply to Play - control link lost', 1 );
+                return;
+            }
+
             if ( !$r2 ) {
-                $log->error( $self->name . ': HQPlayer would not start the track: '
-                    . ( defined $raw2 ? $raw2 : 'no reply' ) );
+                $log->error( $self->name . ": HQPlayer would not start the track: $raw2" );
                 $self->_loadFailed('Play refused');
                 return;
             }
@@ -1830,7 +1846,9 @@ sub _startDeadline {
 # across all of them. A breaker wired to one site leaves the other three
 # stampeding, and against a wedged daemon they do not fail one at a time.
 #
-# $linkDown: the load never reached HQPlayer because there is no control link.
+# $linkDown: the load never reached HQPlayer because there is no control link -
+# either none at the start (_queueTrack) or it went with a PlaylistAdd or Play
+# still unanswered (their callbacks, $raw undef: nothing replied at all).
 # That is not a fact about the track, so skipping to the next one only meets the
 # same missing link - it trips at once instead. It is still counted and cleared
 # here, so the breaker's run stays the one record of failed loads.

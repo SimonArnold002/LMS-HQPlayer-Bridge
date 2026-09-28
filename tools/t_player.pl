@@ -1529,13 +1529,44 @@ print "-- a SYNCED player losing its link mid-load does not fail the group's tra
     ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$sc->{calls}}),
        'synced: the stranded load is retired by the stop, not reported against the group');
 
-    # CONTROL: a SOLO player is not made inactive, nothing retires the load,
-    # and its failure is still reported, once - unchanged
+    # A SOLO player is not made inactive, so nothing retires the load and the
+    # stranded PlaylistAdd reaches its callback with NO reply ($raw undef).
+    # That is the link, not the track: it used to be reported as `PlaylistAdd
+    # refused` - a skip - so a restart or config save mid-load moved the
+    # playlist one track on. It is the link-down stop now, as in _queueTrack.
     my ( $op, $oc ) = $mk->('02:99:88:77:66:62');
     $inflight = shift @sentCb;
+    Slim::Utils::Timers::_reset(); @ex = ();
     { local $linkUp = 0; $inflight->( undef, undef ); }
-    is(scalar( grep { $_ eq 'playerStreamingFailed' } @{$oc->{calls}} ), 1,
-       'CONTROL solo: the same drop is still reported as one failed load');
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$oc->{calls}}),
+       'solo: a PlaylistAdd stranded by a link drop is NOT handed to LMS as a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 1, 'solo: it stops the player, once');
+    is($op->hqFailRun, '0', 'and the run is cleared by that trip');
+
+    # The same for <Play/>: PlaylistAdd accepted, then the link goes.
+    my ( $yp, $yc ) = $mk->('02:99:88:77:66:63');
+    _answer(1);                                        # PlaylistAdd -> OK
+    my $playCb = $sentCb[0];                           # the <Play/> callback
+    ok(scalar( grep { $_ eq '<Play/>' } @sent ), 'Play was sent after the accepted PlaylistAdd');
+    Slim::Utils::Timers::_reset(); @ex = ();
+    { local $linkUp = 0; $playCb->( undef, undef ); }
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$yc->{calls}}),
+       'solo: a Play stranded by a link drop is NOT handed to LMS as a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 1, 'solo: it stops the player, once');
+
+    # CONTROL: HQPlayer ANSWERING Error is a refused track - still a skip.
+    # Without this the no-reply branch could swallow every failure and pass.
+    my ( $rp, $rc ) = $mk->('02:99:88:77:66:64');
+    Slim::Utils::Timers::_reset(); @ex = ();
+    _answer(0);                                        # PlaylistAdd -> Error
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$rc->{calls}}),
+       'CONTROL: a PlaylistAdd HQPlayer answered with Error is still a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 0, 'CONTROL: and does not stop the player');
+
+    Slim::Utils::Timers::_reset(); @ex = ();
 }
 
 print "-- the start deadline: an ack that never becomes playback --\n";

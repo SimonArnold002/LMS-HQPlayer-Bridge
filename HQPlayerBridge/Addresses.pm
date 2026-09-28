@@ -20,27 +20,29 @@ package Plugins::HQPlayerBridge::Addresses;
 #     HQPlayer log.
 #
 # An address never expires: its player stays for as long as it is in the box.
-# A connected one is stamped live each round with no traffic at all - the link
-# is the proof of life. One whose link is down is left to that link, which
-# reconnects on its own ladder, and its stamp ages meanwhile. Stamps use the
-# discovery ROUND number, the plugin's one clock, which keeps running with
-# discovery off.
+# One whose link is down is left to that link, which reconnects on its own
+# ladder. Addresses are checked on the discovery ROUND clock, the plugin's one
+# clock, which keeps running with discovery off.
+#
+# NO ROUND OR lastSeen STAMP. Those exist for discovery's own entries - its TTL
+# and Plugin::_liveOf's DHCP-move collapse - and neither applies here.
 #
 # TWO TYPED ADDRESSES ANSWERING TO ONE NAME ARE TWO PLAYERS, always - each is
 # keyed by its name AND its address, down or not (Simon, 2026-09-27). The
 # DHCP-move collapse in Plugin::_idsFor skips any group holding a typed
-# address (`configured`); an aged stamp here never hands one typed address's
-# player to another.
+# address (`configured`), and that guard is the whole rule.
 
 use strict;
 use warnings;
 
 use Slim::Utils::Log;
+use Slim::Utils::Prefs;
 
 use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Discovery;
 
-my $log = logger('plugin.hqplayerbridge');
+my $log   = logger('plugin.hqplayerbridge');
+my $prefs = preferences('plugin.hqplayerbridge');
 
 # Automatic discovery when `autodiscover` has never been set - the ONE place
 # the default lives; Plugin.pm's prefs->init and the settings page both read it.
@@ -60,8 +62,24 @@ my $log = logger('plugin.hqplayerbridge');
 # list, whatever this constant says in a later release.
 use constant AUTO_DEFAULT => 1;
 
+# The STORED mode: is automatic discovery on? The ONE reading of the pref -
+# Plugin.pm and the settings page both ask this, so the plugin, the save and
+# the page cannot disagree about which mode is in use. Never set means
+# AUTO_DEFAULT. (What the settings page POSTS is a different question, read
+# from the radio in Settings::handler.)
+#
+# OFF IS OFF, WHATEVER THE BOX HOLDS (Simon, 2026-09-27: "It should not
+# discover or add any player without an IP added when in manual mode"). Off
+# with an empty box is a bridge with no players until an address is typed -
+# never discovery running on its own. (A first build refused that save, and
+# inline review 2 then kept discovery running for it; both REVERSED.)
+sub autoDiscover {
+    my $v = $prefs->get('autodiscover');
+    return defined $v ? ( $v ? 1 : 0 ) : AUTO_DEFAULT;
+}
+
 my @list;        # the box, parsed and normalised, in the user's order
-my %entry;       # ip => { ip, name, version, configured, round, lastSeen } once identified
+my %entry;       # ip => { ip, name, version, configured } once identified
 my %pending;     # ip => 1 while an identify is out
 my %failed;      # ip => 1 once a failure has been reported - one line per outage
 my %answered;    # ip => GetInfo's attributes, from the settings page's check - used once
@@ -107,10 +125,16 @@ sub parse {
 # inet_aton would read a leading zero as OCTAL (010 = 8), and the table is
 # keyed by the string discovery reports, so both reasons say normalise here.
 # Refused: anything else, 0.x.x.x, and multicast/broadcast (224 and up).
+#
+# ASCII DIGITS ONLY (/a). LMS hands a form field over DECODED (HTTP.pm's
+# utf8decode), and a bare \d matches any Unicode digit - full-width from a CJK
+# input method, Arabic-Indic - which `+ 0` then misreads: "192.168.1.１０"
+# became 192.168.1.0 and "192.168.1.1０" 192.168.1.1, an address never typed.
+# The page's JS `norm` is ASCII-only already; keep the two in step.
 sub normalise {
     my $t = shift;
 
-    return undef unless defined $t && $t =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+    return undef unless defined $t && $t =~ /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/a;
 
     my @o = map { $_ + 0 } ( $1, $2, $3, $4 );
 
@@ -198,12 +222,13 @@ sub answered {
 }
 
 # ---------------------------------------------------------------------------
-# Once a round (Discovery's onRound). $state->($ip) says whether a player
+# Once a round (Discovery's onRound), and at once after a settings save
+# (Plugin::_applySettings). $state->($ip) says whether a player
 # already holds that address: ( 'up' | 'down', its HQPlayer's name ), or an
 # empty list for no player.
 # ---------------------------------------------------------------------------
 sub verify {
-    my ( $round, $state ) = @_;
+    my ($state) = @_;
 
     for my $ip (@list) {
         my ( $s, $name ) = $state ? $state->($ip) : ();
@@ -226,16 +251,7 @@ sub verify {
                 name       => defined $name && length $name ? $name : 'HQPlayer',
                 version    => '',
                 configured => 1,
-                lastSeen   => time(),
-                round      => 0,       # stamped below if its link is up
             };
-        }
-
-        # Up: stamped live, with no traffic. Down: left to its own link, which
-        # reconnects on its own ladder, and its stamp ages meanwhile.
-        if ( $s eq 'up' ) {
-            $entry{$ip}->{round}    = $round;
-            $entry{$ip}->{lastSeen} = time();
         }
     }
 
@@ -288,8 +304,6 @@ sub _identified {
         name       => $name,
         version    => $version,
         configured => 1,
-        lastSeen   => time(),
-        round      => Plugins::HQPlayerBridge::Discovery::round(),
     };
 
     main::INFOLOG && $log->is_info && ( !$old || $old->{name} ne $name )

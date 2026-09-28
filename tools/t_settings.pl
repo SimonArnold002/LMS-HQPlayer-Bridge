@@ -278,11 +278,11 @@ print "-- the page's answer is the save's answer: ONE connection a new address -
     # What the save's apply does next turn (Plugin::_applySettings).
     @ASKED = ();
     $A->can('set')->( ['10.0.0.7'] );
-    $A->can('verify')->( 1, sub { () } );
+    $A->can('verify')->( sub { () } );
     is( scalar @ASKED, 0, 'the apply keys it from the page\'s answer - it does not ask the same HQPlayer again' );
     is( ( $A->can('entry')->('10.0.0.7') || {} )->{name}, 'Lounge', 'under the name the page was given' );
 
-    $A->can('verify')->( 2, sub { () } );
+    $A->can('verify')->( sub { () } );
     is( scalar @ASKED, 1, 'used ONCE: with still no player at a later round, it is asked over TCP as before' );
 
     # A refused save hands nothing on, not even the address that answered.
@@ -293,7 +293,7 @@ print "-- the page's answer is the save's answer: ONE connection a new address -
     is( $SAVED, 0, 'CONTROL: one dead address refuses the save' );
     @ASKED = ();
     $A->can('set')->( ['10.0.0.7'] );
-    $A->can('verify')->( 1, sub { () } );
+    $A->can('verify')->( sub { () } );
     is( scalar @ASKED, 1, 'and its live neighbour\'s answer was not kept - a later save asks it itself' );
 
     # An answer for an address that did not end up in the box is dropped.
@@ -301,14 +301,21 @@ print "-- the page's answer is the save's answer: ONE connection a new address -
     $A->can('answered')->( '10.0.0.9', { name => 'Gone' } );
     $A->can('set')->( ['10.0.0.1'] );
     $A->can('set')->( [ '10.0.0.1', '10.0.0.9' ] );
-    $A->can('verify')->( 1, sub { () } );
+    $A->can('verify')->( sub { () } );
     ok( scalar( grep { $_ eq '10.0.0.9' } @ASKED ), 'an answer set() saw left out of the box is dropped, not kept for later' );
 }
 
 print "-- a bad entry is NAMED and NOTHING is saved --\n";
+# Non-ASCII digits arrive as CHARACTERS - LMS decodes every form value
+# (Slim::Web::HTTP, utf8decode) - so they are written that way here. A bare
+# \d took them as digits and `+ 0` misread them (review 2026-09-28, finding 7).
+binmode STDOUT, ':encoding(UTF-8)';
 for my $case ( [ 'hqplayer.local', 'a host name' ], [ '192.168.1', 'a short address' ],
                [ '192.168.1.300', 'an octet over 255' ], [ 'fe80::1', 'an IPv6 address' ],
-               [ '239.192.0.199', 'the multicast group' ] ) {
+               [ '239.192.0.199', 'the multicast group' ],
+               [ "192.168.1.\x{FF11}\x{FF10}", 'full-width digits (a CJK input method)' ],
+               [ "192.168.1.1\x{FF10}",        'one full-width digit (was read as .1)' ],
+               [ "192.168.1.\x{0661}\x{0660}", 'Arabic-Indic digits' ] ) {
     my ( $bad, $what ) = @$case;
     reset_store();
     my ( $p ) = post( mode => 0, addresses => "10.0.0.5, $bad" );

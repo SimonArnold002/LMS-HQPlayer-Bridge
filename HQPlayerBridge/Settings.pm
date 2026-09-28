@@ -83,8 +83,7 @@ sub handler {
 
         # What is SAVED now, to say what this save changed - and, below, which
         # addresses it adds and so must check.
-        my $stored  = $prefs->get('autodiscover');
-        my $wasAuto = defined $stored ? ( $stored ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
+        my $wasAuto = Plugins::HQPlayerBridge::Addresses::autoDiscover();
 
         # The box IN USE. Coming from automatic there is none: whatever the
         # pref holds was not in use, so each mode starts fresh and every
@@ -267,6 +266,9 @@ sub _deadline { $_[1]->() }
 sub beforeRender {
     my ( $class, $params ) = @_;
 
+    # The mode SAVED now - read once, for both the page's radio and hqp_saved.
+    my $wasAuto = Plugins::HQPlayerBridge::Addresses::autoDiscover();
+
     if ( $params->{hqp_error} ) {
         # Only an addresses-only save is ever refused - an automatic one has
         # no addresses to check - so a refused page is always addresses-only.
@@ -274,10 +276,8 @@ sub beforeRender {
         $params->{hqp_auto}      = 0;
     }
     else {
-        my $auto = $prefs->get('autodiscover');
         $params->{hqp_addresses} = $prefs->get('addresses') // '';
-        $params->{hqp_auto}      = defined $auto ? ( $auto ? 1 : 0 )
-                                 : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
+        $params->{hqp_auto}      = $wasAuto;
     }
 
     # The addresses already SAVED - what handler() compares against to decide
@@ -285,8 +285,6 @@ sub beforeRender {
     # line uses the same list, so it appears exactly when the save will check.
     # Stored automatic means NONE, exactly as handler() reads it: the pref is
     # not in use there, so a switch starts fresh (a refused switch included).
-    my $stored = $prefs->get('autodiscover');
-    my $wasAuto = defined $stored ? ( $stored ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
     $params->{hqp_saved} = $wasAuto ? '' : $prefs->get('addresses') // '';
 
     # And the addresses a CONNECTED player already holds: handler() names

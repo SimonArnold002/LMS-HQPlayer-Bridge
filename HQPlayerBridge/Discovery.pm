@@ -155,7 +155,8 @@ sub instances {
 sub _socket { $sock }    # for the tests
 
 # The round being collected now. An instance whose `round` equals it answered
-# THIS round.
+# THIS round. For the tests: nothing outside this file reads it since the typed
+# addresses stopped carrying a round stamp (2026-09-28).
 sub round { $roundNo }
 
 # A control link has just gone down: look now rather than at the next round,
@@ -186,8 +187,8 @@ sub _round {
 
     $collecting = 1;
 
-    # The typed addresses are checked on the same clock, so a reply from one
-    # and a reply from discovery carry comparable round numbers.
+    # The typed addresses are checked on the same clock (Addresses::verify),
+    # which is why it runs with discovery off.
     if ($onRound) {
         eval { $onRound->($roundNo); 1 }
             or $log->error("discovery: round hook failed: $@");

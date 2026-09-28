@@ -980,13 +980,14 @@ fns = src[src.index('read_allow() {'):src.index('OS="$(uname -s)"')]
 blk = src[src.index('CURRENT="$(read_allow "$CONF")"'):]
 blk = blk[:blk.index('\nfi\n') + 4]
 
-def reinstall(allow):
+def reinstall(allow, seed='{"token": "keepme", "allow": ["192.168.1.234"]}'):
     c = os.path.join(tmp, 'reinstall.json')
-    open(c, 'w').write('{"token": "keepme", "allow": ["192.168.1.234"]}')
+    open(c, 'w').write(seed)
     sh = os.path.join(tmp, 'reinstall.sh')
-    open(sh, 'w').write('set -e\nPY=python3\nSRC=%s\nCONF=%s\nUNINSTALL=0\nALLOW_GIVEN=1\nALLOW=%s\n%s%s\n'
+    open(sh, 'w').write('set -e\nPY=python3\nSRC=%s\nCONF=%s\nUNINSTALL=0\nALLOW_GIVEN=%d\nALLOW=%s\n%s%s\n'
                         'echo "REACHED THE START, current=[$CURRENT]"\n'
-                        % (os.path.join(_here, 'hqrestart', 'hqrestart.py'), c, allow, fns, blk))
+                        % (os.path.join(_here, 'hqrestart', 'hqrestart.py'), c,
+                           1 if allow else 0, allow or "''", fns, blk))
     pr = REAL_POPEN(['sh', sh], stdin=hq.subprocess.DEVNULL, stdout=hq.subprocess.PIPE,
                     stderr=hq.subprocess.STDOUT, universal_newlines=True)
     out, _ = pr.communicate(timeout=60)
@@ -1006,6 +1007,24 @@ ok(conf.get('allow') == ['192.168.1.234'] and conf.get('token') == 'keepme',
 # CONTROL: a good address on the same path is still written.
 rc, out, conf = reinstall('10.0.0.7')
 ok(rc == 0 and conf.get('allow') == ['10.0.0.7'], 'a good address is still written')
+
+# read_allow READS THROUGH THE HELPER'S OWN CONFIG (`--get`), not `--allow`'s raw
+# read. A hand-edited STRING `allow` is one entry to the helper (`_coerce`), so
+# it admits that address - and the installer used to show it as "not set".
+rc, out, conf = reinstall(None, '{"token": "keepme", "allow": "192.168.1.234"}')
+ok(rc == 0 and 'current=[192.168.1.234]' in out,
+   'a string `allow` reads as the address the helper admits, not as unset (%r)' % out[-60:])
+ok(conf.get('allow') == '192.168.1.234', 'and reading it rewrites nothing')
+
+# CONTROL: the ordinary list form, and no config at all (a first install).
+rc, out, conf = reinstall(None)
+ok('current=[192.168.1.234]' in out, 'CONTROL: a list `allow` reads as before')
+os.remove(os.path.join(tmp, 'reinstall.json'))
+sh = os.path.join(tmp, 'reinstall.sh')
+pr = REAL_POPEN(['sh', sh], stdin=hq.subprocess.DEVNULL, stdout=hq.subprocess.PIPE,
+                stderr=hq.subprocess.STDOUT, universal_newlines=True)
+out, _ = pr.communicate(timeout=60)
+ok(pr.returncode == 0 and 'current=[]' in out, 'CONTROL: no config yet reads as unset, rc 0')
 
 print('\n%d passed, %d failed' % (P, F))
 sys.exit(1 if F else 0)

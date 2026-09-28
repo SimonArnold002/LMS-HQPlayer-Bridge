@@ -170,22 +170,9 @@ sub _rawBox {
     return $ok;
 }
 
-# Never set means Addresses::AUTO_DEFAULT. The settings page always stores an
-# explicit 0 or 1 (the mode radio, Settings::handler).
-#
-# OFF IS OFF, WHATEVER THE BOX HOLDS (Simon, 2026-09-27: "It should not
-# discover or add any player without an IP added when in manual mode"). Off
-# with an empty box is a bridge with no players until an address is typed -
-# never discovery running on its own. (A first build refused that save, and
-# inline review 2 then kept discovery running for it; both REVERSED.)
-sub _autoDiscover {
-    my $v = $prefs->get('autodiscover');
-    return defined $v ? ( $v ? 1 : 0 ) : Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT();
-}
-
 # The addresses in use: the box with discovery off, none with it on.
 sub _boxAddresses {
-    return _autoDiscover() ? [] : _rawBox();
+    return Plugins::HQPlayerBridge::Addresses::autoDiscover() ? [] : _rawBox();
 }
 
 # The round clock always runs: with automatic discovery off it opens no socket
@@ -195,16 +182,24 @@ sub _startDiscovery {
     Plugins::HQPlayerBridge::Discovery->start(
         sub { _onInstances( _table(), $_[1] ) },
         onRound => \&_onRound,
-        udp     => _autoDiscover(),
+        udp     => Plugins::HQPlayerBridge::Addresses::autoDiscover(),
     );
 
     return;
 }
 
 sub _onRound {
-    my $round = shift;
-    Plugins::HQPlayerBridge::Addresses::verify( $round, \&_linkStateAt );
+    Plugins::HQPlayerBridge::Addresses::verify( \&_linkStateAt );
     return;
+}
+
+# Is this bridge's control link UP? Player::connected - the proven link, the
+# answer Material shows. THE ONE TEST: _linkStateAt, _heldAddresses and the
+# removal pass in _onInstances all ask it, so the settings page, the save and
+# the player list cannot disagree about what "connected" means.
+sub _linkUp {
+    my $b = shift;
+    return $b->{client} && $b->{client}->connected ? 1 : 0;
 }
 
 # Does a player already hold this address? ( 'up' | 'down', its HQPlayer's
@@ -217,18 +212,18 @@ sub _linkStateAt {
     for my $b ( values %bridges ) {
         my $inst = $b->{instance} or next;
         next unless ( $inst->{ip} // '' ) eq $ip;
-        return ( $b->{client} && $b->{client}->connected ? 'up' : 'down', $inst->{name} );
+        return ( _linkUp($b) ? 'up' : 'down', $inst->{name} );
     }
 
     return;
 }
 
 # Every address a player holds over a PROVEN link - where _linkStateAt says
-# 'up'. The same test, so the page's line and the save cannot disagree.
+# 'up'. The same test (_linkUp), so the page's line and the save cannot
+# disagree.
 sub _heldAddresses {
     return map  { $_->{instance}->{ip} }
-           grep { $_->{instance} && defined $_->{instance}->{ip}
-                  && $_->{client} && $_->{client}->connected } values %bridges;
+           grep { $_->{instance} && defined $_->{instance}->{ip} && _linkUp($_) } values %bridges;
 }
 
 # THE ONE TABLE the players are reconciled against. With the two modes
@@ -269,7 +264,7 @@ sub _settingsChanged {
 # Within the typed mode, an address taken out of the box loses its player the
 # same way; typing it back brings the same player back.
 sub _applySettings {
-    my $auto = _autoDiscover();
+    my $auto = Plugins::HQPlayerBridge::Addresses::autoDiscover();
     my $box  = _boxAddresses();
 
     my $removed = Plugins::HQPlayerBridge::Addresses::set($box);
@@ -285,8 +280,7 @@ sub _applySettings {
     }
     else {
         # Anything newly typed is keyed now, not at the next round.
-        Plugins::HQPlayerBridge::Addresses::verify(
-            Plugins::HQPlayerBridge::Discovery::round(), \&_linkStateAt );
+        Plugins::HQPlayerBridge::Addresses::verify( \&_linkStateAt );
     }
 
     my %gone = map { $_ => 1 } @$removed;
@@ -1165,8 +1159,8 @@ sub _onInstances {
         # links, on one HQPlayer.
         my $b  = $bridges{$id};
         my $ip = ( $b->{instance} || {} )->{ip};
-        # Player::connected, the answer Material shows.
-        next if $b->{client} && $b->{client}->connected && !( defined $ip && $ids->{$ip} );
+        # Player::connected, the answer Material shows (_linkUp).
+        next if _linkUp($b) && !( defined $ip && $ids->{$ip} );
 
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
         _teardown($id);
@@ -1350,10 +1344,10 @@ sub _idsFor {
         #
         # AND NEVER ACROSS TYPED ADDRESSES (Simon, 2026-09-27): a typed address
         # is its name AND its address - the user put each one there, and none
-        # of them moves. A typed address that is DOWN keeps its old round
-        # stamp (Addresses::verify stamps only a live link), so collapsing here
-        # handed its player - prefs, playlist - to a second same-named HQPlayer
-        # switched on meanwhile, for as long as the first stayed down. Nothing
+        # of them moves. Collapsing here once handed a DOWN typed address's
+        # player - prefs, playlist - to a second same-named HQPlayer switched
+        # on meanwhile, for as long as the first stayed down. This guard is the
+        # whole rule: typed entries carry no round stamp at all. Nothing
         # HQPlayer sends can tell one machine from two (CLAUDE.md, `NO HQPLAYER
         # ID ON THE CONTROL API`), so the same HQPlayer typed at two addresses
         # is two players - accepted, unsupported.
