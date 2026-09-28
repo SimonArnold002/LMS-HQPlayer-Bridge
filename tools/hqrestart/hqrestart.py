@@ -31,7 +31,6 @@ Host, which is what the Host rule refuses.
 
 Run:
     python3 hqrestart.py [config.json]      serve (the installers set this up)
-    python3 hqrestart.py --allow CONFIG     print the `allow` list
     python3 hqrestart.py --allow CONFIG ADDRS
                                             validate and write it, keeping every
                                             other key; exits 1 naming a bad one.
@@ -924,15 +923,17 @@ def install_cmd(args):
     return './install.sh ' + args
 
 
-def set_allow(path, raw=None):
-    """Read or write the config's `allow` list, for the installers to call.
+def set_allow(path, raw):
+    """Write the config's `allow` list, for the installers to call.
 
     It lives here, not in install.sh, because it is ONE rule - an address the
     tokenless restart trusts - and two copies of a validator drift. The
     installer shells out to this.
 
-    `raw` None reads; otherwise it is a comma/space separated list of IP
-    addresses. Returns the list written. Raises ValueError, naming the offending
+    `raw` is a comma/space separated list of IP addresses. Returns the list
+    written. It never READS: `--get CONFIG allow` does, through Config, so the
+    list is coerced exactly as the running helper coerces it (a read here had
+    no coercion and printed a string `allow` as empty - review 2026-09-28). Raises ValueError, naming the offending
     address, rather than writing a file the helper would then have to correct at
     load: an installer can say which address was wrong while the user is still
     sitting there.
@@ -950,10 +951,6 @@ def set_allow(path, raw=None):
         if not isinstance(data, dict):
             data = {}
 
-    if raw is None:
-        got = data.get('allow') or []
-        return [str(a) for a in got] if isinstance(got, list) else []
-
     addrs = []
     for part in raw.replace(',', ' ').split():
         try:
@@ -963,13 +960,12 @@ def set_allow(path, raw=None):
         if part not in addrs:
             addrs.append(part)
 
-    # AN EMPTY WRITE IS REFUSED, NOT STORED.  main() tells a read from a write
-    # by argument count alone, so `--allow <config> ""` - a wrapper
+    # AN EMPTY WRITE IS REFUSED, NOT STORED.  `--allow <config> ""` - a wrapper
     # interpolating an unset variable, or a user copying the usage line -
     # arrived here as raw='' and stored `allow: []`, which silently disables
     # the tokenless Restart row and exits 0.  Every address GIVEN is validated;
-    # "no addresses at all" needed a rule of its own.  A read is raw=None and
-    # never reaches here, and install.sh's own `[ -n "$ALLOW" ]` guard is now
+    # "no addresses at all" needed a rule of its own.  install.sh's own
+    # `[ -n "$ALLOW" ]` guard is now
     # belt and braces rather than the only thing preventing it.
     if not addrs:
         raise ValueError('no IP addresses given - refusing to write an empty '
@@ -982,20 +978,21 @@ def set_allow(path, raw=None):
 
 
 def main():
-    # `--allow <config> [addresses]` is the installers' entry point, not a way
-    # to run the helper: it reads or writes one key and exits.
+    # `--allow <config> <addresses>` is the installers' entry point, not a way
+    # to run the helper: it writes one key and exits. It has no read mode -
+    # reading is `--get`, the one reader.
     #
     # Matched on the FLAG, not on the argument count. `--allow` with no config
     # path used to fall through to serve mode, where sys.argv[1] became the
     # config path: it wrote a file literally named `--allow`, minted a token
     # into it, and bound the port. Say what is missing instead.
     if len(sys.argv) > 1 and sys.argv[1] == '--allow':
-        if len(sys.argv) < 3:
-            sys.stderr.write('usage: %s --allow <config> [addresses]\n'
+        if len(sys.argv) < 4:
+            sys.stderr.write('usage: %s --allow <config> <addresses>\n'
                              % os.path.basename(sys.argv[0]))
             return 2
         try:
-            got = set_allow(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+            got = set_allow(sys.argv[2], sys.argv[3])
         except (ValueError, OSError) as e:
             sys.stderr.write('  %s\n' % e)
             return 1

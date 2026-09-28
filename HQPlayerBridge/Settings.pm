@@ -99,6 +99,12 @@ sub handler {
             return $class->SUPER::handler( $client, $params, $callback, @args );
         }
 
+        # The text AS TYPED, for a refused page to redraw - taken here, before
+        # the save below replaces pref_addresses with the parsed list (commas,
+        # no leading zeros, no duplicates). A refusal for a dead address comes
+        # after that; a refused page shows what was typed (`no leave as is`).
+        $params->{hqp_typed} = $params->{pref_addresses};
+
         my ( $ok, $bad ) = Plugins::HQPlayerBridge::Addresses::parse( $params->{pref_addresses} );
 
         # A bad entry is NAMED and nothing is saved - not the good ones
@@ -207,13 +213,12 @@ sub _savedLines {
 }
 
 # Draw the page with the reason, and SAVE NOTHING: with no saveSettings the
-# base class writes no pref. The box keeps what was typed so nothing has to be
-# typed again.
+# base class writes no pref. The box keeps what was typed (hqp_typed, taken in
+# handler before the parse) so nothing has to be typed again.
 sub _refuse {
     my ( $class, $client, $params, $callback, $args, $error ) = @_;
 
     $params->{hqp_error} = $error;
-    $params->{hqp_typed} = $params->{pref_addresses};
 
     delete $params->{saveSettings};
 

@@ -594,7 +594,7 @@ print "-- discovery: one socket, one multicast datagram a round, its own pace --
 
     Slim::Utils::Timers::_reset();
     my ( @rounds, @lists );
-    $D->start( sub { push @lists, $_[1] ? 'partial' : 'full' }, onRound => sub { push @rounds, $_[0] } );
+    $D->start( sub { push @lists, $_[1] ? 'partial' : 'full' }, onRound => sub { push @rounds, 1 } );
 
     is( scalar @sent, 1, 'a round sends ONE datagram' );
     is( @sent ? $dest->( $sent[0] ) : 'none', '239.192.0.199', 'to the multicast group' );
@@ -650,7 +650,7 @@ print "-- discovery OFF: no socket, no datagram, but the rounds still run --\n";
 
     Slim::Utils::Timers::_reset();
     my @rounds;
-    $D->start( sub { }, onRound => sub { push @rounds, $_[0] }, udp => 0 );
+    $D->start( sub { }, onRound => sub { push @rounds, 1 }, udp => 0 );
 
     is( $opens, 0, 'no socket is opened' );
     is( scalar @sent, 0, 'no datagram is sent' );

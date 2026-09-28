@@ -96,7 +96,7 @@ use constant IDLE_PERIOD   => 15;
 my $sock;          # the plugin's one UDP socket, while `udp` is on
 my %found;         # ip => { ip, name, version, lastSeen, round }
 my $onChange;      # caller's callback: ( \@instances, $partial )
-my $onRound;       # caller's hook, called as a round STARTS: ( $roundNo )
+my $onRound;       # caller's hook, called as a round STARTS, with no arguments
 my $running    = 0;
 my $udp        = 0;    # automatic discovery on: a socket and a probe a round
 my $collecting = 0;    # a round is listening - _roundDone is pending
@@ -190,7 +190,7 @@ sub _round {
     # The typed addresses are checked on the same clock (Addresses::verify),
     # which is why it runs with discovery off.
     if ($onRound) {
-        eval { $onRound->($roundNo); 1 }
+        eval { $onRound->(); 1 }
             or $log->error("discovery: round hook failed: $@");
     }
 

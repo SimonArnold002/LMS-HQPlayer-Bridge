@@ -192,6 +192,22 @@ print "-- addresses only: a NEW address is saved only if HQPlayer answers there 
 }
 
 {
+    # UNTIDY TEXT, REFUSED FOR A DEAD ADDRESS. The dead-address refusal comes
+    # AFTER the save has replaced pref_addresses with the parsed list, so the
+    # box came back tidied - not what was typed, unlike a bad-entry refusal
+    # (review 2026-09-28, finding 5). The tests above type tidy text, which
+    # reads the same either way.
+    reset_store();
+    %UP = ( '10.0.0.5' => 'Up' );
+    my $typed = "10.0.0.5\n010.0.0.6  10.0.0.6";
+    my ($p) = post( mode => 0, addresses => $typed );
+    answer_all();
+    is( $SAVED, 0, 'untidy text, one address dead: nothing is saved' );
+    ok( scalar( ( $p->{hqp_error} // '' ) =~ /nothing answered at 10\.0\.0\.6\b/ ), 'CONTROL: refused for the DEAD address, not a bad entry' );
+    is( $p->{hqp_addresses}, $typed, 'and the box shows the text AS TYPED, not the parsed list' );
+}
+
+{
     # Only what the save ADDS is checked: an address already in the box is
     # not re-asked, so one HQPlayer being off cannot block editing the list.
     reset_store();

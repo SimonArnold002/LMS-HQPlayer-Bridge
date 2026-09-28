@@ -39,7 +39,6 @@ use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 
 use Plugins::HQPlayerBridge::Control;
-use Plugins::HQPlayerBridge::Discovery;
 
 my $log   = logger('plugin.hqplayerbridge');
 my $prefs = preferences('plugin.hqplayerbridge');

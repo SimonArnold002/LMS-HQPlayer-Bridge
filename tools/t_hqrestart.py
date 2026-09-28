@@ -628,9 +628,14 @@ CONF = os.path.join(tmp, 'allow.json')
 
 # Every check is a CALLABLE, so a build without set_allow FAILS here rather
 # than killing the run - a control run that dies reports nothing at all.
-ok(lambda: hq.set_allow(CONF) == [], 'a config that does not exist yet reads as no addresses')
+# Read back through Config, the helper's own reader (what `--get` uses):
+# set_allow only writes.
+def allow_of(path):
+    return list(hq.Config(path, generate=False)['allow'])
+
+ok(lambda: allow_of(CONF) == [], 'a config that does not exist yet reads as no addresses')
 ok(lambda: hq.set_allow(CONF, '192.168.1.234') == ['192.168.1.234'], 'one address is written')
-ok(lambda: hq.set_allow(CONF) == ['192.168.1.234'], 'and reads back')
+ok(lambda: allow_of(CONF) == ['192.168.1.234'], 'and reads back')
 
 # The token is generated on the helper's FIRST START, which is after the
 # installer has written allow - so writing it must never lose the rest.
@@ -766,8 +771,18 @@ ok(set(os.listdir('.')) == _here_before, 'and nothing else is left behind either
 
 # CONTROL: the installers' real call still works, on the same code path.
 ok(run_main('--allow', CONF, '10.0.0.7')[0] == 0, 'CONTROL: --allow <config> <addr> still returns 0')
-ok(lambda: hq.set_allow(CONF) == ['10.0.0.7'], 'and still writes the address')
-ok(run_main('--allow', CONF)[0] == 0, 'CONTROL: --allow <config> still reads back')
+ok(lambda: allow_of(CONF) == ['10.0.0.7'], 'and still writes the address')
+
+# `--allow <config>` with NO addresses was a second reader of `allow` with no
+# coercion: a string `"allow": "192.168.1.234"`, which the helper admits as one
+# entry, printed as empty. The read mode is gone; reading is `--get`.
+json.dump({'token': 'keepme', 'allow': '192.168.1.234'}, open(CONF, 'w'))
+_before = open(CONF).read()
+_code, _usage = run_main('--allow', CONF)
+ok(_code == 2, '--allow <config> with no addresses is a usage error, not a read (%r)' % (_code,))
+ok('usage' in _usage.lower(), 'and says how to call it (%r)' % _usage.strip())
+ok(open(CONF).read() == _before, 'and the config is untouched')
+ok(allow_of(CONF) == ['192.168.1.234'], 'CONTROL: the one reader, Config, reads that string as its one entry')
 
 # ---------------------------------------------------------------------------
 # `--get`: install.sh's ONE reader of the config, through Config - so the file
