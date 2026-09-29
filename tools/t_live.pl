@@ -28,6 +28,7 @@ sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
     sub content_type { my $s=shift; $s->{ct}   = shift if @_; return $s->{ct} }
     sub header       { my ($s,$k,$v)=@_; $s->{headers}{lc $k} = $v if defined $v;
                        return $s->{headers}{lc $k} }
+    sub content_length { my $s=shift; $s->{len} = shift if @_; return $s->{len} }
     package FakeHttpClient;
     sub new { bless {}, shift }
     sub connected { 1 }
@@ -54,6 +55,19 @@ ok(scalar($res->content_type && $res->content_type =~ m{^text/html}),
 ok(scalar(($res->header('cache-control') || '') =~ /no-store/),
    'and no-store - a cached copy of a LIVE view is a lie');
 ok(defined $SENT && length $SENT, 'a body is sent');
+
+# THE SECOND HALF OF THE SAME TRAP. A raw handler owns its FRAMING as well as
+# its status code: LMS keeps the connection alive and adds no Content-Length of
+# its own, so without one the browser is never told where the body ends. The
+# page renders and its script runs, but the request never completes and the
+# spinner stays until LMS closes the socket 75s later. Measured live on the
+# installed build 2026-09-29: 53,691 bytes served, no Content-Length, curl
+# timing out; a templated LMS page on the same server sends one, and so does
+# LMS's own raw handler (Web/JSONRPC.pm:349). Found in the Eversolo plugin,
+# whose page was copied from this one.
+ok(defined $res->content_length, 'and a Content-Length, so the request can finish');
+is($res->content_length, defined $SENT ? length($SENT) : -1,
+   'counted on the OCTETS actually sent, after any encode');
 
 # The version is HANDED IN at init. A page module that reached into its own
 # Plugin.pm would die mid-handler and LMS would render the half-built page with

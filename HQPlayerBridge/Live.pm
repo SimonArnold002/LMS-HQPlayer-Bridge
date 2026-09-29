@@ -42,6 +42,8 @@ package Plugins::HQPlayerBridge::Live;
 use strict;
 use warnings;
 
+use Encode ();
+
 use Slim::Utils::Strings qw(cstring);
 use Slim::Web::Pages;
 use Slim::Web::HTTP;
@@ -73,7 +75,14 @@ sub _handler {
 
     return unless $httpClient && $httpClient->connected;
 
+    # OCTETS on the wire, because the Content-Type promises UTF-8 and the
+    # length below has to count what actually goes out.  Encoded only when the
+    # page holds CHARACTERS: cstring() labels that arrive as octets are already
+    # right, and encoding those twice would send mojibake.  strings.txt is all
+    # ASCII today, so this changes nothing yet - it is here so that the first
+    # translated label does not silently truncate the page at the byte count.
     my $body = _page();
+    $body = Encode::encode_utf8($body) if utf8::is_utf8($body);
 
     # The code, FIRST and explicitly - see the trap at the top of this file.
     $response->code(200);
@@ -84,6 +93,17 @@ sub _handler {
     # ruled out while diagnosing it.
     $response->header( 'Cache-Control' => 'no-cache, no-store, must-revalidate' );
     $response->header( Pragma          => 'no-cache' );
+
+    # A RAW HANDLER OWNS ITS FRAMING TOO, not just its status code.  LMS keeps
+    # the connection alive and adds no Content-Length of its own, so without
+    # this the browser is never told where the body ends: the page renders and
+    # its script runs, but the request never completes and the spinner stays
+    # until LMS closes the socket 75s later.  Measured live 2026-09-29 against
+    # the installed build - 53,691 bytes served, no Content-Length, curl timing
+    # out - while a templated LMS page on the same server sends one, and so
+    # does LMS's own raw handler (Web/JSONRPC.pm:349).  Found in
+    # LMS-Eversolo-Screen-Control, whose page was copied from this one.
+    $response->content_length( length $body );
 
     Slim::Web::HTTP::addHTTPResponse( $httpClient, $response, \$body );
 

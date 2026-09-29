@@ -28,6 +28,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 
 | symbol / subject | verdict | find it with |
 |---|---|---|
+| `/hqplive`, `Content-Length`, raw handler framing, hanging spinner | FIXED 2026-09-29 — a raw handler owns its FRAMING as well as its status code | `A RAW HANDLER OWNS ITS FRAMING` |
 | `volume`, `_onStatus`, echo guard, `_lmsToDb` round trip | SUPERSEDED — now compares in dB via `_volTol` | `_lmsToDb(_dbToLms($db)) == $db` |
 | `_followVolume`, endpoint re-register jumping the level | REVERSED — we follow it anyway | `An endpoint re-registering can jump the output` |
 | volume curve, taper, knee, sqrt | DECLINED — linear in dB, deliberately | `The volume curve should be tapered` |
@@ -165,6 +166,32 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
    of reporting it as live.
 2. **A comment is not the contract.** Where a comment claims an invariant the code does not
    enforce, the comment is the defect. Fix the prose and pin the behaviour in a suite.
+
+### A RAW HANDLER OWNS ITS FRAMING, not just its status code (FIXED 2026-09-29)
+
+`Live.pm::_handler` set `code(200)` and a content type but no `Content-Length`, and LMS adds
+none of its own while keeping the connection alive. So the browser was never told where the
+body ended: `/hqplive` rendered and its script ran, but the request never completed and the
+spinner stayed until LMS closed the socket 75s later.
+
+**Measured live against the installed build, not inferred.** `curl -D - http://plex:9000/hqplive`
+returned 200 with 53,691 bytes and no `Content-Length`, and timed out; a templated LMS page on
+the same server answered in 0.11s with `Content-Length: 80003`, and LMS's own raw handler
+`jsonrpc.js` with `Content-Length: 92`. LMS sets it in both of its raw handlers
+(`Web/JSONRPC.pm:349`, `Web/Cometd.pm:731`).
+
+This is the SECOND half of the trap this file already records for the status line — the one that
+shipped a literal `HTTP/1.1  ` for 13 versions. Same cause: a raw handler owns the whole
+response, and LMS fills in nothing.
+
+Found in `LMS-Eversolo-Screen-Control`, whose power page was copied from this one and had the
+same defect; both are fixed. The fix also **encodes the body to octets first**
+(`Encode::encode_utf8 if utf8::is_utf8`). `strings.txt` is all ASCII today so that changes
+nothing yet — it is there so the first translated label does not silently TRUNCATE the page at a
+character count, which would be worse than the hang.
+
+`t_live.pl` pins both: that a length is set, and that it equals the octet length actually sent.
+Anti-tested — removing the call fails exactly those two.
 
 ### HOW TO LOG A VERDICT so the next round finds it
 
