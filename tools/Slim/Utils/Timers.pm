@@ -6,8 +6,13 @@ use strict; use warnings;
 
 my @timers;   # { obj, when, cb, args }
 
+# LMS keys a timer on its object, and turns an undef object into '' - in
+# _makeTimer, killTimers and firePendingTimer alike (8.0-9.1). So undef is ONE
+# key, not a wildcard: killTimers(undef, $cb) kills only timers SET with undef,
+# and the callback gets '' back. Matched here, or a test passes that LMS fails.
 sub setTimer {
     my ( $obj, $when, $cb, @args ) = @_;
+    $obj = '' unless defined $obj;
     push @timers, { obj => $obj, when => $when, cb => $cb, args => \@args };
     return $cb;
 }
@@ -16,13 +21,15 @@ sub setHighTimer { goto &setTimer }
 
 sub killTimers {
     my ( $obj, $cb ) = @_;
+    return 0 unless $cb;                  # LMS: no sub, nothing killed
+    $obj = '' unless defined $obj;
     my $before = @timers;
-    @timers = grep {
-        !( ( !defined $obj || ( defined $_->{obj} && $_->{obj} == $obj ) )
-           && ( !defined $cb || $_->{cb} == $cb ) )
-    } @timers;
+    @timers = grep { !( $_->{cb} == $cb && _same( $_->{obj}, $obj ) ) } @timers;
     return $before - @timers;
 }
+
+# LMS compares the object as a hash key, i.e. by its stringified form.
+sub _same { return "$_[0]" eq "$_[1]" }
 
 # --- test helpers ----------------------------------------------------------
 sub _pending  { return scalar @timers }

@@ -10,9 +10,9 @@ package Plugins::HQPlayerBridge::Plugin;
 # audio at all: it hands HQPlayer a URL pointing back at LMS's own HTTP
 # server and lets HQPlayer fetch the bytes directly.
 #
-# No configuration.  Instances are found by multicast, and there is no settings
-# page at all - nothing here is configurable, so the only surfaces are the Apps
-# feed and the live view (Live.pm).
+# Instances are found by multicast, or from addresses typed into the settings
+# page (Settings.pm), which is also where automatic discovery can be switched
+# off. The other surfaces are the Apps feed and the live view (Live.pm).
 
 use strict;
 use warnings;
@@ -32,13 +32,18 @@ use Socket qw(pack_sockaddr_in INADDR_LOOPBACK);
 
 use Slim::Utils::Log;
 use Slim::Utils::PluginManager;
+use Slim::Utils::Prefs;
+use Slim::Utils::Timers;
+use Time::HiRes ();
 use Slim::Control::Request;
+use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Player::Source;
 
 use Plugins::HQPlayerBridge::Live;
 use Slim::Display::NoDisplay;
 use Slim::Utils::Strings qw(cstring);
 
+use Plugins::HQPlayerBridge::Addresses;
 use Plugins::HQPlayerBridge::Control;
 use Plugins::HQPlayerBridge::Discovery;
 use Plugins::HQPlayerBridge::Player;
@@ -62,12 +67,27 @@ sub version {
 
 my $log = Slim::Utils::Log->addLogCategory({
     'category'     => 'plugin.hqplayerbridge',
-    'defaultLevel' => 'INFO',
+    'defaultLevel' => 'WARN',
     'description'  => 'PLUGIN_HQPLAYER_BRIDGE',
 });
 
+# The settings page's two prefs. The default mode is Addresses::AUTO_DEFAULT.
+my $prefs = preferences('plugin.hqplayerbridge');
+$prefs->init( { addresses => '', autodiscover => Plugins::HQPlayerBridge::Addresses::AUTO_DEFAULT() } );
+
 # id => { instance => {...}, control => $ctl, client => $client }
 my %bridges;
+my %splitWarned;  # name => the addresses last reported as a same-named pair
+
+# ip => 1 once that host's restart helper answered; never shrinks in a run.
+# See _probeRestart.
+my %restartable;
+my %probedAt;       # ip => when it was last asked - the REPROBE_AFTER throttle
+
+# The Restart rows, in the order they first appeared: bridge ids, APPEND-ONLY
+# for the server run, plus the name each was last seen under. See topLevel.
+my @restartRows;
+my %restartName;
 
 sub getDisplayName { 'PLUGIN_HQPLAYER_BRIDGE' }
 
@@ -106,7 +126,192 @@ sub initPlugin {
     Slim::Control::Request::addDispatch(
         [ 'hqplayerbridge', 'signalpath' ], [ 0, 1, 0, \&_signalPathQuery ] );
 
-    Plugins::HQPlayerBridge::Discovery->start( \&_onInstances, \&_linkUpFor );
+    # A disconnected player can now be FORGOTTEN from LMS - `client forget`
+    # refuses a connected one, and these used to read connected for ever. When
+    # that happens the bridge lets go too, or its control link would go on
+    # reconnecting a player LMS no longer has. NO UI in LMS or Material sends
+    # it to this player (Slimproto's timer is for SlimProto clients, and the
+    # on-device menu needs a display) - only a third-party app or a hand-typed
+    # command. If the instance still answers discovery, or its address is in
+    # the settings, the next round (15s at most) makes a FRESH player: unlike a
+    # Lyrion player, which returns only when it reconnects, this one returns
+    # when discovery answers.
+    Slim::Control::Request::subscribe( \&_onForget, [ ['client'], ['forget'] ] );
+
+    if (main::WEBUI) {
+        require Plugins::HQPlayerBridge::Settings;
+        Plugins::HQPlayerBridge::Settings->new;
+    }
+
+    # A saved settings page - or a `pref` command - takes effect AT ONCE: a
+    # removed address loses its player now, not at the next round.
+    $prefs->setChange( \&_settingsChanged, qw(addresses autodiscover) );
+
+    # A typed address answering for the first time is announced straight
+    # away, as a new discovery reply is. Additive only - see _onInstances.
+    # _linkStateAt also tells the settings page which addresses are already
+    # connected, so its check opens no second link to them; _heldAddresses
+    # lists them all, so the page's "checking" line leaves them out too.
+    Plugins::HQPlayerBridge::Addresses::init( sub { _onInstances( _table(), 1 ) }, \&_linkStateAt, \&_heldAddresses );
+    Plugins::HQPlayerBridge::Addresses::set( _boxAddresses() );
+
+    _startDiscovery();
+
+    return;
+}
+
+# TWO MODES, NEVER BOTH (Simon, 2026-09-27: "only allow manual ip addresses
+# when auto is turned off ... we should not be having both active at same
+# time"). Automatic discovery ON: the box is empty and ignored. OFF: the box is
+# the whole list and no UDP is sent. Switching cleans out the other mode's
+# players - see _applySettings.
+sub _rawBox {
+    my ($ok) = Plugins::HQPlayerBridge::Addresses::parse( $prefs->get('addresses') );
+    return $ok;
+}
+
+# The addresses in use: the box with discovery off, none with it on.
+sub _boxAddresses {
+    return Plugins::HQPlayerBridge::Addresses::autoDiscover() ? [] : _rawBox();
+}
+
+# The round clock always runs: with automatic discovery off it opens no socket
+# and sends nothing, but its rounds are still when the typed addresses are
+# checked.
+sub _startDiscovery {
+    Plugins::HQPlayerBridge::Discovery->start(
+        sub { _onInstances( _table(), $_[1] ) },
+        onRound => \&_onRound,
+        udp     => Plugins::HQPlayerBridge::Addresses::autoDiscover(),
+    );
+
+    return;
+}
+
+sub _onRound {
+    Plugins::HQPlayerBridge::Addresses::verify( \&_linkStateAt );
+    return;
+}
+
+# Is this bridge's control link UP? Player::connected - the proven link, the
+# answer Material shows. THE ONE TEST: _linkStateAt, _heldAddresses and the
+# removal pass in _onInstances all ask it, so the settings page, the save and
+# the player list cannot disagree about what "connected" means.
+sub _linkUp {
+    my $b = shift;
+    return $b->{client} && $b->{client}->connected ? 1 : 0;
+}
+
+# Does a player already hold this address? ( 'up' | 'down', its HQPlayer's
+# name ), or an empty list for no player. `up` is the proven link - the answer
+# Material shows. The name lets a typed address that a player already holds
+# be keyed without opening a second control connection to it.
+sub _linkStateAt {
+    my $ip = shift;
+
+    for my $b ( values %bridges ) {
+        my $inst = $b->{instance} or next;
+        next unless ( $inst->{ip} // '' ) eq $ip;
+        return ( _linkUp($b) ? 'up' : 'down', $inst->{name} );
+    }
+
+    return;
+}
+
+# Every address a player holds over a PROVEN link - where _linkStateAt says
+# 'up'. The same test (_linkUp), so the page's line and the save cannot
+# disagree.
+sub _heldAddresses {
+    return map  { $_->{instance}->{ip} }
+           grep { $_->{instance} && defined $_->{instance}->{ip} && _linkUp($_) } values %bridges;
+}
+
+# THE ONE TABLE the players are reconciled against. With the two modes
+# exclusive, it is discovery's list OR the typed addresses, never a mix - but
+# it is keyed by address either way, so a transition can never make one
+# HQPlayer two rows.
+sub _table {
+    my %t = map { $_->{ip} => { %$_ } } @{ Plugins::HQPlayerBridge::Discovery::instances() };
+
+    for my $ip ( @{ Plugins::HQPlayerBridge::Addresses::list() } ) {
+        my $e = Plugins::HQPlayerBridge::Addresses::entry($ip) or next;
+        $t{$ip} ||= { %$e };
+    }
+
+    return [ map { $t{$_} } sort keys %t ];
+}
+
+# LMS fires the change handler once PER PREF, in the middle of a save, so the
+# first call would see a half-saved page - the switch flipped but the box not
+# yet written, or the other way round. Applied one event-loop turn later
+# instead, once, when both are stored.
+sub _settingsChanged {
+    Slim::Utils::Timers::killTimers( undef, \&_applySettings );
+    Slim::Utils::Timers::setTimer( undef, Time::HiRes::time(), \&_applySettings );
+    return;
+}
+
+# The settings were saved (or a `pref` command changed one).
+#
+# SWITCHING CLEANS OUT THE OTHER MODE, at once and connected or not (Simon,
+# 2026-09-27: "when its turned off clean the records"):
+#   - discovery OFF: every player whose address is not in the box goes, and
+#     discovery's table is dropped (Discovery->stop);
+#   - discovery ON: the box is cleared (by the settings page) and every typed
+#     player goes. Discovery finds again whatever it can reach, under the same
+#     id - a player is keyed by HQPlayer's name - so its prefs and playlist
+#     come back with it.
+# Within the typed mode, an address taken out of the box loses its player the
+# same way; typing it back brings the same player back.
+sub _applySettings {
+    my $auto = Plugins::HQPlayerBridge::Addresses::autoDiscover();
+    my $box  = _boxAddresses();
+
+    my $removed = Plugins::HQPlayerBridge::Addresses::set($box);
+
+    if ( $auto != Plugins::HQPlayerBridge::Discovery::listening() ) {
+        main::INFOLOG && $log->is_info && $log->info(
+            'automatic discovery ' . ( $auto ? 'on' : 'off - no UDP at all, only the addresses in the settings' ) );
+
+        # Restarting the clock runs a round at once, which keys every address
+        # in the box: from the player that already holds it, or over TCP.
+        Plugins::HQPlayerBridge::Discovery->stop;
+        _startDiscovery();
+    }
+    else {
+        # Anything newly typed is keyed now, not at the next round.
+        Plugins::HQPlayerBridge::Addresses::verify( \&_linkStateAt );
+    }
+
+    my %gone = map { $_ => 1 } @$removed;
+    my %box  = map { $_ => 1 } @$box;
+
+    for my $id ( keys %bridges ) {
+        my $ip = ( $bridges{$id}->{instance} || {} )->{ip};
+
+        next unless defined $ip;
+        next if $auto ? !$gone{$ip} : $box{$ip};
+
+        $log->info( ( $bridges{$id}->{name} || $id ) . ": $ip is not in use in the settings any more, removing player" );
+        _teardown($id);
+    }
+
+    return;
+}
+
+sub _onForget {
+    my $request = shift;
+
+    # THE ID, NOT ->client: the notification is delivered from the queue
+    # AFTER clientForgetCommand has run forgetClient, which deletes the client
+    # from %clientHash - and Request::client is a getClient() lookup, so it is
+    # always undef here.
+    my $id = $request->clientid or return;
+
+    return unless $bridges{$id};
+
+    main::INFOLOG && $log->is_info && $log->info("$bridges{$id}->{name}: forgotten in LMS, dropping its link");
+    _teardown($id);
 
     return;
 }
@@ -180,7 +385,10 @@ sub postinitPlugin {
 }
 
 sub shutdownPlugin {
+    Slim::Control::Request::unsubscribe( \&_onForget );
     Plugins::HQPlayerBridge::Discovery->stop;
+    Plugins::HQPlayerBridge::Addresses::reset();
+    %splitWarned = ();
 
     for my $id ( keys %bridges ) {
         _teardown($id);
@@ -211,13 +419,15 @@ sub bridges { return \%bridges }
 # when tapped - `text` avoids that entirely.
 # ---------------------------------------------------------------------------
 use constant ICON => 'plugins/HQPlayerBridge/html/images/HQPlayerBridgeIcon.png';
+use constant SETTINGS_PATH => '/plugins/HQPlayerBridge/settings/basic.html';
 
 sub topLevel {
     my ( $client, $callback, $args ) = @_;
 
-    # THE ONE ACTION, AND THERE IS NO SETTINGS PAGE BEHIND IT ANY MORE. Nothing
-    # in this plugin is configurable, so a settings page was only ever a place
-    # to read numbers from - and it could not keep them current.
+    # THE LIVE VIEW FIRST. The live reading is not a settings page: the one
+    # that existed until 0.2.62 was only a place to read numbers from, and it
+    # could not keep them current. (The settings page that came back on
+    # 2026-09-27 holds only the typed addresses and the discovery switch.)
     #
     # A BROWSE LIST CANNOT REFRESH ITSELF IN MATERIAL, and that is settled from
     # Material's own source, not inferred: every `refreshList` trigger in
@@ -236,10 +446,51 @@ sub topLevel {
         image   => ICON,
     } );
 
+    # THE SETTINGS PAGE, second and ALWAYS present: a fixed row above the
+    # Restart block, so it never moves one of those positional rows within a
+    # run. A relative weblink opens in Material's own iframe dialog.
+    push @items, {
+        name    => cstring( $client, 'PLUGIN_HQPLAYER_SETTINGS' ),
+        type    => 'link',
+        weblink => SETTINGS_PATH,
+    } if main::WEBUI;
+
+    # THE RESTART ROWS: ONE BLOCK, RIGHT UNDER THE LIVE VIEW, APPEND-ONLY.
+    #
+    # An item_id is a row POSITION, and a tap is resolved by walking the feed
+    # again from here - both taps of the confirm-then-restart pair. Inside each
+    # instance's block, a row moved whenever an EARLIER instance left
+    # discovery, and a tap on B's "Restart ... now" then restarted C (simulated
+    # 2026-09-21: the page read "Restart HQPlayer B now" and C was restarted).
+    #
+    # So these rows live in one block above everything that can move, and the
+    # block only ever APPENDS: a host that becomes restartable is added at the
+    # end, and a bridge that goes away KEEPS its row (tapping it says so). No
+    # actionable row can change position within a run; what shifts below it is
+    # text, which does nothing when tapped.
+    for my $id ( sort keys %bridges ) {
+        my $b = $bridges{$id} or next;
+        next unless $restartable{ ( $b->{instance} || {} )->{ip} // '' };
+        push @restartRows, $id unless exists $restartName{$id};
+        $restartName{$id} = $b->{name};
+    }
+    push @items, map { {
+        name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART', $restartName{$_} ),
+        type        => 'link',
+        url         => \&_restartConfirm,
+        passthrough => [ { id => $_ } ],
+    } } @restartRows;
+
     for my $id ( sort keys %bridges ) {
         my $b = $bridges{$id} or next;
 
         push @items, { name => $b->{name}, type => 'text' };
+
+        # A host missed at link-up is asked again when the list is drawn, or
+        # the row stays hidden until the link next drops - days on a healthy
+        # host. hqplayerd and the helper start at login in no fixed order, so
+        # the miss is ordinary. Throttled; the row shows on the NEXT open.
+        _probeRestart( ( $b->{instance} || {} )->{ip} );
 
         my $p = signalPathFor( $client, $b );
 
@@ -267,16 +518,27 @@ sub topLevel {
         }
     }
 
-    # NOTHING DISCOVERED YET SAYS SO, rather than showing a bare link and
-    # leaving the user to wonder whether the plugin is working. The wording
-    # matches the live page's - waiting, not failed - because that is what it
-    # is: discovery keeps probing, and an instance that is simply switched off
-    # will appear on its own. The second row is the diagnostic, for the case
-    # where it never does.
+    # WHAT IT IS STILL WAITING FOR SAYS SO, rather than leaving the user to
+    # wonder whether the plugin is working: waitingText, the SAME words the
+    # live page shows, true to the mode - and with typed addresses, even when
+    # other players are connected. Last, so it can never move a positional
+    # row above it. With no player at all, the diagnostic follows, matching
+    # what is actually running (with discovery off no probe was sent at all);
+    # with no address typed the waiting row already says what to do.
+    #
+    # This feed is a snapshot: Material never re-renders a browse list on its
+    # own. The live page is the surface that follows the state as it changes.
+    my $wait = waitingText($client);
+
+    push @items, { name => $wait, type => 'text' } if length $wait;
+
     if ( !keys %bridges ) {
-        push @items,
-            { name => cstring( $client, 'PLUGIN_HQPLAYER_LIVE_WAITING' ), type => 'text' },
-            { name => cstring( $client, 'PLUGIN_HQPLAYER_NONE_DESC' ),    type => 'text' };
+        my $auto = Plugins::HQPlayerBridge::Discovery::listening();
+
+        push @items, {
+            name => cstring( $client, $auto ? 'PLUGIN_HQPLAYER_NONE_DESC' : 'PLUGIN_HQPLAYER_NONE_DESC_OFF' ),
+            type => 'text',
+        } if $auto || @{ Plugins::HQPlayerBridge::Addresses::list() };
     }
 
     $callback->( { items => \@items } );
@@ -284,12 +546,149 @@ sub topLevel {
     return;
 }
 
+# ---------------------------------------------------------------------------
+# RESTARTING HQPLAYER, through the hqrestart helper (tools/hqrestart/).
+#
+# WHY: a power-cycled NAA endpoint is often not used again until hqplayerd
+# restarts, and nothing on HQPlayer's side can do that remotely. The control
+# API has no restart verb, `:8088/restart` is a no-op (measured 2026-09-21),
+# and the web UI's Refresh devices drops the saved SDM mode to PCM - a restart
+# reloads it. So a small webhook runs on the HQPlayer host and does it.
+#
+# NO CONFIGURATION, which is still true of this plugin: the helper listens on
+# a fixed port of the host discovery already found, `/ping` needs no token, and
+# the restart is authorised on the helper's side by this server's address
+# (its `allow` list). No helper answering means no row - the ordinary case.
+#
+# THE RESTART IS A JSON POST, NEVER A GET: the helper only waives the token for
+# that. LMS's own image proxy will GET any URL a client hands it, from THIS
+# server's address - so a GET-able restart was reachable from any web page on
+# the LAN (measured 2026-09-21 against `/status`).
+#
+# MANUAL ONLY. The bridge never restarts HQPlayer by itself - auto-recovery of
+# the NAA was DECLINED 2026-09-21 ("This is for Eversolo to fix").
+# ---------------------------------------------------------------------------
+use constant RESTART_PORT  => 8090;
+use constant REPROBE_AFTER => 60;    # seconds between asks of one still-unknown host
+
+sub restartable { return \%restartable }
+sub probedAt    { return \%probedAt }       # for the tests
+sub restartRows  { return \@restartRows }    # for the tests
+sub restartNames { return \%restartName }
+
+sub _restartUrl { return 'http://' . $_[0] . ':' . RESTART_PORT . $_[1] }
+
+# JSON::PP is loaded at CALL TIME, not with a top-level `use`: it is core Perl
+# but not shipped by LMS, and a BEGIN failure on a platform that lacks it would
+# take the WHOLE plugin down over the one optional row that reads a reply. A
+# miss here costs the Restart row and nothing else.
+sub _decode {
+    my $body = shift;
+    my $r = eval { require JSON::PP; JSON::PP::decode_json( $body // '' ) };
+    return ref $r eq 'HASH' ? $r : {};
+}
+
+# The clock, as a sub so the tests can move it; `time` is a builtin that a
+# glob assignment cannot reach.
+sub _now { return time() }
+
+# At every link-up and whenever the Apps list is drawn, while the host is still
+# unknown - at most once per REPROBE_AFTER either way. A link-up is throttled
+# too: the link retries a refusing instance every 10s (Control::BACKOFF_MAX),
+# and an unthrottled probe was a 3s GET to a dead :8090 every ~10s for ever on
+# a host with no helper. A host already known is never asked again.
+sub _probeRestart {
+    my $ip = shift;
+    return unless $ip;
+    return if $restartable{$ip};
+    return if _now() - ( $probedAt{$ip} || 0 ) < REPROBE_AFTER;
+    $probedAt{$ip} = _now();
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $r = _decode( eval { $_[0]->content } );
+            return unless ( $r->{service} // '' ) eq 'hqrestart';
+
+            $restartable{$ip} = 1;
+            main::INFOLOG && $log->is_info && $log->info("restart helper found on $ip");
+        },
+        sub { },    # nothing listening: no helper installed, the normal case
+        { timeout => 3 },
+    )->get( _restartUrl( $ip, '/ping' ) );
+
+    return;
+}
+
+# The first tap only asks: a restart stops playback, and a browse row is easy
+# to hit by accident.
+#
+# Both taps are resolved by POSITION from topLevel, which is why the rows that
+# open this sit in an append-only block that never moves (see topLevel). A
+# bridge gone by then gets text at the same position, so nothing to tap.
+sub _restartConfirm {
+    my ( $client, $callback, $args, $pt ) = @_;
+
+    my $b = $bridges{ ( $pt || {} )->{id} // '' };
+    return $callback->( { items => [
+        { name => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_GONE' ), type => 'text' },
+    ] } ) unless $b;
+
+    $callback->( { items => [
+        {
+            name        => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_NOW', $b->{name} ),
+            type        => 'link',
+            url         => \&_restartNow,
+            passthrough => [ $pt ],
+        },
+        { name => cstring( $client, 'PLUGIN_HQPLAYER_RESTART_DESC' ), type => 'text' },
+    ] } );
+
+    return;
+}
+
+# Answers when HQPlayer is back (the helper waits for the new process, ~7s on
+# a Mac), so the page that opens is the outcome. The helper bounds the whole
+# restart at 90s (`total_timeout`); this waits longer, or a slow service stop
+# would read as a failure that then succeeds. The control link drops and
+# comes back on its own backoff - nothing here touches it.
+sub _restartNow {
+    my ( $client, $callback, $args, $pt ) = @_;
+
+    my $say = sub { $callback->( { items => [ { name => shift, type => 'text' } ] } ) };
+
+    my $b  = $bridges{ ( $pt || {} )->{id} // '' };
+    my $ip = $b && ( $b->{instance} || {} )->{ip};
+    return $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_GONE' ) ) unless $ip;
+
+    main::INFOLOG && $log->is_info && $log->info("asking the helper on $ip to restart HQPlayer");
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $r = _decode( eval { $_[0]->content } );
+            return $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_OK', $r->{seconds} // '?' ) )
+                if $r->{ok};
+            $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_FAIL', $r->{error} // '?' ) );
+        },
+        sub {
+            # A 401 / 409 / 500 lands HERE, with the helper's reason in the body.
+            my ( undef, $error, $res ) = @_;
+            my $r = _decode( eval { $res->content } );
+            $log->warn( "restart on $ip failed: " . ( $r->{error} || $error || '?' ) );
+            $say->( cstring( $client, 'PLUGIN_HQPLAYER_RESTART_FAIL', $r->{error} || $error || '?' ) );
+        },
+        { timeout => 120 },
+    )->post( _restartUrl( $ip, '/restart' ), 'Content-Type' => 'application/json', '{}' );
+
+    return;
+}
+
 # audio/x-flac -> FLAC.  HQPlayer reports the source container as a MIME type;
 # the bare subtype is what a listener recognises.
 #
-# It lives HERE, not in Settings.pm, because BOTH surfaces need it and
-# Settings.pm is only required under main::WEBUI - calling it from the feed
-# would die on a headless build.
+# It lives HERE because BOTH surfaces reach it through signalPathFor - the
+# Apps feed and the live view's query - and neither is loaded only under
+# main::WEBUI.  (It moved out of the old Settings.pm, which was WEBUI-only,
+# for that reason; that page went in 0.2.60-0.2.76.)
 sub _shortMime {
     my $mime = shift or return undef;
 
@@ -297,6 +696,39 @@ sub _shortMime {
     $mime =~ s{^x-}{}i;
 
     return uc $mime;
+}
+
+# WHAT THE BRIDGE IS STILL WAITING FOR - true to the mode, and ONE answer for
+# the Apps feed and the live page (whose poll carries it as `waiting`), so the
+# two never disagree. '' when it is waiting for nothing: the poll sends that
+# too, so the live page drops a line that no longer holds.
+#
+#   automatically, no player       looking on the network
+#   automatically, players         '' - there is no list of HQPlayers to expect
+#   addresses only, none typed     nothing to wait for: enter one in Settings
+#   addresses only                 every typed address with NO player yet, named
+#                                  - even while others are connected (review 6:
+#                                  one off at an LMS restart was shown nowhere)
+sub waitingText {
+    my $client = shift;
+
+    if ( Plugins::HQPlayerBridge::Discovery::listening() ) {
+        return keys %bridges ? '' : cstring( $client, 'PLUGIN_HQPLAYER_WAIT_AUTO' );
+    }
+
+    my $list = Plugins::HQPlayerBridge::Addresses::list();
+
+    return cstring( $client, 'PLUGIN_HQPLAYER_NONE_DESC_EMPTY' ) if !@$list;
+
+    # In LIST context: _linkStateAt answers ( state, name ) or nothing, and
+    # in scalar context a player with no name would read as no player.
+    my @waiting = grep { my @at = _linkStateAt($_); !@at } @$list;
+
+    return '' if !@waiting;
+
+    ( my $text = cstring( $client, 'PLUGIN_HQPLAYER_WAIT_ADDR' ) ) =~ s/%s/join( ', ', @waiting )/e;
+
+    return $text;
 }
 
 # ---------------------------------------------------------------------------
@@ -338,7 +770,7 @@ sub _signalPathQuery {
         $request->addResultLoop( 'bridges_loop', $i, 'playerid', $b->{client}->id )
             if $b->{client};
 
-        for my $k (qw( connected source output filter shaper speed tier )) {
+        for my $k (qw( connected up source output filter shaper speed tier )) {
             $request->addResultLoop( 'bridges_loop', $i, $k, $p->{$k} ) if defined $p->{$k};
         }
 
@@ -347,7 +779,7 @@ sub _signalPathQuery {
         my $np = nowPlayingFor( $b->{client} );
 
         for my $k (qw( title artist album artwork state position duration
-                       volume muted volctl )) {
+                       volume muted volctl extid )) {
             $request->addResultLoop( 'bridges_loop', $i, "np_$k", $np->{$k} )
                 if defined $np->{$k};
         }
@@ -356,6 +788,7 @@ sub _signalPathQuery {
     }
 
     $request->addResult( 'count', $i );
+    $request->addResult( 'waiting', waitingText($client) );
     $request->setStatusDone();
 
     return;
@@ -380,10 +813,17 @@ sub signalPathFor {
 
     my %out;
 
+    # Player::connected - the answer Material shows - and nothing else, so no
+    # surface can disagree with it.
+    my $up = $c->connected ? 1 : 0;
+
     $out{connected} = cstring( $client,
-        ( $b->{control} && $b->{control}->connected )
-            ? 'PLUGIN_HQPLAYER_CONNECTED' : 'PLUGIN_HQPLAYER_DISCONNECTED' )
+        $up ? 'PLUGIN_HQPLAYER_CONNECTED' : 'PLUGIN_HQPLAYER_DISCONNECTED' )
         . ' - ' . ( $b->{instance}->{ip} || '?' ) . ':4321';
+
+    # The same fact as a FLAG, for a reader that must not parse the display
+    # string: the live page used to test for a '-', which both strings contain.
+    $out{up} = $up;
 
     # SOURCE is off the <metadata/> child; OUTPUT off the <Status/> root. See
     # _onStatus in Player.pm for why they are different elements.
@@ -534,6 +974,11 @@ sub nowPlayingFor {
             if defined $cover && $cover ne '' && $cover !~ /^-/;
     }
 
+    # THE SERVICE BADGE'S KEY, FROM THE URL - see _extid. Absent for a local
+    # file, a plain radio stream, or any service Material has no emblem for.
+    my $extid = _extid( $t->{url} // $rm->{url} );
+    $np{extid} = $extid if defined $extid;
+
     # NOTHING PLAYING DROPS THE TRACK, NOT THE PLAYER.
     #
     # These keys are absent rather than blank, so the page draws no artwork, no
@@ -544,10 +989,78 @@ sub nowPlayingFor {
     # what the transport and volume controls need in order to still work when
     # the queue is stopped. Returning an empty hash here would have left the
     # page with a mute button and no idea whether it was muted.
-    delete @np{ qw( title artist album artwork duration position ) }
+    delete @np{ qw( title artist album artwork duration position extid ) }
         unless length $np{title};
 
     return \%np;
+}
+
+# ---------------------------------------------------------------------------
+# THE SERVICE BADGE, IN THE SHAPE THE OTHER PLUGINS SEND IT.
+#
+# LMS-Listen-to-Later and LMS-Pitchfork-Reviews put a service logo on a row by
+# setting `extid`: Material reads the part before the first ':' and looks it up
+# in its own misc/emblems.json. That route is NOT open to this plugin - those
+# are XMLBrowser rows that MATERIAL renders, and the live page renders itself
+# (see Live.pm) - so the key travels in the same `extid` shape and the page
+# draws the badge from it. Sending the same shape is the point: the page can
+# then do exactly what Material does with it, and a service Material learns
+# about needs no change here beyond a line in the table.
+#
+# THE KEY COMES FROM THE URL, BECAUSE A STATUS RESULT HAS NO `extid` FOR THE
+# PLAYING TRACK. Measured on the rig, not assumed: `status` with `tags:x` adds
+# nothing, and a Qobuz track answers `url => 'qobuz://449954371.flac'` and
+# nothing else that names the service. Material has the same problem and
+# solves it the same way (getTrackSource), so the prefixes below are ITS
+# track-sources.json keys mapped to ITS emblems.json keys - they are not
+# always the same word (sounds: -> bbc), and an invented one draws nothing.
+my %EMBLEM = (
+    'qobuz:'         => 'qobuz',
+    'tidal:'         => 'tidal',
+    'wimp:'          => 'wimp',
+    'spotify:'       => 'spotify',
+    'spoton:'        => 'spoton',
+    'deezer:'        => 'deezer',
+    'bandcamp:'      => 'bandcamp',
+    'youtube:'       => 'youtube',
+    'ytm:'           => 'ytm',
+    'pandora:'       => 'pandora',
+    'pyrrha:'        => 'pyrrha',
+    'radioparadise:' => 'radioparadise',
+    'ibcst:'         => 'ibcst',
+    'sounds:'        => 'bbc',
+);
+
+# MATERIAL'S SECOND TIER: A SUBSTRING, NOT A PREFIX. Its `getTrackSource` tries
+# the prefixes above and then an `includes` table, because these two services
+# are also reachable as an ORDINARY http(s) stream - a Radio Paradise FLAC
+# favourite is `https://stream.radioparadise.com/flacm`, which no prefix
+# matches. Without this tier Material badges such a track and this page did
+# not, which is exactly the divergence the prefix table exists to avoid.
+# `.planetradio.co.uk` is Material's third entry and is deliberately absent:
+# it carries no `extid`, so Material draws no badge for it either.
+my %EMBLEM_IN = (
+    '.radioparadise.com/' => 'radioparadise',
+    '.bandcamp.com'       => 'bandcamp',
+);
+
+sub _extid {
+    my $url = shift;
+
+    return undef unless defined $url && length $url;
+
+    my $lc = lc $url;
+
+    for my $pfx ( keys %EMBLEM ) {
+        return $EMBLEM{$pfx} . ':' if index( $lc, $pfx ) == 0;
+    }
+
+    # ONLY AFTER the prefixes, which is Material's own order.
+    for my $frag ( keys %EMBLEM_IN ) {
+        return $EMBLEM_IN{$frag} . ':' if index( $lc, $frag ) >= 0;
+    }
+
+    return undef;
 }
 
 sub _fmtFormat {
@@ -565,21 +1078,6 @@ sub _fmtFormat {
 # ---------------------------------------------------------------------------
 # Reconcile the discovered instance list against the players we have made
 # ---------------------------------------------------------------------------
-# Discovery asks this before it decides how hard to keep probing: an instance
-# whose control link is up needs no finding.  An instance that has been
-# discovered but has no bridge yet is deliberately NOT settled - the player is
-# still being built.
-sub _linkUpFor {
-    my $ip = shift or return 0;
-
-    for my $b ( values %bridges ) {
-        next unless $b->{instance} && ( $b->{instance}->{ip} || '' ) eq $ip;
-        return $b->{control} && $b->{control}->connected ? 1 : 0;
-    }
-
-    return 0;
-}
-
 # $partial is set when discovery is announcing a reply mid-round, before the
 # rest of the instances have had their chance to answer.  Such a list is
 # additive only: see the removal pass at the end.
@@ -590,11 +1088,25 @@ sub _onInstances {
 
     my %seen;
 
-    my $ids = _idsFor($instances);
+    my $ids = _idsFor( $instances, $partial, \%bridges );
 
     for my $inst (@$instances) {
-        my $id   = $ids->{ $inst->{ip} }->{id};
-        my $name = $ids->{ $inst->{ip} }->{name};
+        # NO ENTRY MEANS DELIBERATELY NOT ACTED ON, and it is not an error.
+        # _idsFor drops a DISCOVERED address that has stopped answering when
+        # EXACTLY ONE address still answers to the same name and that name is
+        # not already split into address-qualified players (it is then the same
+        # daemon, seen at the address a DHCP move left) - never a typed one,
+        # which keeps its own player down or not - and it defers a whole name
+        # group on a PARTIAL list
+        # because freshness cannot be judged until the round is complete.
+        # Either way the address gets no player this round; a deferred group is
+        # resolved by the complete round ~LISTEN_TIME later, and a dropped
+        # corpse is torn down by the removal pass below because nothing marks
+        # its id seen.
+        my $entry = $ids->{ $inst->{ip} } or next;
+
+        my $id   = $entry->{id};
+        my $name = $entry->{name};
 
         $seen{$id} = 1;
 
@@ -613,6 +1125,8 @@ sub _onInstances {
                 _create( $id, $inst, $name );
             }
             else {
+                # Nothing to poke: a down link reconnects on its own ladder
+                # (Control::BACKOFF_MAX), whatever discovery hears.
                 $b->{instance} = $inst;
             }
         }
@@ -633,6 +1147,21 @@ sub _onInstances {
 
     for my $id ( keys %bridges ) {
         next if $seen{$id};
+
+        # Lyrion forgets only a DISCONNECTED player, and so does this: a live
+        # control link outranks discovery going quiet (see INSTANCE_TTL). A
+        # dead peer loses its link to the status watchdog within ~40s, and is
+        # removed at the first complete round after that.
+        #
+        # NOT when its address went to ANOTHER id this round: that is the same
+        # daemon re-keyed (a pair shrinking to one takes the plain id), and
+        # keeping the old player too would leave two players, and two control
+        # links, on one HQPlayer.
+        my $b  = $bridges{$id};
+        my $ip = ( $b->{instance} || {} )->{ip};
+        # Player::connected, the answer Material shows (_linkUp).
+        next if _linkUp($b) && !( defined $ip && $ids->{$ip} );
+
         $log->info( ( $bridges{$id}->{instance}->{name} || $id ) . ': no longer answering, removing player' );
         _teardown($id);
     }
@@ -665,6 +1194,51 @@ sub _nameFor {
     return $name;
 }
 
+# Which members of a name group are STILL ANSWERING: the ones that answered
+# the same discovery ROUND as the newest reply. Anything from an earlier round
+# is an address the daemon has left.
+#
+# It used to be judged by the clock - replies within ADDR_SLACK (10s) of the
+# newest counted as the same round. That only worked while rounds were MORE
+# than 10s apart; when discovery moved to rounds 5-15s apart, an address
+# left one round ago would have looked fresh, and a DHCP move would have split
+# one daemon into two players again - the 1.0.8 bug. Counting rounds says what
+# was meant directly, and does not care how far apart they are.
+#
+# NO ROUND AT ALL means every member counts as live.  That is the case the
+# suite's fixtures build, and it is the conservative answer: it keeps two
+# genuinely separate instances apart rather than silently merging them.
+sub _liveOf {
+    my $group = shift;
+
+    my ($newest) = sort { $b <=> $a }
+                   grep { defined }
+                   map  { $_->{round} } @$group;
+
+    return [@$group] unless defined $newest;
+
+    my @live = grep { !defined $_->{round}
+                      || $_->{round} == $newest } @$group;
+
+    # Belt and braces: never hand back an empty group.
+    return @live ? \@live : [@$group];
+}
+
+# True when any member of a name group already holds an ADDRESS-QUALIFIED
+# player - i.e. the name is an established pair, not one daemon that has moved.
+# No $existing (the suite's direct calls) means nothing is running yet.
+sub _isSplit {
+    my ( $name, $group, $existing ) = @_;
+
+    return 0 unless $existing;
+
+    for my $inst (@$group) {
+        return 1 if exists $existing->{ _idFor( $name . '@' . $inst->{ip} ) };
+    }
+
+    return 0;
+}
+
 # Player id for every discovered instance, keyed by ip.
 #
 # The id is derived from the instance NAME rather than its address, so that a
@@ -675,7 +1249,7 @@ sub _nameFor {
 # HQPlayer Embedded instance answers "HQPlayerEmbedded", so on the name alone
 # two instances are one player: each discovery round would see the id it
 # already has arrive with the other one's address, tear the player down and
-# build it again 60 seconds later, killing playback every time.  (A DHCP move
+# build it again a round later, killing playback every time.  (A DHCP move
 # is the same shape - the old address lingers in the discovery table for
 # INSTANCE_TTL, so for that window the instance appears twice under one name.)
 #
@@ -683,8 +1257,43 @@ sub _nameFor {
 # own, and those instances are told apart by address.  A name only one instance
 # answers to - the ordinary case, and the only one where the prefs actually
 # matter - keeps the plain name-derived id and its DHCP immunity.
+#
+# LIVE IS THE WHOLE WORD, AND IT USED TO GO UNENFORCED.  REPRODUCED on the rig
+# 2026-09-20: the Mac running hqplayerd was moved from Wi-Fi (.109) onto
+# Ethernet (.238) with the daemon left running.  hqplayerd answers the
+# multicast probe from ONE address only - whichever the routing table picks -
+# so .238 arrived while .109 was still sitting in %found inside INSTANCE_TTL,
+# and one live address plus one corpse counted as two instances:
+#
+#   discovery: found 'HQPlayerEmbedded' at 192.168.1.238
+#   2 instances answer to 'HQPlayerEmbedded' (192.168.1.109, 192.168.1.238)
+#     - identifying them by address instead
+#   HQPlayerEmbedded: no longer answering, removing player
+#
+# The plain-id player was torn down and replaced by TWO address-qualified ones,
+# taking the user's settings with it - they live under the id.  So the count
+# that decides this is of instances STILL ANSWERING, never of rows in the table.
+#
+# THE CASE THIS FIXES IS A DHCP MOVE, which is the one `_idFor`'s comment above
+# already promises immunity from: the lease moves, nothing is left at the old
+# address, the corpse stops answering and the group collapses back to one.
+#
+# IT DELIBERATELY DOES NOT MERGE TWO ADDRESSES THAT ARE BOTH ANSWERING, and an
+# interface move is exactly that once the daemon is healthy.  MEASURED the same
+# day: hqplayerd answers the MULTICAST probe from one address only, but answers
+# a UNICAST probe on EVERY address it holds.  While `_probe` unicast to every
+# address in %found (until 2026-09-27) a remembered address refreshed its own
+# lastSeen for ever and that split was PERMANENT; with multicast only, the
+# unused address now ages out after INSTANCE_TTL and the pair collapses to the
+# plain id (docs/discovery-simplification-plan.md section 5).  Running HQPlayer on more than one
+# active interface is DECLINED as scope (Simon, 2026-09-20; the vendor
+# documents single-interface operation), so collapsing it is not this gate's
+# job - and merging on the name alone would take two REAL instances with it.
+# See CLAUDE.md, `more than one interface active is DECLINED`.
 sub _idsFor {
-    my $instances = shift || [];
+    my ( $instances, $partial, $existing ) = @_;
+
+    $instances ||= [];
 
     my %byName;
 
@@ -698,23 +1307,112 @@ sub _idsFor {
         my $group = $byName{$name};
 
         if ( @$group == 1 ) {
+            delete $splitWarned{$name};
             my $inst = $group->[0];
+            my $id   = _idFor($name);
+
+            # A PARTIAL LIST CREATES NO NEW PLAYER FROM DISCOVERY. One reply is
+            # not yet evidence that the name is unique: a same-named sibling
+            # (two HQPlayer Embedded boxes left at the default name) may answer
+            # a few ms later. Created here, the first box got the PLAIN id -
+            # init restoring that player's old prefs and playlist, a control
+            # link, its volume followed - and the complete round ~LISTEN_TIME
+            # later split the pair into name@ip and tore it down again
+            # (review 2026-09-28, finding 3; reproduced through this sub).
+            # So creation waits for the round's end, at most LISTEN_TIME (1.5s).
+            # An EXISTING player still takes its update at once (an address
+            # change reconnects immediately), and a TYPED address is never
+            # deferred - it is its own name and address, and Addresses
+            # announces it with a partial list.
+            next if $partial && !$inst->{configured} && !( $existing && $existing->{$id} );
+
             $id{ $inst->{ip} } = {
-                id   => _idFor($name),
+                id   => $id,
                 name => _nameFor( $inst, 0 ),
             };
             next;
         }
 
-        $log->warn( scalar(@$group) . " instances answer to '$name' ("
-            . join( ', ', map { $_->{ip} } @$group )
-            . ') - identifying them by address instead' );
+        # A PARTIAL list is mid-round: the instances that have not answered
+        # YET still carry the previous round's number, so every one of them
+        # would read as stale and a genuinely second instance would be demoted
+        # to a corpse.  Defer the whole group - the complete round decides it
+        # ~LISTEN_TIME later, and until then nothing is touched.
+        next if $partial;
+
+        my $live = _liveOf($group);
+
+        # One address still answering, the rest are the same daemon at
+        # addresses it has left.  Keep the plain name-derived id - that is what
+        # the player's prefs, playlist and sync group hang off - and leave the
+        # corpses without one.
+        #
+        # BUT ONLY WHEN THE NAME IS NOT ALREADY AN ESTABLISHED PAIR.  Missing a
+        # round cannot tell "the same daemon at an address it has left" from "a
+        # SECOND daemon that is briefly quiet" - hqplayerd restarts on any
+        # configuration change and misses a round or more while it does.
+        # Collapsing that re-keyed the instance that did NOT restart onto the
+        # plain id mid-playback, tore down BOTH address-qualified players, and
+        # flipped it back on the next round (found in review 2026-09-21).
+        # What separates the two cases is what is already running: a DHCP move
+        # leaves the PLAIN-id player in place, an established pair already
+        # holds ADDRESS-QUALIFIED ones.  A pair keeps today's behaviour, and
+        # its quiet member sits out INSTANCE_TTL's grace untouched.
+        #
+        # AND NEVER ACROSS TYPED ADDRESSES (Simon, 2026-09-27): a typed address
+        # is its name AND its address - the user put each one there, and none
+        # of them moves. Collapsing here once handed a DOWN typed address's
+        # player - prefs, playlist - to a second same-named HQPlayer switched
+        # on meanwhile, for as long as the first stayed down. This guard is the
+        # whole rule: typed entries carry no round stamp at all. Nothing
+        # HQPlayer sends can tell one machine from two (CLAUDE.md, `NO HQPLAYER
+        # ID ON THE CONTROL API`), so the same HQPlayer typed at two addresses
+        # is two players - accepted, unsupported.
+        if ( @$live == 1
+             && !grep( { $_->{configured} } @$group )
+             && !_isSplit( $name, $group, $existing ) ) {
+            delete $splitWarned{$name};
+            my $inst = $live->[0];
+
+            main::INFOLOG && $log->is_info && $log->info(
+                "'$name' is in the discovery table at "
+              . join( ', ', map { $_->{ip} } @$group )
+              . " but only $inst->{ip} is still answering - keeping the plain id" );
+
+            $id{ $inst->{ip} } = {
+                id   => _idFor($name),
+                name => _nameFor( $inst, 0 ),
+            };
+
+            next;
+        }
+
+        # Said once per CHANGE, not once per round: discovery runs every
+        # 10-15s, and a same-named pair is a steady state - HQPlayer Embedded
+        # names every instance "HQPlayerEmbedded" - so saying it each round
+        # would fill the log for as long as both are up.
+        my $addrs = join( ', ', sort map { $_->{ip} } @$group );
+        if ( ( $splitWarned{$name} // '' ) ne $addrs ) {
+            $splitWarned{$name} = $addrs;
+            $log->warn( scalar(@$group) . " instances answer to '$name' ($addrs)"
+                . ' - identifying them by address instead' );
+        }
 
         for my $inst (@$group) {
             $id{ $inst->{ip} } = {
                 id   => _idFor( $name . '@' . $inst->{ip} ),
                 name => _nameFor( $inst, 1 ),
             };
+        }
+    }
+
+    # A name that has left the table altogether - both of a pair switched
+    # off, say - is no longer a pair, so its warning is owed again if it comes
+    # back. Only on a COMPLETE list: a partial one holds only the instances
+    # that have answered so far.
+    if ( !$partial ) {
+        for my $name ( keys %splitWarned ) {
+            delete $splitWarned{$name} unless $byName{$name};
         }
     }
 
@@ -750,8 +1448,12 @@ sub _create {
 
     $client->macaddress($id);
 
-    # A literal 1, never a socket: this is what lets the rest of LMS treat the
-    # player as connected without there being a SlimProto link to speak to.
+    # A literal 1, never a socket. It no longer decides `connected` - that is
+    # the proven control link, see Player::connected. Kept because every
+    # release has set it and code outside LMS may test it; in LMS core
+    # (public/9.1) only the Squeezebox classes, Slimproto, Display::Graphics
+    # (not this player's NoDisplay), NetTest and Client::forgetClient read it -
+    # and forgetClient is why Player::forgetClient clears it first.
     $client->tcpsock(1);
 
     $client->display( Slim::Display::NoDisplay->new($client) );
@@ -759,7 +1461,7 @@ sub _create {
     eval { $client->init };
     if ($@) {
         $log->error("player init failed for $name: $@");
-        eval { Slim::Player::Client::forgetClient($client) };
+        eval { $client->forgetClient };
         return;
     }
 
@@ -778,9 +1480,10 @@ sub _create {
         ip      => $inst->{ip},
         name    => $name,
         onState => sub {
-            my ( $c, $up ) = @_;
-            _onLinkState( $id, $up );
+            my ( $c, $up, $wasProven ) = @_;
+            _onLinkState( $id, $up, $wasProven );
         },
+        onProven => sub { _onLinkProven($id) },
         # Every Status message - the one we asked for and the ~1/s HQPlayer
         # pushes afterwards - drives the player's state machine.
         onStatus => sub {
@@ -799,31 +1502,119 @@ sub _create {
         name     => $name,
     };
 
-    $ctl->connect;
+    # `client new` WAS ALREADY SENT - by LMS's own Slim::Player::Client::new,
+    # which every constructor reaches. The player reads disconnected until
+    # HQPlayer replies (Player::connected is `proven`), so say so now: this
+    # also takes back what `new` set up for a player that may never answer
+    # (UPnP's MediaRenderer registers on `new` and unregisters on
+    # `disconnect`). Every proof after this is a `client reconnect`.
+    $client->disconnected(1);
+    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
 
-    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'new' ] );
+    $ctl->connect;
 
     return;
 }
 
 sub _onLinkState {
-    my ( $id, $up ) = @_;
+    my ( $id, $up, $wasProven ) = @_;
 
     my $b = $bridges{$id} or return;
 
     my $client = $b->{client} or return;
 
     if ($up) {
+        # The TCP accept only. Nothing LMS-facing happens here: hqplayerd also
+        # accepts when it is about to drop the socket, so the player is not
+        # reported connected until HQPlayer REPLIES - see _onLinkProven.
         $client->refreshInfo;
 
         # The status subscription is armed HERE, not at a track load.  It is
         # the plugin's only liveness signal for a peer that goes quiet without
-        # closing the socket, and discovery reads that link state to decide how
-        # hard to keep probing - see _statusWatchdog in Player.pm.
+        # closing the socket - see _statusWatchdog in Player.pm.
         $client->_startPolling;
+
+        # Throttled like every other call (see _probeRestart): the link retries
+        # a refusing instance every BACKOFF_MAX (10s), and every accept
+        # reaches this branch.
+        _probeRestart( ( $b->{instance} || {} )->{ip} );
     }
     else {
         $client->_stopPolling;
+
+        # Only a link LMS was told about: an accept-then-drop never was, and
+        # must announce nothing - and was never made active, so it has no
+        # group to leave.
+        #
+        # THEN LEAVE THE GROUP, exactly as Slimproto's close does: playerInactive
+        # unless this is the only active player. Left in, a synced member with a
+        # dead link is still handed every track, fails to open it, and LMS fails
+        # that track for the WHOLE group - every other room skipping through the
+        # playlist. Out of it, the others play on; `_onLinkProven`'s playerActive
+        # brings it back at the group's position (_JumpToTime restarts the
+        # group, as a Lyrion player rejoining does). A solo player is left
+        # active, Slimproto's rule - its PLAYBACK is stopped instead
+        # (Player::linkDropped), the player stays in the active set.
+        #
+        # playerInactive's _stopClient reaches Player::stop, whose <Stop/> is
+        # failed quietly on the dead link (Control::send) - no reconnect, nothing
+        # queued. Control::_dropLink calls this BEFORE it fails the load that
+        # was in flight, so stop()'s new generation retires that load instead of
+        # letting it report a failure against the group.
+        if ($wasProven) {
+            $client->disconnected(1);
+            Slim::Control::Request::notifyFromArray( $client, [ 'client', 'disconnect' ] );
+
+            # NO LINK: LMS stops, nothing is sent until the link is back, and
+            # the next play is the listener's - see Player::linkDropped.
+            eval { $client->linkDropped; 1 }
+                or $log->error( ( $b->{name} || $id ) . ": could not stop after the link drop: $@" );
+
+            # Look NOW: if HQPlayer moved (DHCP), this is how the new address
+            # is heard without waiting for the next round. One probe however
+            # many links drop, and none with automatic discovery off. Only a
+            # PROVEN link - an accept-then-drop every 10s must not become a
+            # probe every 10s.
+            Plugins::HQPlayerBridge::Discovery->probeNow;
+
+            my $controller = eval { $client->controller };
+            if ( $controller && !$controller->onlyActivePlayer($client) ) {
+                eval { $controller->playerInactive($client); 1 }
+                    or $log->error( ( $b->{name} || $id ) . ": could not leave the sync group: $@" );
+            }
+        }
+    }
+
+    return;
+}
+
+# HQPlayer's FIRST REPLY on a link: the player is now connected as far as LMS
+# is concerned (Player::connected reads the same flag). Always `client
+# reconnect` - the constructor sent `new`, and _create marked the player
+# disconnected straight after. Lyrion's Squeezebox::reconnect: a powered player
+# rejoins its sync group's active set - after a drop took it out (_onLinkState),
+# and at the first link too, since Client::startup's restoreSync ran while it
+# read as disconnected. A solo player is already active and LMS returns at its
+# "already active" guard. Forgetting is
+# unchanged: Lyrion's 300s, via discovery (INSTANCE_TTL).
+sub _onLinkProven {
+    my $id = shift;
+
+    my $b = $bridges{$id} or return;
+
+    my $client = $b->{client} or return;
+
+    # The flag and the announcement FIRST, so nothing below can lose them:
+    # without the notification Material never re-lists the player.
+    $client->disconnected(0);
+    Slim::Control::Request::notifyFromArray( $client, [ 'client', 'reconnect' ] );
+
+    # playerActive can run the whole _JumpToTime -> play() path when the group
+    # is playing; a failure there is logged, not allowed to unwind the proof.
+    my $controller = eval { $client->controller };
+    if ( $controller && $client->power ) {
+        eval { $controller->playerActive($client); 1 }
+            or $log->error( ( $b->{name} || $id ) . ": could not rejoin the sync group: $@" );
     }
 
     return;
@@ -840,15 +1631,27 @@ sub _teardown {
         # player actually go away.
         delete $ctl->{onStatus};
         delete $ctl->{onState};
+        delete $ctl->{onProven};
     }
 
     if ( my $client = $b->{client} ) {
         eval {
             $client->_stopPolling;
 
-            $client->controller->stop if $client->controller;
+            # ONLY A CONTROLLER THIS PLAYER HAS TO ITSELF.  controller->stop is
+            # StreamingController::_Stop, which stops EVERY player in a sync
+            # group.  Sample-accurate sync is not offered, but a bridge player
+            # joins and leaves a group as a Lyrion player does (CLAUDE.md,
+            # `A PLAYER JOINS AND LEAVES A GROUP AS LYRION'S DO`), and removing
+            # it must not silence another room: forgetClient below runs LMS's
+            # own unsync first, which stops just
+            # the one it removes and hands it a controller of its own - the
+            # same path `client forget` takes.  A solo player is stopped here
+            # exactly as before.
+            my $ctl = $client->controller;
+            $ctl->stop if $ctl && !( $ctl->can('allPlayers') && $ctl->allPlayers > 1 );
         };
-        eval { Slim::Player::Client::forgetClient($client) };
+        eval { $client->forgetClient };
     }
 
     return;

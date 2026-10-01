@@ -8,6 +8,9 @@ my ($pass,$fail)=(0,0);
 sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
   if ($got eq $want){$pass++; printf "  ok   %s\n",$name}
   else {$fail++; printf "  FAIL %s\n        got: %s\n       want: %s\n",$name,$got,$want} }
+# see the note on ok() in t_player.pl - a failed match returns the EMPTY LIST
+sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
+  $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
 
 print "-- parseAttrs --\n";
 my $a = $C->can('parseAttrs')->('<?xml version="1.0"?><Status state="Playing" position="42.5" rate="352800"/>');
@@ -63,6 +66,69 @@ is($C->can('parseAttrs')->($err)->{result},'Error','error reply result=Error');
 
 my $gt = $C->can('parseAttrs')->('<?xml version="1.0" encoding="utf-8"?><GetTransport arg="" value="240"/>');
 is($gt->{value},'240','GetTransport is a numeric id, not a device name');
+
+# ---------------------------------------------------------------------------
+# %BENIGN - the one error HQPlayer answers that is NOT a failure.
+#
+# With an empty playlist every <Volume> comes back result="Error" carrying
+# `clPlaylist::GetAlbumGain(): trackn > last` - HQPlayer recomputing replaygain
+# over a playlist with no tracks. The level IS applied (ledger 2026-08-27), so
+# it is logged at debug rather than crying wolf.
+#
+# IT NEVER WORKED, AND NOTHING TESTED IT. `_dispatch` pulled the message with
+# `/>([^<]*)</`, and because every reply carries the XML declaration that `*`
+# matched the EMPTY string between `?>` and `<Volume`. $msg was "" for EVERY
+# error on the wire, so the %BENIGN lookup could never match and the raw frame
+# was printed in its place. Found live 2026-09-26, off a real reconnect.
+print "-- a benign error is logged at debug, not warn --\n";
+{
+    my (@warned, @debugged);
+    no warnings qw(redefine once);
+    local *Slim::Utils::Log::Obj::warn  = sub { push @warned,    $_[1] };
+    local *Slim::Utils::Log::Obj::debug = sub { push @debugged,  $_[1] };
+    Slim::Utils::Timers::_reset();
+
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->{connected} = 1;
+
+    # THE EXACT FRAME OFF THE WIRE, declaration and all - including the `>`
+    # inside the message text, which `[^<]` has to span.
+    my $benign = '<?xml version="1.0" encoding="utf-8"?>'
+               . '<Volume result="Error">clPlaylist::GetAlbumGain(): trackn > last</Volume>';
+
+    $c->{inflight} = { verb => 'Volume', cmd => '<Volume value="-45"/>' };
+    $c->_dispatch($benign);
+
+    is(scalar @warned, 0, 'the empty-playlist <Volume> error does NOT warn');
+    is(scalar @debugged >= 1 ? 1 : 0, 1, 'it is logged at debug instead');
+    is(( grep { /trackn > last/ } @debugged ) ? 1 : 0, 1,
+       'and the MESSAGE is logged, not the raw frame - `>` in the text survives');
+
+    # CONTROL: a real failure on the same verb still warns.
+    @warned = ();
+    $c->{inflight} = { verb => 'Volume', cmd => '<Volume value="-45"/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?>'
+                . '<Volume result="Error">Unknown command</Volume>');
+    is(scalar @warned, 1, 'CONTROL: any OTHER <Volume> error still warns');
+
+    # CONTROL: the benign text on a DIFFERENT verb is not excused - %BENIGN is
+    # keyed on the verb, and only Volume is listed.
+    @warned = ();
+    $c->{inflight} = { verb => 'Play', cmd => '<Play/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?>'
+                . '<Play result="Error">clPlaylist::GetAlbumGain(): trackn > last</Play>');
+    is(scalar @warned, 1, 'CONTROL: the same text on <Play> is NOT downgraded');
+
+    # CONTROL: an error with no message at all still reports the raw frame.
+    @warned = ();
+    $c->{inflight} = { verb => 'Play', cmd => '<Play/>' };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><Play result="Error"></Play>');
+    is(scalar @warned, 1, 'CONTROL: an empty error message still warns');
+    is(( grep { /result="Error"/ } @warned ) ? 1 : 0, 1,
+       'and falls back to the raw frame, having no message to show');
+
+    Slim::Utils::Timers::_reset();
+}
 
 print "-- _extractMessage (framing a pushed Status stream) --\n";
 my $D  = '<?xml version="1.0" encoding="utf-8"?>';
@@ -210,7 +276,7 @@ print "-- the reconnect ladder must climb against a peer that accepts and drops 
     }
     Slim::Utils::Timers::_reset();
 
-    is( join( ',', @waits ), '2,4,8,16,32,60,60',
+    is( join( ',', @waits ), '2,4,8,10,10,10,10',
         "it doubles from ${min}s and caps at ${max}s" );
 }
 
@@ -236,6 +302,302 @@ print "-- superseded track work is removed before it reaches HQPlayer --\n";
         'using the same failed-callback contract as a dropped link' );
     is( defined $failed[0][1] ? 'raw' : 'no raw', 'no raw',
         'and does not invent an HQPlayer reply' );
+}
+
+print "-- onProven: once per link, at HQPlayer's FIRST reply --\n";
+{
+    my $n = 0;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onProven => sub { $n++ } );
+    $c->{connected} = 1;    # the accept alone
+    is($c->proven ? 1 : 0, 0, 'an accepted link is not proven');
+    is($n, 0, 'and onProven has not fired');
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    is($c->proven ? 1 : 0, 1, 'a reply proves it');
+    is($n, 1, 'onProven fires exactly once for two replies');
+    $c->{closing} = 1;
+    $c->_dropLink('test');
+    is($c->proven ? 1 : 0, 0, 'a dropped link is unproven again');
+}
+
+print "-- onState(0) says whether the dropped link had been PROVEN --\n";
+{
+    my @got;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onState => sub { push @got, $_[2] ? 1 : 0 } );
+    $c->{closing}   = 1;
+    $c->{connected} = 1;
+    $c->_dropLink('accept then drop');
+    $c->{connected} = 1;
+    $c->{proven}    = 1;
+    $c->_dropLink('after a reply');
+    is(join(',', @got), '0,1', 'an unanswered accept reports 0, a replied link reports 1');
+}
+
+print "-- the link-down listener hears BEFORE the stranded commands are failed --\n";
+{
+    # A synced player leaves its group in the listener, and the stop that does
+    # it retires the load in flight. Failed first, that load would report a
+    # failure LMS charges to the WHOLE group. So: listener, then callbacks.
+    my @ev;
+    my $c = Plugins::HQPlayerBridge::Control->new(
+        ip => '10.0.0.5', name => 'T', onState => sub { push @ev, 'onState' } );
+    $c->{closing}   = 1;
+    $c->{connected} = 1;
+    $c->{proven}    = 1;
+    $c->{inflight}  = { verb => 'PlaylistAdd', cb => sub { push @ev, 'inflight failed' } };
+    $c->{queue}     = [ { verb => 'Play', cb => sub { push @ev, 'queued failed' } } ];
+    $c->_dropLink('test');
+    is(join(', ', @ev), 'onState, inflight failed, queued failed',
+       'onState first, then the in-flight command, then the queue');
+    is(scalar @{ $c->{queue} }, 0, 'and nothing is left queued');
+
+    # CONTROL: an accept that never answered is not announced, and its
+    # commands are still failed
+    @ev = ();
+    $c->{connected} = 0;
+    $c->{inflight}  = { verb => 'GetInfo', cb => sub { push @ev, 'inflight failed' } };
+    $c->_dropLink('test');
+    is(join(', ', @ev), 'inflight failed', 'CONTROL: a link that was never up still fails its command');
+}
+
+print "-- send on a DOWN link fails the command and does NOT connect --\n";
+{
+    # It used to connect at once, skipping the reconnect backoff for every
+    # command LMS sends a disconnected player, and from inside _dropLink when
+    # a link-down listener sent something. The reconnect is already scheduled;
+    # send must leave it to that.
+    my @connects;
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, 1 };
+    Slim::Utils::Timers::_reset();
+
+    my @got;
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->send( '<Stop/>', sub { push @got, [@_] } );
+    is(scalar @connects, 0, 'a command on a down link starts no connect');
+    is(scalar @{ $c->{queue} }, 0, 'and is not left queued for the next link');
+    is(scalar @got, 0, 'its failure is not reported inside send()');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar @got, 1, 'but on the next turn');
+    is(defined $got[0][0] ? 'success' : 'failed', 'failed', 'as a failure, the dropped-link contract');
+
+    # the case that mattered: a listener that sends as the link drops
+    @connects = ();
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T',
+        onState => sub { $_[0]->send('<Stop/>') if !$_[1] } );
+    $d->{connected} = 1;
+    $d->_dropLink('test');
+    is(scalar @connects, 0, 'a Stop sent from the link-down callback does not reconnect ahead of the backoff');
+    is(scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 1,
+       'the backoff reconnect is still the one scheduled');
+
+    # a link being closed for good: failed too, not left waiting for ever
+    @got = ();
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $e->{closing} = 1;
+    $e->send( '<Stop/>', sub { push @got, [@_] } );
+    Slim::Utils::Timers::_fireAll();
+    is(scalar @got, 1, 'a command on a closed link is failed, not left without a callback');
+
+    # CONTROL: a link still CONNECTING queues the command for when it is up
+    @connects = ();
+    my $f = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $f->{sock} = 'pending'; $f->{connecting} = 1;
+    $f->send('<Stop/>');
+    is(scalar @{ $f->{queue} }, 1, 'CONTROL: a connecting link still queues the command');
+    is(scalar @connects, 0, 'and starts no second connect');
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- up(): will send() accept a command? --\n";
+{
+    # Player::_queueTrack asks this instead of "does an hqControl object exist",
+    # which is true straight through a drop.  It has to answer EXACTLY what
+    # send() accepts: read `connected` there instead and a load arriving while a
+    # reconnect is in flight is refused, though send() would have queued and
+    # carried it.
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    is($d->up, '0', 'a link with no socket is not up');
+
+    $d->{connecting} = 1;
+    is($d->up, '1', 'a link still CONNECTING is up - send() queues on it');
+    is($d->connected, '0', 'though `connected` is false there - why up() is not that');
+
+    $d->{connecting} = 0;
+    $d->{sock}       = 'pending';
+    is($d->up, '1', 'and an established link is up');
+
+    # CONTROL: what up() calls down, send() really does refuse.
+    $d->{sock} = undef;
+    $d->send('<Stop/>');
+    is(scalar @{ $d->{queue} }, '0', 'CONTROL: send() queues nothing on a link up() calls down');
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- send() answers through its callback only --\n";
+{
+    # Nothing reads a return value; every caller is driven by $cb. A value here
+    # would invite a caller to trust "queued" as "delivered" again.
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    my @down = $e->send('<Stop/>');
+    is(scalar @down, 0, 'a down link: send() returns nothing');
+    my @bad = $e->send('<NoSuchVerb/>');
+    is(scalar @bad, 0, 'a refused verb: send() returns nothing');
+    $e->{sock} = 'pending';
+    { no warnings 'redefine'; local *Plugins::HQPlayerBridge::Control::_pump = sub {};
+      my @up = $e->send('<Stop/>');
+      is(scalar @up, 0, 'a queued command: send() returns nothing'); }
+    is(scalar @{ $e->{queue} }, '1', 'CONTROL: that command WAS queued');
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- the timer stub keys undef as LMS does --\n";
+{
+    # LMS turns an undef object into '' (Timers.pm, 8.0-9.1): one key, not a
+    # wildcard. A stub that killed every timer for the sub let a test pass
+    # that LMS would fail.
+    Slim::Utils::Timers::_reset();
+    my $cb  = sub {};
+    my $obj = bless {}, 'TimerObj';
+    Slim::Utils::Timers::setTimer( undef, 1, $cb );
+    Slim::Utils::Timers::setTimer( $obj,  1, $cb );
+    Slim::Utils::Timers::killTimers( undef, $cb );
+    is(Slim::Utils::Timers::_pending(), '1', 'killTimers(undef) leaves the timer set WITH an object');
+    Slim::Utils::Timers::killTimers( $obj, $cb );
+    is(Slim::Utils::Timers::_pending(), '0', 'CONTROL: killing by the object removes it');
+    my @got;
+    Slim::Utils::Timers::setTimer( undef, 1, sub { push @got, $_[0] } );
+    Slim::Utils::Timers::_fireAll();
+    is($got[0] // 'undef', '', "an undef-object timer is called back with '', as LMS does");
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- the link keeps itself alive: no discovery in the loop --\n";
+{
+    # reconnectNow is GONE (2026-09-27). Discovery used to poke a down link
+    # every 10s round, and that poke was the real return time after a long
+    # outage; the link's own ladder now caps at that same 10s.
+    ok( !Plugins::HQPlayerBridge::Control->can('reconnectNow'), 'reconnectNow no longer exists' );
+    is( Plugins::HQPlayerBridge::Control::BACKOFF_MAX(), 10, 'the link backs off to 10s at most, not 60' );
+
+    # A link that has been down a long time - the ladder at its top - is
+    # retried within 10s, with nothing else running at all.
+    require Plugins::HQPlayerBridge::Discovery;
+    Plugins::HQPlayerBridge::Discovery->stop;
+    Slim::Utils::Timers::_reset();
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $c->{backoff}    = Plugins::HQPlayerBridge::Control::BACKOFF_MAX();
+    $c->{connecting} = 1;
+    my $t0 = Time::HiRes::time();
+    $c->_dropLink('connect: refused');
+    my @r = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() };
+    is( scalar @r, 1, 'a dropped link schedules its own retry, discovery stopped' );
+    ok( @r && $r[0]{when} - $t0 <= 10.01, 'and it comes within 10s' );
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- identify: one <GetInfo/> to a typed address, and done --\n";
+{
+    my @warned;
+    no warnings qw(redefine once);
+    local *Slim::Utils::Log::Obj::warn = sub { push @warned, $_[1] };
+    my @connects;
+    local *Plugins::HQPlayerBridge::Control::connect = sub { push @connects, $_[0]; $_[0]->{connecting} = 1 };
+    Slim::Utils::Timers::_reset();
+
+    my $got = 'none';
+    my $c = Plugins::HQPlayerBridge::Control->identify( '10.1.2.3', sub { $got = $_[0] } );
+    is( scalar @connects, 1, 'it opens one connection' );
+    is( $c->{queue}[0]{cmd}, '<GetInfo/>', 'and queues <GetInfo/> on it' );
+
+    # HQPlayer answers: the same name discovery reports (measured, both products)
+    $c->{connecting} = 0; $c->{connected} = 1; $c->{sock} = 'x';
+    $c->{inflight} = shift @{ $c->{queue} };
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo engine="6.0.4" name="MacMini" platform="Mac" product="Signalyst HQPlayer Embedded" version="6"/>');
+    is( ref $got eq 'HASH' ? $got->{name} : $got, 'MacMini', 'the answer hands back GetInfo\'s name' );
+    my @close = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_closeOneShot } @{ Slim::Utils::Timers::_timers() };
+    is( scalar @close, 1, 'and the connection is closed on the next turn, not under _dispatch' );
+
+    delete $c->{sock};
+    Slim::Utils::Timers::_fireAll();
+    ok( $c->{closing}, 'then it is closed' );
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
+        'and a one-shot link never schedules a reconnect' );
+    is( scalar @warned, 0, 'nor logs above debug when it closes' );
+
+    # Nothing there: the callback gets undef, nothing reconnects, nothing warns.
+    Slim::Utils::Timers::_reset();
+    my $dead = 'none';
+    my $d = Plugins::HQPlayerBridge::Control->identify( '10.1.2.4', sub { $dead = $_[0] } );
+    $d->_connectTimeout;
+    is( defined $dead ? $dead : 'undef', 'undef', 'a dead address answers undef' );
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 0,
+        'and costs that one attempt - no retry ladder' );
+    is( scalar @warned, 0, 'and no warning of its own - the caller reports once per outage' );
+
+    # CONTROL: an ordinary link DOES reconnect and DOES warn, so the two
+    # assertions above are about oneShot and not a broken stub.
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '10.1.2.5', name => 'T' );
+    $e->{connecting} = 1;
+    $e->_connectTimeout;
+    is( scalar( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Control::_reconnect } @{ Slim::Utils::Timers::_timers() } ), 1,
+        'CONTROL: an ordinary link reconnects' );
+    is( scalar @warned, 1, 'CONTROL: and warns' );
+    Slim::Utils::Timers::_reset();
+}
+
+print "-- ONE warning per outage, not one per retry --\n";
+{
+    # 401 of the bridge's 414 log lines in 6.5 hours were one instance that
+    # accepts and resets, warned on every retry. Now: the first failure, then
+    # quiet until HQPlayer answers again.
+    my @warned;
+    no warnings qw(redefine once);
+    local *Slim::Utils::Log::Obj::warn = sub { push @warned, $_[1] };
+    Slim::Utils::Timers::_reset();
+
+    my $c = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    for ( 1 .. 5 ) { $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer') }
+    is(scalar @warned, 1, 'five accept-then-reset retries warn ONCE');
+    $c->_connectTimeout for 1 .. 3;
+    is(scalar @warned, 1, 'and timeouts in the same outage add nothing');
+
+    # it answers: the outage is over
+    $c->{connected} = 1;
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->_dropLink('HQPlayer closed the link');
+    is(scalar @warned, 2, 'a link that had been ANSWERING going down always warns');
+    $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer');
+    $c->_connectTimeout;
+    is(scalar @warned, 2, 'and the retries after it are quiet - that outage is already reported');
+
+    # CONTROL: after another recovery, a fresh outage is reported again
+    $c->{connected} = 1;
+    $c->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $c->{proven} = 0;                              # as a new link would start
+    $c->{connected} = 1; $c->_dropLink('read: Connection reset by peer');
+    is(scalar @warned, 3, 'CONTROL: a new outage after a recovery warns again');
+
+    # CONTROL: a first failure with nothing before it still warns
+    my $d = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $d->_connectTimeout;
+    is(scalar @warned, 4, 'CONTROL: the very first failure is reported');
+
+    # A PROVEN link that stops answering is ONE event, and was two WARNs:
+    # "no reply to <X> after 30s", then "control link down - reply timeout".
+    # The reason now rides on _dropLink's own line, text intact for log greps.
+    @warned = ();
+    my $e = Plugins::HQPlayerBridge::Control->new( ip => '127.0.0.1', name => 'T' );
+    $e->{connected} = 1;
+    $e->_dispatch('<?xml version="1.0" encoding="utf-8"?><GetInfo name="T"/>');
+    $e->{inflight} = { verb => 'PlaylistAdd' };
+    $e->_replyTimeout;
+    is(scalar @warned, 1, 'a proven link timing out warns ONCE');
+    is(( $warned[0] // '' ) =~ /control link down - no reply to <PlaylistAdd> after 30s/ ? 1 : $warned[0], 1,
+       'and that one line names the command it was waiting on');
+    Slim::Utils::Timers::_reset();
 }
 
 printf "\n%d passed, %d failed\n",$pass,$fail;

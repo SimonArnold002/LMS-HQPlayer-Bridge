@@ -1,10 +1,14 @@
 #!/bin/sh
-# Syntax-check and unit-test the plugin without an LMS install.
+# Syntax-check and test the plugin, and the optional restart helper, without
+# an LMS install.
 #
 # There is no LMS on the Mac, so `perl -c` cannot load Slim::*.  tools/Slim/**
 # is a minimal stub tree that satisfies the `use` lines; it is NOT a simulator
-# and proves nothing about runtime behaviour - only that the modules compile
-# and that the pure XML logic is correct.
+# and proves nothing about runtime behaviour on a real server.
+#
+# Also run: the live page's own JavaScript (osascript, skipped out loud
+# without it), the helper's Python suite, and its installer END TO END with the
+# service managers stubbed.
 #
 # Usage:  sh tools/run_checks.sh        (from the repo root)
 set -e
@@ -12,7 +16,7 @@ cd "$(dirname "$0")"
 rm -rf Plugins && mkdir -p Plugins && ln -sfn ../../HQPlayerBridge Plugins/HQPlayerBridge
 
 echo "== syntax =="
-for m in Control Discovery Stream Player Plugin Live; do
+for m in Control Discovery Addresses Settings Stream Player Plugin Live; do
     perl -I. syncheck.pl "Plugins::HQPlayerBridge::$m"
 done
 
@@ -23,6 +27,10 @@ perl -I. t_player.pl
 perl -I. t_stream.pl
 perl -I. t_plugin.pl
 perl -I. t_live.pl
+perl -I. t_settings.pl
+python3 t_hqrestart.py   # its own log is silenced inside; a traceback must be VISIBLE
+sh -n hqrestart/install.sh && echo "  ok   the macOS/Linux installer parses"   # nothing else reads it
+python3 t_installers.py  # the installer RUNS end to end, service managers stubbed: stop/ask/start ORDER
 
 echo
 echo "== called-vs-defined sweep (perl -c will NOT catch these) =="

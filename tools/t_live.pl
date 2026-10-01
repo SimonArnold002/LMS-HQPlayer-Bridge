@@ -28,6 +28,7 @@ sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
     sub content_type { my $s=shift; $s->{ct}   = shift if @_; return $s->{ct} }
     sub header       { my ($s,$k,$v)=@_; $s->{headers}{lc $k} = $v if defined $v;
                        return $s->{headers}{lc $k} }
+    sub content_length { my $s=shift; $s->{len} = shift if @_; return $s->{len} }
     package FakeHttpClient;
     sub new { bless {}, shift }
     sub connected { 1 }
@@ -54,6 +55,19 @@ ok(scalar($res->content_type && $res->content_type =~ m{^text/html}),
 ok(scalar(($res->header('cache-control') || '') =~ /no-store/),
    'and no-store - a cached copy of a LIVE view is a lie');
 ok(defined $SENT && length $SENT, 'a body is sent');
+
+# THE SECOND HALF OF THE SAME TRAP. A raw handler owns its FRAMING as well as
+# its status code: LMS keeps the connection alive and adds no Content-Length of
+# its own, so without one the browser is never told where the body ends. The
+# page renders and its script runs, but the request never completes and the
+# spinner stays until LMS closes the socket 75s later. Measured live on the
+# installed build 2026-09-29: 53,691 bytes served, no Content-Length, curl
+# timing out; a templated LMS page on the same server sends one, and so does
+# LMS's own raw handler (Web/JSONRPC.pm:349). Found in the Eversolo plugin,
+# whose page was copied from this one.
+ok(defined $res->content_length, 'and a Content-Length, so the request can finish');
+is($res->content_length, defined $SENT ? length($SENT) : -1,
+   'counted on the OCTETS actually sent, after any encode');
 
 # The version is HANDED IN at init. A page module that reached into its own
 # Plugin.pm would die mid-handler and LMS would render the half-built page with
@@ -172,18 +186,23 @@ ok(scalar($SENT =~ /removeChild\(back\)/),
 ok(scalar($SENT !~ /window\.top\.location\.href\s*=/),
    'so it never navigates the top window - that was destructive once the tile opened inline');
 
-print "-- there is no settings page left to link to --\n";
-# Nothing in this plugin is configurable. The settings page existed only to
-# read numbers off, could not keep them current, and put a link inside a link
-# on the way to the one page that works.
-ok(scalar(!-e '../HQPlayerBridge/Settings.pm'), 'Settings.pm is gone');
-ok(scalar(!-e '../HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/settings/basic.html'),
-   'and so is its template');
+print "-- the settings page is settings only, never the live reading --\n";
+# THE SETTINGS PAGE CAME BACK ON 2026-09-27 - but ONLY for the typed HQPlayer
+# addresses and the discovery switch. The old one existed to read numbers off,
+# could not keep them current, and put a link inside a link on the way to the
+# one page that works. That must not return: the live reading is Live.pm's.
 {
-    open my $fh, '<', 'Plugins/HQPlayerBridge/Plugin.pm' or die $!;
-    my $mod = do { local $/; <$fh> }; close $fh;
-    ok(scalar($mod !~ /HQPlayerBridge::Settings/),
-       'and Plugin.pm no longer registers one');
+    my $slurp = sub { open my $fh, '<', $_[0] or return ''; local $/; <$fh> };
+    my $mod  = $slurp->('../HQPlayerBridge/Settings.pm');
+    my $tmpl = $slurp->('../HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/settings/basic.html');
+    ok(scalar($mod =~ /sub prefs/ && $mod =~ /addresses/ && $mod =~ /autodiscover/),
+       'the settings page holds the addresses and the discovery switch');
+    ok(scalar($mod !~ /signalPath|nowPlaying|bridges\(/),
+       'and reads nothing of the signal path or the players - that is the live view');
+    # A <script> is allowed since 2026-09-27 (the "checking" line on save);
+    # what must never come back is a poller or a link to the live page.
+    ok(scalar($tmpl !~ /setInterval|setTimeout|XMLHttpRequest|fetch\(|jsonrpc|hqplive/),
+       'and its template polls nothing and links to no live page');
 }
 
 print "-- it follows MATERIAL's theme, by LMS's own recipe --\n";
@@ -251,6 +270,80 @@ ok(scalar($SENT =~ /el\.title\.textContent = b\.np_title/),
    'and the title is assigned, not re-rendered');
 ok(scalar($SENT =~ /getAttribute\('src'\) !== b\.np_artwork/),
    'artwork is only assigned when it CHANGES - rewriting the same src flickers');
+
+print "-- the service badge --\n";
+# THE SAME KEY THE OTHER PLUGINS SEND. LMS-Listen-to-Later and
+# LMS-Pitchfork-Reviews badge a row by setting `extid`, and Material reads the
+# part before the first ':'. This page is not a Material row - it renders
+# itself - so it does the lookup Material would have done, on MATERIAL'S OWN
+# table, fetched rather than copied: a copy here would drift the moment
+# Material changes a colour or adds a service.
+ok(scalar($SENT =~ m{/material/html/misc/emblems\.json}),
+   "the page fetches Material's own emblem table instead of embedding a copy");
+ok(scalar($SENT =~ /b\.np_extid\.split\(':'\)\[0\]/),
+   'and reads the key from extid exactly the way Material does');
+ok(scalar($SENT =~ m{'/material/svg/' \+ encodeURIComponent\(em\.name\)}),
+   "the logo is Material's own svg, recoloured through its c parameter");
+ok(scalar($SENT =~ /el\.badge\.style\.background = em\.bgnd/),
+   'and the circle carries the service brand colour from the same table');
+
+# MATERIAL IS NOT A DEPENDENCY OF THIS PAGE. It is reachable standalone and on
+# a server with no Material installed, where the emblems fetch 404s - which
+# must cost the badge and nothing else.
+ok(scalar($SENT =~ /if \(xhr\.status !== 200\) \{ return; \}/),
+   'a missing Material leaves EMBLEMS null rather than throwing');
+# ANCHORED ON THE ELSE BODY, not on the class name alone: 'np-badge' is also
+# written by the img-error handler above, so a bare match passed even with this
+# whole branch deleted - and a deleted branch leaves the LAST service's badge
+# sitting over a local file's cover.
+ok(scalar($SENT =~ /\} else \{\s*badgeWant = null;\s*el\.badge\.className = 'np-badge';/),
+   'and an unrecognised service simply draws no badge');
+
+# Only assigned when it changes, like the artwork above: reassigning an img src
+# reloads it, and a badge that reloads once a second flickers.
+ok(scalar($SENT =~ /if \(src !== badgeSrc\) \{\s*badgeSrc = src;/),
+   'the badge src is only written when it CHANGES');
+
+# A BROKEN IMAGE OVER THE ARTWORK IS THE ONE THING THIS MUST NEVER BE. The
+# circle is drawn from the emblems TABLE, so a table that fetched plus an svg
+# that did not would leave a coloured disc with a broken-image glyph in it.
+ok(scalar($SENT =~ /e\.target === el\.badgeImg\) \{\s*badgeOk = false;\s*el\.badge\.className = 'np-badge';/),
+   'a logo that fails to load hides the badge instead of showing a broken image');
+
+# AND THE OTHER HALF OF THE SAME RULE: nothing is shown before its own logo has
+# arrived. Without it the circle's colour - which comes from the TABLE, not the
+# image - changes a service ahead of the glyph in it, so a Qobuz-to-Tidal move
+# paints the Qobuz logo on Tidal's disc until the new svg lands. That also
+# retires the old blacklist: a src that 404s never turns the badge on, and the
+# "only when it CHANGES" rule above already stops it being re-requested.
+ok(scalar($SENT =~ /el\.badge\.className = badgeOk \? 'np-badge on' : 'np-badge';/),
+   'the badge is shown only once its logo has LOADED');
+ok(scalar($SENT =~ /addEventListener\('load', function \(e\) \{/),
+   'which needs a load listener beside the error one');
+# THE TWO CHECKS IN THE LOAD LISTENER ARE DIFFERENT ON PURPOSE. Recording the
+# load against badgeWant instead WEDGED the badge: a logo landing while a
+# service-less track played was discarded, and since src is only written when
+# it CHANGES it was never asked for again - that service stayed unbadged for
+# the rest of the page session.
+ok(scalar($SENT =~ /el\.badgeImg\.getAttribute\('src'\) === badgeSrc/),
+   'the LOAD is recorded against the src that was asked for, so it outlives the track');
+ok(scalar($SENT =~ /badgeOk = true;\s*if \(badgeSrc === badgeWant\) \{/),
+   'and only SHOWING it is gated on the track still wanting it');
+ok(scalar($SENT =~ /badgeOk\s+= false;\s*el\.badge\.style\.background = em\.bgnd/),
+   'and the circle is recoloured in the same breath as the src, never before it');
+
+# IT IS JUDGED SIDE BY SIDE WITH A MATERIAL ROW BADGE, so the numbers are
+# Material's own (style.css: --small-icon-size 18px, --sub-opacity 0.7), not
+# picked here. The first build drew it solid and Simon called it immediately.
+ok(scalar($SENT =~ /opacity: 0\.7;/),
+   "the badge carries Material's own --sub-opacity, not a solid circle");
+ok(scalar($SENT =~ /\.np-badge img \{ width: 18px; height: 18px/),
+   'and its logo is the 18px Material draws on a row');
+
+# The badge sits ON the cover, so the cover is what the idle rule hides - the
+# old rule named .np-art, which would now leave a badge floating over nothing.
+ok(scalar($SENT =~ m{\.np\.idle > \.np-cover \{ display: none}),
+   'idle hides the whole cover, badge included');
 
 print "-- it SCALES, which was the desktop complaint --\n";
 # A hard 96px cover on a full-bleed card is what looked tiny on a PC and fine on
@@ -442,6 +535,10 @@ ok(scalar($SENT !~ /no bridges_loop in reply/),
    'a missing bridges_loop is no longer reported as a bad reply');
 ok(scalar($SENT =~ /var loop = r\.bridges_loop \|\| \[\];/),
    'it is read as an empty list - the poll answered, there is just no player yet');
+ok(scalar($SENT =~ /if \(typeof r\.waiting === 'string'\) \{ WAIT = r\.waiting; \}/),
+   'what it waits for is re-read from every poll - the mode can change under the page');
+ok(scalar($SENT =~ /esc\(WAIT\)/ && $SENT !~ /esc\(L\.waiting\)/),
+   'and the empty card draws THAT, not the fixed label');
 ok(scalar($SENT =~ /if \(!r\) \{ throw new Error\('no result in reply'\)/),
    'a genuinely malformed reply is still an error');
 ok(scalar($SENT !~ /No HQPlayer instances found/),
@@ -579,11 +676,127 @@ print "-- nowPlayingFor: the resolution the server does --\n";
     ok(scalar(!exists $np->{volume}),
        'a missing mixer volume yields no volume key rather than 0');
 
+    # THE SERVICE BADGE'S KEY, DERIVED FROM THE URL - because a status result
+    # does not carry `extid` for the playing track. Measured on the rig:
+    # `tags:x` adds nothing and a Qobuz track answers only
+    # url => 'qobuz://449954371.flac'. Material solves it the same way
+    # (getTrackSource), so these prefixes are ITS keys.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'Q', duration => 10,
+                             url => 'qobuz://449954371.flac' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'qobuz:', 'a service URL yields the emblem key Material looks up');
+
+    # NOT ALWAYS THE SAME WORD AS THE SCHEME. Material's emblems.json keys
+    # sounds:// under `bbc`, so a table that just echoed the prefix would draw
+    # nothing here - and would look like the badge "not working for the BBC".
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'S', duration => 10,
+                             url => 'sounds://_LIVE_bbc_6music' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'bbc:', 'and the key is the emblem name, not the url scheme');
+
+    # The url can arrive on remoteMeta alone, which is where a remote track's
+    # metadata lives when the loop entry is bare.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { duration => 10 } ],
+        remoteMeta => { title => 'R', url => 'tidal://123.flac' },
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    is($np->{extid}, 'tidal:', 'the url falls back to remoteMeta like the rest of the track');
+
+    # MATERIAL'S SECOND TIER IS A SUBSTRING. These two services are also
+    # reachable as an ordinary https stream - a Radio Paradise FLAC favourite
+    # is stream.radioparadise.com/flacm - which no prefix matches. Material
+    # badges them through its `includes` table; without this tier the page
+    # diverged from Material on exactly those rows.
+    for my $c2 ( [ 'https://stream.radioparadise.com/flacm' => 'radioparadise:' ],
+                 [ 'https://artist.bandcamp.com/track/x'    => 'bandcamp:' ] ) {
+        $Slim::Control::Request::RESULTS = {
+            mode => 'play',
+            playlist_loop => [ { title => 'I', duration => 10, url => $c2->[0] } ],
+        };
+        $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+        is($np->{extid}, $c2->[1], "an http stream is matched on a SUBSTRING too ($c2->[1])");
+    }
+
+    # Material's third `includes` entry, .planetradio.co.uk, carries NO extid -
+    # it draws no badge there either, so neither must this.
+    $Slim::Control::Request::RESULTS = {
+        mode => 'play',
+        playlist_loop => [ { title => 'P', duration => 10,
+                             url => 'https://stream.planetradio.co.uk/net1national' } ],
+    };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    ok(scalar(!exists $np->{extid}),
+       'a service Material lists but does not badge gets no badge here either');
+
+    # A LOCAL FILE HAS NO SERVICE, and neither has a plain radio stream. Both
+    # must yield NO key at all: an empty string would be a key Material's table
+    # cannot match, and the page would draw an empty coloured circle.
+    for my $u ( 'file:///music/x.flac', 'http://stream.example.com/live' ) {
+        $Slim::Control::Request::RESULTS = {
+            mode => 'play',
+            playlist_loop => [ { title => 'L', duration => 10, url => $u } ],
+        };
+        $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+        ok(scalar(!exists $np->{extid}),
+           "no service in $u means no badge key at all");
+    }
+
+    # And it is a TRACK key: it goes when the track goes, or the page would
+    # badge whatever played last.
+    $Slim::Control::Request::RESULTS = { mode => 'stop', playlist_loop => [] };
+    $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
+    ok(scalar(!exists $np->{extid}), 'and nothing playing drops it with the other track keys');
+
     # A failed request must not yield half a snapshot either.
     $Slim::Control::Request::ERROR = 1;
     $np = Plugins::HQPlayerBridge::Plugin::nowPlayingFor($c);
     ok(scalar(!exists $np->{title}), 'and a failed status request yields no title');
     $Slim::Control::Request::ERROR = 0;
+}
+
+# ---------------------------------------------------------------------------
+# THE PAGE, EXECUTED - not grepped.
+#
+# Everything above asserts against the served bytes, which can say a function
+# is there and nothing about what it DOES. `t_live_page.js` runs this very page
+# under a DOM shim and drives it: three instances, choosing one, a choice that
+# goes away and comes back. A logic defect fails here instead of arriving as a
+# screenshot.
+#
+# JavaScriptCore via osascript, because there is no node on this Mac - so it is
+# SKIPPED, out loud, anywhere without it rather than failing the run.
+print "\n-- the page, executed against a three-instance payload --\n";
+{
+    my $osa = `which osascript 2>/dev/null`; chomp $osa;
+
+    if ( !$osa ) {
+        print "  skip no osascript here - the page is only source-checked\n";
+    }
+    else {
+        my $page = ( $ENV{TMPDIR} || '/tmp' ) . "/hqp_live_page_$$.html";
+        open my $fh, '>', $page or die $!;
+        print $fh $SENT;
+        close $fh;
+
+        my @out = `$osa -l JavaScript t_live_page.js '$page' 2>&1`;
+        unlink $page;
+
+        print @out;
+        my ($p, $f) = ( join('', @out) =~ /(\d+) passed, (\d+) failed/ );
+        # A run that says nothing is a FAILURE, not a pass: that is how a
+        # harness that crashed on line one reports 0 failures.
+        ok( scalar( defined $p && $p > 0 && defined $f && $f == 0 ),
+            defined $f ? "the executed page: $p passed, $f failed"
+                       : 'the executed page reported nothing' );
+    }
 }
 
 printf "\n%d passed, %d failed\n", $pass, $fail;

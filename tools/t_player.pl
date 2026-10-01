@@ -23,6 +23,20 @@ sub is { my($got,$want,$name)=@_; $got//='(undef)'; $want//='(undef)';
 sub ok { my $n = pop; my $c = @_ ? $_[0] : 0;
   $c ? ($pass++, printf "  ok   %s\n",$n) : ($fail++, printf "  FAIL %s\n",$n) }
 
+# The stub the load tests hand the player as its control link.  It was `bless
+# {}, 'FakeCtl'` with NO package at all, which works only for as long as
+# Player.pm never calls a method on the link.  TRAP: the moment one was added -
+# _queueTrack's `$ctl->up` check - every load test died with "Can't locate
+# object method up", and a `perl t_player.pl | tail` reads as a PASS because
+# the exit code belongs to tail.  Keep this in step with Control.pm's public
+# accessors.
+{
+    package FakeCtl;
+    sub up        { 1 }   # send() would accept a command - what _queueTrack gates on
+    sub connected { 1 }
+    sub proven    { 1 }
+}
+
 print "-- player construction --\n";
 my $c = eval { Plugins::HQPlayerBridge::Player->new('02:ab:88:42:4c:69', 'paddr', 1.0, undef, 12, undef) };
 ok($c && !$@, "new() does not die".($@ ? " ($@)" : ""));
@@ -870,9 +884,20 @@ sub _answer {           # answer the oldest outstanding command, OK unless told
     $cb->( $ok ? { result => 'OK' } : undef, $raw );
     return 1;
 }
+# $linkUp is the control link.  On a down link Control::send never queues and
+# fails the callback, and the stub has to carry the same contract or it tests a
+# send that always succeeds: the load-on-a-down-link tests below flip it.
+our $linkUp = 1;
 {
     no warnings 'redefine';
     *Plugins::HQPlayerBridge::Player::_send      = sub {
+        if ( !$linkUp ) {
+            # Control::send FAILS the callback on a down link (next event-loop
+            # turn, via _failLater) - with $raw undef, because nothing replied.
+            # The stub has to do it too.
+            $_[2]->( undef, undef ) if $_[2];
+            return;
+        }
         push @sent, $_[1];
         push @sentCb, $_[2] if $_[2];
         return;
@@ -931,7 +956,6 @@ $c->hqWanted('play');
 $c->_onStatus({ state => 2, position => 31 }, '');
 is(scalar(@{$ctl->{calls}}), '0',
    'but a PLAYING push during our own 300ms pause fade does NOT un-pause LMS');
-
 
 # ---------------------------------------------------------------------------
 # Volume is SHARED, not owned.  HQPlayer holds the real level in dB and splits
@@ -1298,6 +1322,40 @@ $p->controller($lc);
 # so age the player first wherever a REAL end is meant.
 sub aged { $_[0]->hqStartedAt( Time::HiRes::time() - 30 ); return }
 
+print "-- a load in the drop->reconnect window --\n";
+{
+    # Control::send NO LONGER CONNECTS on demand: on a down link it fails the
+    # command on the next event-loop turn.  _queueTrack used to gate on "an
+    # hqControl object exists", which is true straight through a drop, so all
+    # three sends failed and the PlaylistAdd callback reported `PlaylistAdd
+    # refused` - one PROBLEM_OPENING per track as LMS walked the playlist.
+    # Fail the load ONCE, at the guard, and put nothing on the wire.
+    my ( @sent, @failed );
+    no warnings qw(redefine once);
+    local *Plugins::HQPlayerBridge::Player::_send       = sub { push @sent, $_[1] };
+    local *Plugins::HQPlayerBridge::Player::_loadFailed = sub { push @failed, $_[1] };
+    local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+
+    my $dn = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:55', 'paddr', 1.0, undef, 12, undef);
+    $dn->hqControl( bless {}, 'DownCtl' );
+    $dn->_queueTrack( 'http://x/one.flac', $one, undef );
+    is(scalar @sent,   '0', 'a load on a DOWN link puts nothing on the wire');
+    is(scalar @failed, '1', 'and fails the load exactly once, not once per command');
+    is($failed[0], 'no control link', 'with the link as the reason, not a PlaylistAdd refusal');
+
+    # CONTROL: the guard must not reject a load the link would have carried.
+    @sent = (); @failed = ();
+    my $lv = Plugins::HQPlayerBridge::Player->new('02:99:88:77:66:56', 'paddr', 1.0, undef, 12, undef);
+    $lv->hqControl( bless {}, 'FakeCtl' );
+    $lv->_queueTrack( 'http://x/one.flac', $one, undef );
+    is(scalar @sent,   '3', 'CONTROL: a live link still sends Stop, PlaylistClear and PlaylistAdd');
+    is(scalar @failed, '0', 'and fails nothing');
+}
+{
+    package DownCtl;
+    sub up { 0 }          # the drop window: a link that send() would refuse
+}
+
 # helper: one pushed <Status/>, with the metadata child HQPlayer really sends.
 # $track is HQPlayer's own playlist index (it reports track="n" tracks_total="n"
 # on every push), which is what a gapless hand-over is observed by.
@@ -1441,6 +1499,73 @@ print "-- a load that genuinely fails --\n";
        'a rejected PlaylistAdd IS reported as a failed load');
     ok(scalar(!grep { $_ eq '<Play/>' } @sent),
        'and Play is never sent for a track HQPlayer refused');
+}
+
+print "-- a SYNCED player losing its link mid-load does not fail the group's track --\n";
+{
+    # Control::_dropLink tells the plugin first, and a synced member leaves its
+    # group there: playerInactive -> _stopClient -> stop(). Only then is the
+    # PlaylistAdd in flight failed. LMS fails a track for the WHOLE group when
+    # one member reports it, so that failure must find its load retired.
+    my $mk = sub {
+        my $pl = Plugins::HQPlayerBridge::Player->new($_[0], 'paddr', 1.0, undef, 12, undef);
+        $pl->hqControl( bless {}, 'FakeCtl' );
+        my $cc = LoadController->new($one);
+        $pl->controller($cc);
+        @sent = (); @sentCb = ();
+        $pl->play({ controller => $cc });
+        $cc->{calls} = [];
+        return ( $pl, $cc );
+    };
+
+    my ( $sp, $sc ) = $mk->('02:99:88:77:66:61');
+    my $inflight = shift @sentCb;     # the PlaylistAdd, still unanswered
+    {
+        local $linkUp = 0;
+        $sp->stop;                    # what playerInactive's _stopClient does
+        $inflight->( undef, undef );  # then _dropLink fails the stranded command
+    }
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$sc->{calls}}),
+       'synced: the stranded load is retired by the stop, not reported against the group');
+
+    # A SOLO player is not made inactive, so nothing retires the load and the
+    # stranded PlaylistAdd reaches its callback with NO reply ($raw undef).
+    # That is the link, not the track: it used to be reported as `PlaylistAdd
+    # refused` - a skip - so a restart or config save mid-load moved the
+    # playlist one track on. It is the link-down stop now, as in _queueTrack.
+    my ( $op, $oc ) = $mk->('02:99:88:77:66:62');
+    $inflight = shift @sentCb;
+    Slim::Utils::Timers::_reset(); @ex = ();
+    { local $linkUp = 0; $inflight->( undef, undef ); }
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$oc->{calls}}),
+       'solo: a PlaylistAdd stranded by a link drop is NOT handed to LMS as a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 1, 'solo: it stops the player, once');
+    is($op->hqFailRun, '0', 'and the run is cleared by that trip');
+
+    # The same for <Play/>: PlaylistAdd accepted, then the link goes.
+    my ( $yp, $yc ) = $mk->('02:99:88:77:66:63');
+    _answer(1);                                        # PlaylistAdd -> OK
+    my $playCb = $sentCb[0];                           # the <Play/> callback
+    ok(scalar( grep { $_ eq '<Play/>' } @sent ), 'Play was sent after the accepted PlaylistAdd');
+    Slim::Utils::Timers::_reset(); @ex = ();
+    { local $linkUp = 0; $playCb->( undef, undef ); }
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$yc->{calls}}),
+       'solo: a Play stranded by a link drop is NOT handed to LMS as a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 1, 'solo: it stops the player, once');
+
+    # CONTROL: HQPlayer ANSWERING Error is a refused track - still a skip.
+    # Without this the no-reply branch could swallow every failure and pass.
+    my ( $rp, $rc ) = $mk->('02:99:88:77:66:64');
+    Slim::Utils::Timers::_reset(); @ex = ();
+    _answer(0);                                        # PlaylistAdd -> Error
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$rc->{calls}}),
+       'CONTROL: a PlaylistAdd HQPlayer answered with Error is still a skip');
+    Slim::Utils::Timers::_fireAll();
+    is(scalar( grep { $_ eq 'stop' } @ex ), 0, 'CONTROL: and does not stop the player');
+
+    Slim::Utils::Timers::_reset(); @ex = ();
 }
 
 print "-- the start deadline: an ack that never becomes playback --\n";
@@ -1694,6 +1819,30 @@ print "-- the circuit breaker: N consecutive failed loads stop the player --\n";
         ok(scalar( $mod =~ /hqStarted\( 1 \);.*?hqFailRun\( 0 \)/s ),
            'and the start latch is what clears the run');
     }
+
+    # NO LINK IS NOT A BAD TRACK. Play pressed while HQPlayer is off used to be
+    # reported as a skippable failure: LMS moved on, met the same missing link,
+    # and only FAIL_LIMIT stopped it - the playlist two tracks on, nothing
+    # played. The first load now trips the stop and the playlist stays put.
+    my ( $np, $nc ) = $mk->('02:cb:00:00:00:04');
+    $np->hqControl( bless {}, 'DownCtl' );
+    @sent = (); @sentCb = (); $nc->{calls} = []; @ex = ();
+    Slim::Utils::Timers::_reset();
+    $np->play({ controller => $nc });
+    ok(scalar(!grep { $_ eq 'playerStreamingFailed' } @{$nc->{calls}}),
+       'no link: the load is NOT handed to LMS as a skip');
+    ok(!$stopped->(), 'and the stop is deferred one turn, not dispatched inside play()');
+    Slim::Utils::Timers::_fireAll();
+    is($stopped->(), 1, 'no link: the FIRST failed load stops the player, once');
+    is($np->hqFailRun, '0', 'and the run is cleared by that trip, as at the limit');
+    is(scalar @sent, '0', 'and nothing went on the wire');
+
+    # CONTROL: a live link that refuses the TRACK is still a skip, below the limit
+    $np->hqControl( bless {}, 'FakeCtl' );
+    $failOnce->( $np, $nc );
+    ok(scalar(grep { $_ eq 'playerStreamingFailed' } @{$nc->{calls}}),
+       'CONTROL: a refused track on a live link is still reported for LMS to skip');
+    ok(!$stopped->(), 'and does not stop the player');
 
     Slim::Utils::Timers::_reset();
     @ex = ();
@@ -2789,6 +2938,53 @@ print "-- gapless: the guards --\n";
 }
 
 {
+    # REVIEW 2026-09-28 finding 2: NO REPLY to the hand-over PlaylistAdd (a link
+    # drop, or the 30s reply timeout, which drops the link) was demoted like a
+    # refusal - but HQPlayer may have appended it, advance into it unseen, and
+    # the held load then plays it TWICE. Unreachable since NO LINK STOPS LMS:
+    # _dropLink tells the link-down listener FIRST (linkDropped keeps the
+    # pre-queued uri, schedules the stop), THEN fails the in-flight append; the
+    # stop clears the demoted item, and at link-back a HQPlayer playing that
+    # track is stopped. Pinned end to end through the real _appendTrack.
+    my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f6', 'paddr', 1.0, undef, 12, undef);
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    my $gc = LoadController->new($one);
+    $gp->controller($gc);
+
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });
+    my ($u1) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    _answer(); _answer();
+    status( $gp, 2, $u1, 1, 1 );
+
+    $gc->{song} = $two; $gc->{playing} = 1;
+    @sent = (); @sentCb = ();
+    $gp->play({ controller => $gc });                   # the hand-over append
+    my ($u2) = ( grep { /^<PlaylistAdd\b/ } @sent )[0] =~ m{\buri="([^"]+)"};
+    ok( defined $u2 && $gp->hqNext && $gp->hqNext->{mode} eq 'queue', 'a hand-over append is in flight' );
+
+    # _dropLink's order: the listener first, then the in-flight command fails
+    Slim::Utils::Timers::_reset(); @ex = ();
+    $gp->hqControl( bless {}, 'DownCtl' );
+    $gp->linkDropped;
+    ( shift @sentCb )->( undef, undef );
+    is( $gp->hqNext && $gp->hqNext->{mode}, 'load', 'the no-reply callback still demotes it (the finding\'s premise)' );
+
+    Slim::Utils::Timers::_fireAll();
+    ok( scalar( grep { $_ eq 'stop' } @ex ), 'but the link drop stops LMS on the next turn' );
+    { local $linkUp = 0; $gp->stop; }                 # LMS acting on that stop
+    is( $gp->hqNext, '(undef)', 'which DISCARDS the held item - it can never be loaded a second time' );
+
+    # link back: HQPlayer DID take the append and advanced into it
+    $gp->hqControl( bless {}, 'FakeCtl' );
+    @sent = (); $gc->{calls} = [];
+    status( $gp, 2, $u2, 3, 2 );
+    is( join( ',', @sent ), '<Stop/>', 'and a HQPlayer playing the appended track at link-back is stopped - no double play' );
+    ok( !grep( { /^<PlaylistAdd\b/ } @sent ), 'nothing is loaded' );
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+}
+
+{
     # A hand-over cannot carry a seek: <Seek> acts on what is playing now, not
     # on a queued item.  The full load can, so it takes that call.
     my $gp = Plugins::HQPlayerBridge::Player->new('02:aa:bb:cc:dd:f0', 'paddr', 1.0, undef, 12, undef);
@@ -3093,6 +3289,994 @@ sub _chained {
         'and not as the end of the playlist' );
     is( scalar( grep { /^<PlaylistAdd\b/ } @sent ), '0',
         'and nothing is loaded over the top of it' );
+}
+# ---------------------------------------------------------------------------
+# NO LINK: LMS STOPS, NOTHING IS SENT, AND THE NEXT PLAY IS THE LISTENER'S.
+# Simon's rule 2026-09-28 (Player::linkDropped). A settings change can drop the
+# link while HQPlayer plays on; a restart or config save clears its queue. So a
+# drop stops LMS, and the first push after it is not followed as a change made
+# outside LMS. A first cut PAUSED instead: a paused LMS followed a local file
+# played from HQPlayer's own UI as "resumed outside LMS" and started LMS's track
+# over it (1.0.35 regression, seen live).
+# ---------------------------------------------------------------------------
+print "-- a link drop stops LMS, and HQPlayer's own playback is left alone --\n";
+{
+    package DropCtl;
+    sub new       { bless { st => 'play', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub pause     { push @{$_[0]->{calls}}, 'pause';  $_[0]->{st} = 'pause' }
+    sub resume    { push @{$_[0]->{calls}}, 'resume'; $_[0]->{st} = 'play' }
+    sub stop      { push @{$_[0]->{calls}}, 'stop';   $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {} sub playerTrackStarted {} sub playerEndOfStream {}
+    sub playerReadyToStream {}  sub playerStopped {}
+    package DownCtl; sub up { 0 } sub connected { 0 } sub proven { 0 }
+    package main;
+
+    my $LMS  = 'http://h/music/1/download.flac';    # the track LMS handed over
+    my $NEXT = 'http://h/music/2/download.flac';    # its pre-queued next one
+    my $OWN  = 'file:///Users/me/Music/own.flac';   # played from HQPlayer's UI
+
+    my $mk = sub {
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:dd:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $dc = DropCtl->new;
+        $p->controller($dc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqStarted(1); $p->hqPlayAck(1); $p->hqWanted('play'); $p->hqStartedAt(0);
+        $p->hqURL($LMS);
+        return ( $p, $dc );
+    };
+    # the drop, as _onLinkState + LMS acting on our stop: returns with the link DOWN
+    my $drop = sub {
+        my ( $p, $dc ) = @_;
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+        $p->hqControl( bless {}, 'DownCtl' );
+        $p->linkDropped;
+        Slim::Utils::Timers::_fireAll();
+        my $ex = join(',', @ex);
+        if ( $ex eq 'stop' ) { local $linkUp = 0; $dc->{st} = 'stop'; $p->stop; }
+        return $ex;
+    };
+    my $push = sub {    # a status push, with the uri HQPlayer says it is playing
+        my ( $p, $dc, $state, $uri, %a ) = @_;
+        $p->hqControl( bless {}, 'FakeCtl' );
+        @sent = (); @ex = (); $dc->{calls} = [];
+        my $raw = '<Status state="' . $state . '">'
+                . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>';
+        $p->_onStatus( { state => $state, position => 50, %a }, $raw );
+    };
+
+    # 1. a settings change: the link drops, HQPlayer plays LMS's track on
+    my ( $p, $dc ) = $mk->(1);
+    is($drop->($p, $dc), 'stop', 'a proven link drop while playing STOPS LMS');
+    is(scalar(@sent), '0', 'and nothing is sent to HQPlayer while the link is down');
+    $push->($p, $dc, 2, $LMS);
+    is(join(',', @sent), '<Stop/>', 'link back, HQPlayer still playing LMS\'s track: it is stopped to match LMS');
+    is(join(',', @{$dc->{calls}}), '', 'and LMS is not moved');
+    $push->($p, $dc, 0, undef);
+    is(join(',', @sent) . join(',', @{$dc->{calls}}), '', 'the next push (STOPPED) changes nothing');
+
+    # ...including a pre-queued next track HQPlayer advanced into during the gap
+    ( $p, $dc ) = $mk->(2);
+    $p->hqNext({ mode => 'queue', url => $NEXT, acked => 1 });
+    $drop->($p, $dc);
+    $push->($p, $dc, 2, $NEXT);
+    is(join(',', @sent), '<Stop/>', 'the pre-queued next track counts as LMS\'s too - kept before the stop cleared hqNext');
+
+    # ...and on tier 5, where HQPlayer reports the signed url WITHOUT its query
+    # string (measured 2026-08-30): the kept uri has it, the push does not
+    ( $p, $dc ) = $mk->(9);
+    $p->hqURL('https://cdn.example/file?uid=1&hmac=abc');
+    $drop->($p, $dc);
+    $push->($p, $dc, 2, 'https://cdn.example/file');
+    is(join(',', @sent), '<Stop/>', 'tier 5: HQPlayer still playing LMS\'s signed url (query stripped) is stopped too');
+    is(join(',', @{$dc->{calls}}), '', 'and LMS is not moved');
+
+    # 2. THE REGRESSION: after a restart, a local file played from HQPlayer's own UI
+    ( $p, $dc ) = $mk->(3);
+    $drop->($p, $dc);
+    $push->($p, $dc, 2, $OWN);
+    is(join(',', @{$dc->{calls}}) . join(',', @ex), '', 'HQPlayer playing its OWN file at link-up: LMS is NOT started');
+    is(scalar(@sent), '0', 'and HQPlayer is not stopped - it is not LMS\'s track');
+    $push->($p, $dc, 2, $OWN);
+    is(join(',', @{$dc->{calls}}) . join(',', @ex), '', 'nor on any later push (a stopped LMS follows no PLAYING)');
+    is(scalar(@sent), '0', 'and nothing is sent - no <Volume>, no load');
+
+    # 3. a restart / config save: link back, HQPlayer STOPPED with its queue gone
+    ( $p, $dc ) = $mk->(4);
+    $p->hqTrackSerial(5);
+    $drop->($p, $dc);
+    $push->($p, $dc, 0, undef, track_serial => 0);
+    is(join(',', @{$dc->{calls}}), '', 'link back, HQPlayer STOPPED: nothing followed');
+    is(scalar(@sent), '0', 'and nothing is sent to it');
+
+    # a player LMS holds PAUSED when the link drops is stopped too
+    ( $p, $dc ) = $mk->(5);
+    $p->hqStarted(0); $dc->{st} = 'pause';
+    is($drop->($p, $dc), 'stop', 'a drop while PAUSED also stops LMS');
+
+    # CONTROLS
+    ( $p, $dc ) = $mk->(6);
+    $p->hqStarted(0); $dc->{st} = 'stop';
+    is($drop->($p, $dc), '', 'CONTROL: a drop while STOPPED stops nothing');
+    $push->($p, $dc, 2, $OWN);
+    is(scalar(@sent), '0', 'CONTROL: and an HQPlayer playing on its own is left alone at link-up');
+
+    ( $p, $dc ) = $mk->(7);
+    Slim::Utils::Timers::_reset(); @ex = ();
+    $p->hqControl( bless {}, 'DownCtl' );
+    $p->linkDropped;
+    $p->hqGen( $p->hqGen + 1 );     # a stop or a new load in the same turn
+    Slim::Utils::Timers::_fireAll();
+    is(join(',', @ex), '', 'CONTROL: a stop or load in the same turn supersedes the link-drop stop');
+
+    ( $p, $dc ) = $mk->(8);
+    $p->hqWanted('pause'); $dc->{st} = 'pause'; @sent = ();
+    $push->($p, $dc, 2, $LMS);
+    is(join(',', @{$dc->{calls}}), 'resume',
+       'CONTROL: with NO drop, a pause in LMS then play on HQPlayer\'s remote is still followed');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+}
+# ---------------------------------------------------------------------------
+# HQPLAYER PLAYING ITS OWN THING NEVER DRIVES LMS. Seen live 2026-09-28: LMS
+# paused, a local file played from HQPlayer's own UI, and the "resumed outside
+# LMS" follow (release behaviour) resumed LMS's track and pushed LMS's stored
+# volume. Now a uri LMS never handed over detaches HQPlayer from LMS's transport
+# until LMS loads again; play in LMS then reloads LMS's track from its start.
+# ---------------------------------------------------------------------------
+print "-- HQPlayer playing its own file does not drive LMS --\n";
+{
+    package FSong; sub new { bless {}, shift } sub index { 3 }
+    package FCtl;
+    sub new       { bless { st => 'pause', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub playingSong { FSong->new }
+    sub pause     { push @{$_[0]->{calls}}, 'pause';  $_[0]->{st} = 'pause' }
+    sub resume    { push @{$_[0]->{calls}}, 'resume'; $_[0]->{st} = 'play' }
+    sub stop      { push @{$_[0]->{calls}}, 'stop';   $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {} sub playerTrackStarted {} sub playerEndOfStream { push @{$_[0]->{calls}}, 'playerEndOfStream' }
+    sub playerReadyToStream {}  sub playerStopped {}
+    package main;
+
+    my $LMS = 'http://h/music/7/download.flac';
+    my $OWN = 'file:///Users/me/Music/own.flac';
+
+    my $mk = sub {   # LMS PAUSED on its own track, which HQPlayer holds
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:ee:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $fc = FCtl->new;
+        $p->controller($fc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqStarted(1); $p->hqPlayAck(1); $p->hqWanted('pause'); $p->hqStartedAt(0);
+        $p->hqURL($LMS); $p->hqTrackSerial(4);
+        return ( $p, $fc );
+    };
+    my $push = sub {
+        my ( $p, $fc, $state, $uri, %a ) = @_;
+        @sent = (); @ex = (); $fc->{calls} = [];
+        my $raw = '<Status state="' . $state . '">'
+                . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>';
+        $p->_onStatus( { state => $state, position => 12, %a }, $raw );
+    };
+
+    my ( $p, $fc ) = $mk->(1);
+    $push->($p, $fc, 2, $OWN);
+    is(join(',', @{$fc->{calls}}), '', 'LMS paused, HQPlayer plays its OWN file: LMS is NOT resumed');
+    is(scalar(@sent), '0', 'and nothing is sent to HQPlayer');
+    $push->($p, $fc, 2, $OWN);
+    is(join(',', @{$fc->{calls}}), '', 'nor on the next push');
+    $push->($p, $fc, 0, undef, track_serial => 5);
+    is(join(',', @{$fc->{calls}}), '', 'its own file ENDING is not read as LMS\'s track ending');
+
+    # LMS's stop must not stop HQPlayer's own playback
+    ( $p, $fc ) = $mk->(2);
+    $push->($p, $fc, 2, $OWN);
+    @sent = ();
+    $p->stop;
+    is(scalar(@sent), '0', 'stop in LMS does not stop what HQPlayer is playing on its own');
+
+    # play in LMS afterwards: a fresh load of LMS's track, never <Play/>
+    ( $p, $fc ) = $mk->(3);
+    $push->($p, $fc, 2, $OWN);
+    $fc->{st} = 'play'; @sent = (); @ex = (); Slim::Utils::Timers::_reset();
+    $p->resume;
+    is(scalar(@sent), '0', 'play in LMS afterwards sends no <Play/> - HQPlayer no longer holds LMS\'s track');
+    Slim::Utils::Timers::_fireAll();
+    is(join(',', @ex), 'playlist jump 3', 'it reloads LMS\'s track from its start (absolute index)');
+    Slim::Utils::Timers::_reset(); @ex = ();
+
+    # CONTROLS: HQPlayer resuming LMS's OWN track is still followed
+    ( $p, $fc ) = $mk->(4);
+    $push->($p, $fc, 2, $LMS);
+    is(join(',', @{$fc->{calls}}), 'resume', 'CONTROL: HQPlayer resuming LMS\'s own track is still followed');
+
+    ( $p, $fc ) = $mk->(5);
+    $p->hqURL('https://cdn.example.com/file?uid=1&eid=9&hmac=zz');
+    $push->($p, $fc, 2, 'https://cdn.example.com/file');
+    is(join(',', @{$fc->{calls}}), 'resume', 'CONTROL: a streaming uri with its query string stripped is still LMS\'s');
+
+    ( $p, $fc ) = $mk->(6);
+    $push->($p, $fc, 2, undef);
+    is(join(',', @{$fc->{calls}}), 'resume', 'CONTROL: a push naming no uri is followed as before');
+
+    ( $p, $fc ) = $mk->(7);
+    $push->($p, $fc, 2, $OWN);
+    $p->hqWanted('pause'); @sent = ();
+    $p->hqForeign(0);        # what _startTrack does on LMS's next load
+    $push->($p, $fc, 2, $LMS);
+    is(join(',', @{$fc->{calls}}), 'resume', 'CONTROL: once LMS has loaded again, following resumes');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+
+    # HQPLAYER HUNG, TWICE, LIVE 2026-09-28: LMS paused, a library item played
+    # from HQPlayer's UI. HQPlayer reports STOPPED first (no uri), and the
+    # bridge answered with a <Stop/> mid-switch - `no reply to <Stop> after 30s`.
+    ( $p, $fc ) = $mk->(8);
+    $push->($p, $fc, 0, undef, track_serial => 4);          # cursor unchanged
+    is(join(',', @{$fc->{calls}}), '', 'LMS paused, HQPlayer STOPS on its own: LMS is not stopped or advanced');
+    is(scalar(@sent), '0', 'and NOTHING is sent to HQPlayer mid-switch');
+    $push->($p, $fc, 2, $OWN);
+    is(join(',', @{$fc->{calls}}) . scalar(@sent), '0', 'then its library item plays: still nothing, either way');
+
+    ( $p, $fc ) = $mk->(9);
+    $p->hqNext({ mode => 'queue', url => 'http://h/music/8/download.flac', acked => 1 });
+    Slim::Utils::Timers::_reset();
+    $push->($p, $fc, 0, undef, track_serial => 5);          # cursor moved: reads like an END
+    is(join(',', @{$fc->{calls}}), '', 'LMS paused, a stop that looks like the END is not reported either');
+    is(Slim::Utils::Timers::_pending(), '0', 'and no end-of-stream is armed - no load can follow');
+
+    # LMS PLAYING and stopped at HQPlayer's UI: still followed, but NOT echoed
+    ( $p, $fc ) = $mk->(10);
+    $p->hqWanted('play'); $fc->{st} = 'play';
+    $push->($p, $fc, 0, undef, track_serial => 4);
+    is(join(',', @{$fc->{calls}}), 'stop', 'LMS playing, stopped at HQPlayer: LMS follows the stop, as before');
+    @sent = ();
+    $p->stop;                                             # the controller calling back into us
+    is(scalar(@sent), '0', 'and the stop is NOT echoed back as a <Stop/> to an HQPlayer that already stopped');
+
+    # CONTROL: an ordinary stop from LMS still reaches HQPlayer
+    ( $p, $fc ) = $mk->(11);
+    $p->hqWanted('play'); @sent = ();
+    $p->stop;
+    is(join(',', @sent), '<Stop/>', 'CONTROL: a stop pressed in LMS is still sent to HQPlayer');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+}
+# ---------------------------------------------------------------------------
+# ...AND AFTER AN ALBUM ENDS. LMS's _Stopped never calls stop() at a natural
+# end, so the end of the playlist left hqWanted 'play' (and hqPlayAck 1): the
+# hqForeign gate, keyed on "LMS is not playing", let HQPlayer's own file
+# through, and it latched as LMS's track - playerTrackStarted, a followed
+# pause and its end all sent to a STOPPED controller (_Invalid, backtraces).
+# Review 2026-09-28 round 5, finding 2.
+# ---------------------------------------------------------------------------
+print "-- HQPlayer's own file after an album ends does not drive LMS --\n";
+{
+    package ECtl;
+    sub new       { bless { st => 'play', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub pause     { push @{$_[0]->{calls}}, 'pause';  $_[0]->{st} = 'pause' }
+    sub resume    { push @{$_[0]->{calls}}, 'resume'; $_[0]->{st} = 'play' }
+    sub stop      { push @{$_[0]->{calls}}, 'stop';   $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {}
+    sub playerTrackStarted  { push @{$_[0]->{calls}}, 'playerTrackStarted' }
+    sub playerEndOfStream   { push @{$_[0]->{calls}}, 'playerEndOfStream' }
+    sub playerReadyToStream { push @{$_[0]->{calls}}, 'playerReadyToStream'; $_[0]->{onReady}->() if $_[0]->{onReady} }
+    sub playerStopped       { push @{$_[0]->{calls}}, 'playerStopped'; $_[0]->{st} = 'stop' }
+    package main;
+
+    my $LMS = 'http://h/music/9/download.flac';
+    my $OWN = 'file:///Users/me/Music/own.flac';
+
+    my $mk = sub {   # the LAST track of LMS's playlist playing, then its end
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:ff:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $ec = ECtl->new;
+        $p->controller($ec);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqStarted(1); $p->hqPlayAck(1); $p->hqWanted('play'); $p->hqStartedAt(0);
+        $p->hqURL($LMS);
+        return ( $p, $ec );
+    };
+    my $push = sub {
+        my ( $p, $ec, $state, $uri ) = @_;
+        @sent = (); @ex = (); $ec->{calls} = [];
+        $p->hqStartedAt(0);     # well past START_GRACE, as a real listen would be
+        my $raw = '<Status state="' . $state . '">'
+                . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>';
+        $p->_onStatus( { state => $state, position => 5 }, $raw );
+        Slim::Utils::Timers::_fireAll();
+    };
+
+    my ( $p, $ec ) = $mk->(1);
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+    $p->_endOfStream;
+    is(join(',', @{$ec->{calls}}), 'playerEndOfStream,playerReadyToStream,playerStopped',
+       'CONTROL: the end of the playlist is still reported to LMS');
+    is($p->hqWanted, 'stop', 'and the bridge now reads LMS as stopped, as after a stop');
+
+    $push->($p, $ec, 2, $OWN);
+    is(join(',', @{$ec->{calls}}), '', 'HQPlayer plays its OWN file after the album: nothing reaches LMS');
+    is(scalar(@sent), '0', 'and nothing is sent to HQPlayer');
+    is($p->hqForeign ? 1 : 0, 1, 'HQPlayer is detached, as when LMS is paused or stopped');
+    $push->($p, $ec, 1, $OWN);
+    is(join(',', @{$ec->{calls}}), '', 'its pause in HQPlayer is not followed into LMS');
+    $push->($p, $ec, 2, $OWN);
+    $push->($p, $ec, 0, undef);
+    is(join(',', @{$ec->{calls}}), '', 'nor is its end');
+
+    # HQPlayer replaying LMS's own last track from its playlist history
+    ( $p, $ec ) = $mk->(2);
+    Slim::Utils::Timers::_reset();
+    $p->_endOfStream;
+    $push->($p, $ec, 2, $LMS);
+    is(join(',', @{$ec->{calls}}), '', 'LMS\'s last track replayed from HQPlayer\'s UI is not latched as started');
+    is(scalar(@sent), '0', 'and nothing is sent');
+
+    # ORDER: ReadyToStream can load LMS's next track synchronously (play() ->
+    # _startTrack sets 'play'); the end-of-playlist reset must not overwrite it.
+    # Simulated here by what _startTrack writes.
+    ( $p, $ec ) = $mk->(3);
+    $ec->{onReady} = sub { $p->hqWanted('play'); $p->hqPlayAck(0) };
+    Slim::Utils::Timers::_reset();
+    $p->_endOfStream;
+    is($p->hqWanted, 'play', 'CONTROL: a next track loaded from ReadyToStream keeps hqWanted \'play\'');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+}
+# ---------------------------------------------------------------------------
+# A LINK DROP BETWEEN THE PLAY ACK AND THE FIRST PLAYING PUSH. linkDropped
+# acted only on hqStarted or a paused LMS, so a drop in that window (~0.33s,
+# ~2.3s on a rate change) stopped nothing, and the start deadline 10s later
+# reported the track as bad: PROBLEM_OPENING, LMS one track on. Review
+# 2026-09-28 round 5, finding 3.
+# ---------------------------------------------------------------------------
+print "-- a link drop after the Play ack, before HQPlayer reports playing --\n";
+{
+    package ACtl;
+    sub new       { bless { st => 'play', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub stop      { push @{$_[0]->{calls}}, 'stop'; $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {} sub playerEndOfStream {} sub playerReadyToStream {} sub playerStopped {}
+    sub playerTrackStarted    { push @{$_[0]->{calls}}, 'playerTrackStarted' }
+    sub playerStreamingFailed { push @{$_[0]->{calls}}, "playerStreamingFailed($_[2])" }
+    package main;
+
+    my $LMS = 'http://h/music/5/download.flac';
+
+    # fire only what is due NOW - the 10s start deadline must wait, as it would live
+    my $fireDue = sub {
+        while ( my ($t) = grep { $_->{when} <= Time::HiRes::time() + 1 } @{ Slim::Utils::Timers::_timers() } ) {
+            Slim::Utils::Timers::killTimers( $t->{obj}, $t->{cb} );
+            $t->{cb}->( $t->{obj}, @{ $t->{args} } );
+        }
+    };
+    my $mk = sub {   # Play acked, deadline armed, no PLAYING push yet
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:ac:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $ac = ACtl->new;
+        $p->controller($ac);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqURL($LMS); $p->hqWanted('play'); $p->hqPlayAck(1); $p->hqStarted(0);
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+        $p->_armStartDeadline( $p->hqGen || 0 );
+        return ( $p, $ac );
+    };
+    my $drop = sub {  # the proven drop, LMS acting on our stop, then 10s passing
+        my ( $p, $ac ) = @_;
+        $p->hqControl( bless {}, 'DownCtl' );
+        $p->linkDropped;
+        $fireDue->();
+        my $ex = join(',', @ex);
+        if ( $ex eq 'stop' ) { local $linkUp = 0; $ac->{st} = 'stop'; $p->stop; }
+        Slim::Utils::Timers::_fireAll();
+        return $ex;
+    };
+    my $push = sub {
+        my ( $p, $ac, $state, $uri ) = @_;
+        $p->hqControl( bless {}, 'FakeCtl' );
+        @sent = (); @ex = (); $ac->{calls} = [];
+        my $raw = '<Status state="' . $state . '">'
+                . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>';
+        $p->_onStatus( { state => $state, position => 0 }, $raw );
+        Slim::Utils::Timers::_fireAll();
+    };
+
+    my ( $p, $ac ) = $mk->(1);
+    is($drop->($p, $ac), 'stop', 'a proven drop after the Play ack, before PLAYING, STOPS LMS');
+    is(join(',', @{$ac->{calls}}), '', 'and the start deadline does NOT report it as a bad track (no PROBLEM_OPENING)');
+    is(scalar(@sent), '0', 'and nothing is sent while the link is down');
+    $push->($p, $ac, 2, $LMS);
+    is(join(',', @sent), '<Stop/>', 'link back, HQPlayer playing the track after all: it is stopped to match LMS');
+    is(join(',', @{$ac->{calls}}), '', 'and LMS is not moved or started');
+
+    # a restart: link back with HQPlayer STOPPED and its queue gone
+    ( $p, $ac ) = $mk->(2);
+    $drop->($p, $ac);
+    $push->($p, $ac, 0, undef);
+    is(join(',', @sent) . join(',', @{$ac->{calls}}), '', 'link back after a restart: nothing sent, LMS not moved');
+
+    # CONTROLS
+    ( $p, $ac ) = $mk->(3);
+    $ac->{st} = 'stop';
+    is($drop->($p, $ac), '', 'CONTROL: a stale ack under a STOPPED LMS stops nothing');
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: and keeps nothing for the link-back stop');
+
+    ( $p, $ac ) = $mk->(4);
+    Slim::Utils::Timers::_fireAll();            # no drop: HQPlayer simply never starts
+    is(join(',', @{$ac->{calls}}), 'playerStreamingFailed(PROBLEM_OPENING)',
+       'CONTROL: with NO drop, an ack that never plays is still reported by the deadline');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+}
+# ---------------------------------------------------------------------------
+# PLAY PRESSED WHILE THE LINK IS STILL DOWN. _startTrack cleared hqReconcile
+# before _queueTrack found the link down, so the failed load threw away the
+# uris the link-back <Stop/> needed: an HQPlayer that played through the drop
+# played LMS's old track on under a stopped LMS. The reconcile is now cleared
+# by a load's first REPLY (PlaylistAdd). Review 2026-09-28 round 5, finding 4.
+# ---------------------------------------------------------------------------
+print "-- play pressed while the link is down keeps the link-back stop --\n";
+{
+    package RCtl;
+    sub new       { bless { st => 'play', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub stop      { push @{$_[0]->{calls}}, 'stop'; $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {} sub playerEndOfStream {} sub playerReadyToStream {} sub playerStopped {}
+    sub playerBufferReady {}
+    sub playerTrackStarted    { push @{$_[0]->{calls}}, 'playerTrackStarted' }
+    sub playerStreamingFailed { push @{$_[0]->{calls}}, "playerStreamingFailed($_[2])" }
+    package main;
+
+    my $X = 'http://h/music/5/download.flac';     # playing when the link dropped
+    my $Y = 'http://h/music/6/download.flac';
+
+    my $fireDue = sub {
+        while ( my ($t) = grep { $_->{when} <= Time::HiRes::time() + 1 } @{ Slim::Utils::Timers::_timers() } ) {
+            Slim::Utils::Timers::killTimers( $t->{obj}, $t->{cb} );
+            $t->{cb}->( $t->{obj}, @{ $t->{args} } );
+        }
+    };
+    my $lmsStops = sub {    # due timers fire; a stop they execute reaches us as LMS's
+        my ( $p, $rc ) = @_;
+        $fireDue->();
+        my $e = join(',', @ex); @ex = ();
+        if ( $e eq 'stop' ) { local $linkUp = 0; $rc->{st} = 'stop'; $p->stop; }
+        return $e;
+    };
+    my $mk = sub {   # X playing, then a PROVEN drop HQPlayer plays through
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:a4:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $rc = RCtl->new;
+        $p->controller($rc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqURL($X); $p->hqWanted('play'); $p->hqPlayAck(1); $p->hqStarted(1); $p->hqStartedAt(0);
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+        $p->hqControl( bless {}, 'DownCtl' );
+        $p->linkDropped;
+        $lmsStops->($p, $rc);
+        return ( $p, $rc );
+    };
+    my $load = sub {   # the listener presses play in LMS: the REAL _startTrack
+        my ( $p, $rc, $url ) = @_;
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $url };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $rc->{st} = 'play'; @sent = (); @sentCb = ();
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+        return $lmsStops->($p, $rc);
+    };
+    my $push = sub {   # link back: HQPlayer reports what it is playing
+        my ( $p, $rc, $state, $uri ) = @_;
+        $p->hqControl( bless {}, 'FakeCtl' );
+        @sent = (); @ex = (); $rc->{calls} = [];
+        $p->_onStatus( { state => $state, position => 30 },
+            '<Status state="' . $state . '">' . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>' );
+        Slim::Utils::Timers::_fireAll();
+    };
+
+    # 1. the same track: play on a down link, the load fails and LMS stops again
+    my ( $p, $rc ) = $mk->(1);
+    is($load->($p, $rc, $X), 'stop', 'play pressed with the link still down: the load fails and LMS stops');
+    ok(ref $p->hqReconcile && grep( { $_ eq $X } @{ $p->hqReconcile } ),
+       'and the uris the link-back stop needs are KEPT');
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '<Stop/>', 'link back, HQPlayer still playing LMS\'s track: it is stopped');
+    is(join(',', @{$rc->{calls}}), '', 'and LMS is not moved or started');
+
+    # A SECOND DROP INSIDE THE RECONCILE STOP'S REPLY WINDOW. The reconcile is
+    # the THIRD stop-sender and recorded nothing, so this drop kept nothing
+    # (hqStarted/hqPlayAck are 0 and LMS is stopped, so linkDropped returns
+    # before it reads hqURL), set no hqReconcile, and NO further <Stop/> was
+    # ever sent: HQPlayer played on for good. Review 2026-09-28 round 7,
+    # finding 1.
+    ok(ref $p->hqUnstopped && grep( { $_ eq $X } @{ $p->hqUnstopped } ),
+       'and the uri the reconcile is stopping is KEPT until HQPlayer answers');
+    my @rcb = @sentCb;                        # the reconcile <Stop/>, unanswered
+    $p->hqControl( bless {}, 'DownCtl' );
+    @ex = ();
+    $p->linkDropped;                          # the listener runs BEFORE _dropLink fails it
+    $rcb[0]->( undef, undef ) if $rcb[0];
+    ok(ref $p->hqReconcile && grep( { $_ eq $X } @{ $p->hqReconcile } ),
+       'a SECOND drop before HQPlayer answers keeps it for the next link-back');
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '<Stop/>', 'and the link back stops HQPlayer AGAIN');
+
+    # CONTROL: HQPlayer ANSWERS the reconcile stop - nothing is kept, so a
+    # later drop of a stopped LMS has nothing to reconcile and sends no stop
+    ( $p, $rc ) = $mk->(6);
+    $load->($p, $rc, $X);
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '<Stop/>', 'CONTROL: the reconcile stop goes out');
+    my $scb = $sentCb[-1];                    # never dereference it blind: an
+    ok($scb ? 1 : 0, 'CONTROL: the reconcile stop asks for a reply');
+    $scb->( { result => 'OK' }, '<Stop result="OK"/>' ) if $scb;
+    is($p->hqUnstopped ? 1 : 0, 0, 'CONTROL: HQPlayer answered it - nothing is kept');
+    $p->hqControl( bless {}, 'DownCtl' );
+    @ex = ();
+    $p->linkDropped;
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: so a second drop keeps nothing');
+
+    # 2. a DIFFERENT track picked: X is now hqPrevURL, so its pushes read as
+    # stale - the reconcile runs AHEAD of the stale test, so the stop is not
+    # held back STALE_LIMIT pushes
+    ( $p, $rc ) = $mk->(2);
+    $load->($p, $rc, $Y);
+    my ( $stopAt, $moved ) = ( 0, '' );
+    for my $n ( 1 .. 8 ) {
+        $push->($p, $rc, $n == 1 ? 2 : 0, $X);    # stopped after the <Stop/>, still naming X
+        $moved .= join(',', @{$rc->{calls}});
+        $stopAt ||= $n if grep { $_ eq '<Stop/>' } @sent;
+    }
+    is($stopAt, 1, 'a different track picked: HQPlayer\'s old track is stopped on the FIRST push');
+    is($moved, '', 'and LMS is not moved or started');
+    is($p->hqURL, $Y, 'and its later pushes naming the old track are not ADOPTED as "our idea is wrong"');
+
+    # CONTROL: a load sent on the RESTORED link - the link-up <Status/> reply
+    # (HQPlayer still on X) comes first and consumes the reconcile while the
+    # load is in flight: no <Stop/> (the load's own is on its way), and X
+    # stays hqPrevURL, so its straddling pushes are still suppressed
+    ( $p, $rc ) = $mk->(5);
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $Y };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $rc->{st} = 'play'; @sent = (); @sentCb = ();
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+    }
+    my @cb = @sentCb;
+    $push->($p, $rc, 2, $X);
+    is(join(',', @sent), '', 'CONTROL: link-up push during a load on the restored link: no reconcile <Stop/>');
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: and the reconcile is consumed');
+    is($p->hqPrevURL, $X, 'CONTROL: and the old track stays hqPrevURL - the load\'s straddle is still guarded');
+    $cb[0]->( { result => 'OK' }, '<PlaylistAdd result="OK"/>' );
+    $sentCb[-1]->( { result => 'OK' }, '<Play result="OK"/>' );
+    Slim::Utils::Timers::_reset();   # the 10s start deadline the ack armed: no time passes here
+    $push->($p, $rc, 2, $X);
+    is(join(',', @{$rc->{calls}}), '', 'CONTROL: a late push of the OLD track after the Play ack does not latch the new one');
+    $push->($p, $rc, 2, $Y);
+    is(join(',', @{$rc->{calls}}), 'playerTrackStarted', 'CONTROL: the new track\'s own push does');
+
+    # CONTROLS: a load that REACHES HQPlayer clears it, before the Play ack
+    ( $p, $rc ) = $mk->(3);
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $Y };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $p->hqControl( bless {}, 'FakeCtl' );    # connecting or back: send() queues
+        $rc->{st} = 'play'; @sent = (); @sentCb = ();
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+    }
+    ok($p->hqReconcile, 'CONTROL: a load on the link keeps the reconcile until HQPlayer answers');
+    $sentCb[0]->( { result => 'OK' }, '<PlaylistAdd result="OK"/>' );
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: its PlaylistAdd reply clears it - the load\'s own <Stop/> went first');
+    $sentCb[1]->( { result => 'OK' }, '<Play result="OK"/>' );
+    $push->($p, $rc, 2, $Y);
+    is(join(',', @{$rc->{calls}}), 'playerTrackStarted', 'CONTROL: and the new track starts normally - its ack is not wiped');
+    is(join(',', @sent), '', 'CONTROL: and nothing is stopped');
+
+    ( $p, $rc ) = $mk->(4);
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $Y };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $rc->{st} = 'play'; @sent = (); @sentCb = ();
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+    }
+    $sentCb[0]->( undef, '<PlaylistAdd result="Error"/>' );
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: a REFUSED PlaylistAdd clears it too - the <Stop/> still went first');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+}
+
+# ---------------------------------------------------------------------------
+# SKIP BACK AT HQPLAYER. Seen live 2026-09-28 on a local album: skip back in
+# HQPlayer to a track LMS put in its playlist, and LMS kept playing, showing the
+# wrong track. Simon's rule: LMS follows. hqItems records what the bridge put
+# in HQPlayer's playlist since the last full load, because HQPlayer's numbers
+# never line up with LMS's. Review 2026-09-28 round 5, findings 5 and 6.
+# ---------------------------------------------------------------------------
+print "-- a skip back at HQPlayer: LMS follows to that track --\n";
+{
+    package SkTrack; sub new { bless { url => $_[1] }, $_[0] } sub url { $_[0]->{url} }
+    package SkSong;
+    sub new   { bless { i => $_[1], t => SkTrack->new( $_[2] ) }, $_[0] }
+    sub index { $_[0]->{i} }
+    sub track { $_[0]->{t} }
+    package SkCtl;
+    sub new       { bless { st => 'play', calls => [] }, $_[0] }
+    sub isPlaying { $_[0]->{st} eq 'play' }
+    sub isPaused  { $_[0]->{st} eq 'pause' }
+    sub isStopped { $_[0]->{st} eq 'stop' }
+    sub pause  { push @{$_[0]->{calls}}, 'pause';  $_[0]->{st} = 'pause' }
+    sub resume { push @{$_[0]->{calls}}, 'resume'; $_[0]->{st} = 'play' }
+    sub stop   { push @{$_[0]->{calls}}, 'stop';   $_[0]->{st} = 'stop' }
+    sub playerStatusHeartbeat {} sub playerEndOfStream {} sub playerReadyToStream {} sub playerStopped {}
+    sub playerBufferReady {}
+    sub playerTrackStarted { push @{$_[0]->{calls}}, 'playerTrackStarted' }
+    package main;
+
+    # LMS's playlist, by (shuffled) index -> url: what Slim::Player::Playlist::track answers
+    our %LMSPL;
+    no warnings 'redefine';
+    local *Slim::Player::Playlist::track = sub { $LMSPL{ $_[1] } };
+    use warnings 'redefine';
+
+    my $L = sub { "http://h/music/$_[0]/download.flac" };
+    my $Q = sub { "https://streaming-qobuz-std.akamaized.net/file?eid=$_[0]&hmac=x$_[0]" };
+
+    my $mk = sub {   # items at HQPlayer positions 1..n, LMS on position $at
+        my ( $n, $at, $urls, $lmsIdx ) = @_;
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:5b:00:00:00:' . sprintf('%02d', $n), 'paddr', 1.0, undef, 12, undef);
+        my $sc = SkCtl->new;
+        $p->controller($sc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        my @items = map { $p->_itemFor( $urls->[$_], SkSong->new( $lmsIdx + $_, $urls->[$_] ) ) } 0 .. $#$urls;
+        %LMSPL = map { ( $lmsIdx + $_ ) => $urls->[$_] } 0 .. $#$urls;
+        $p->hqItems( \@items );
+        $p->hqTrackNo($at); $p->hqURL( $urls->[ $at - 1 ] ); $p->hqPrevURL( $at > 1 ? $urls->[ $at - 2 ] : undef );
+        $p->hqWanted('play'); $p->hqStarted(1); $p->hqPlayAck(1); $p->hqStartedAt(0);
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+        return ( $p, $sc );
+    };
+    my $push = sub {   # one status push; due timers fire (the follow is one turn later)
+        my ( $p, $sc, $state, $track, $total, $uri ) = @_;
+        @sent = (); @ex = (); $sc->{calls} = [];
+        $p->_onStatus( { state => $state, position => 1, track => $track, tracks_total => $total },
+            qq{<Status state="$state" track="$track" tracks_total="$total">}
+          . ( $uri ? qq{<metadata uri="$uri"/>} : '' ) . '</Status>' );
+        for my $t ( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Player::_jumpTo } @{ Slim::Utils::Timers::_timers() } ) {
+            Slim::Utils::Timers::killTimers( $t->{obj}, $t->{cb} );
+            $t->{cb}->( $t->{obj}, @{ $t->{args} } );
+        }
+        return join(',', @ex);
+    };
+
+    # -- the list is BUILT by the real load and hand-over code --
+    {
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:5b:00:00:01:01', 'paddr', 1.0, undef, 12, undef);
+        my $sc = SkCtl->new; $p->controller($sc); $p->hqControl( bless {}, 'FakeCtl' );
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_metadata = sub { '' };
+        {
+            local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $L->(1) };
+            @sent = (); @sentCb = ();
+            $p->_startTrack( SkSong->new( 4, $L->(1) ), undef );
+        }
+        is(join(',', map { $_->{url} } @{ $p->hqItems || [] }), $L->(1), 'a full load starts the list with its one track');
+        is(join(',', map { "$_->{idx}|$_->{turl}" } @{ $p->hqItems || [] }), '4|' . $L->(1),
+           'recording its LMS index and url - plain values, not the Song');
+        @sentCb = ();
+        $p->_appendTrack( $L->(2), SkSong->new( 5, $L->(2) ), 1 );
+        $sentCb[0]->( { result => 'OK' }, '<PlaylistAdd result="OK"/>' );
+        is(join(',', map { $_->{url} } @{ $p->hqItems || [] }), $L->(1) . ',' . $L->(2),
+           'a hand-over HQPlayer accepts is appended');
+        $p->hqNext(undef); @sentCb = ();
+        $p->_appendTrack( $L->(3), SkSong->new( 6, $L->(3) ), 1 );
+        $sentCb[0]->( undef, '<PlaylistAdd result="Error"/>' );
+        is(scalar @{ $p->hqItems || [] }, 2, 'a REFUSED hand-over is not');
+        $p->hqNext({ mode => 'queue', url => $L->(3), acked => 1 });
+        $p->flush;
+        ok(!defined $p->hqItems, 'a flush (a PlaylistClear under a playing track) turns the list off');
+        $p->hqItems([ { url => 'x' } ]);
+        { local $linkUp = 0; $p->stop; }
+        ok(!defined $p->hqItems, 'and so does a stop (a link drop\'s included)');
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+    }
+
+    # -- the follow --
+    my ( $p, $sc ) = $mk->(1, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), 'playlist jump 0',
+       'local album, HQPlayer skips back to item 1: LMS jumps to that track');
+    is(scalar(@sent), '0', 'and nothing is sent to HQPlayer by the bridge itself');
+    is(join(',', @{$sc->{calls}}), '', 'and LMS is not resumed on its own track first');
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), '', 'a second push of the same skip does not jump again');
+
+    ( $p, $sc ) = $mk->(2, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $p->hqWanted('pause'); $sc->{st} = 'pause';
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), 'playlist jump 0', 'LMS paused: it follows too (the playlist is LMS\'s)');
+    is(join(',', @{$sc->{calls}}), '', 'without first resuming its own track');
+
+    ( $p, $sc ) = $mk->(3, 3, [ $Q->(1), $Q->(2), $Q->(3) ], 0);
+    is($push->($p, $sc, 2, 2, 3, 'https://streaming-qobuz-std.akamaized.net/file'), 'playlist jump 1',
+       'Qobuz (every uri reports as .../file): the position picks the track');
+
+    # HQPlayer's numbers are its own: after a restart and a new load at LMS index 7
+    ( $p, $sc ) = $mk->(4, 2, [ $L->(8), $L->(9) ], 7);
+    is($push->($p, $sc, 2, 1, 2, $L->(8)), 'playlist jump 7',
+       'HQPlayer\'s item 1 is LMS index 7 here - its numbers are never read as LMS\'s');
+
+    # -- CONTROLS: every check must agree, or nothing is done --
+    ( $p, $sc ) = $mk->(5, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 2, 3, 3, $L->(3)), '', 'CONTROL: an ordinary advance (forward) is not a skip back');
+    ( $p, $sc ) = $mk->(13, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 2, 2, 3, $L->(2)), '', 'CONTROL: HQPlayer restarting the CURRENT track is not either');
+    ( $p, $sc ) = $mk->(6, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 1, 1, 3, $L->(1)), '', 'CONTROL: a skip back while HQPlayer is PAUSED is NOT followed (settled 2026-09-28, see the ledger)');
+    ( $p, $sc ) = $mk->(7, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 2, 1, 4, $L->(1)), '', 'CONTROL: tracks_total not matching the list (edited behind us): nothing');
+    ( $p, $sc ) = $mk->(8, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    is($push->($p, $sc, 2, 1, 3, $L->(99)), '', 'CONTROL: a local uri that is not the one recorded there: nothing');
+    ( $p, $sc ) = $mk->(9, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $p->hqWanted('stop'); $sc->{st} = 'stop';
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), '', 'CONTROL: LMS stopped: nothing (a stopped LMS follows no play)');
+    ( $p, $sc ) = $mk->(10, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $p->hqItems(undef);
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), '', 'CONTROL: the list is off (after a flush or a stop): nothing');
+    ( $p, $sc ) = $mk->(11, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $LMSPL{0} = $L->(42);
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), '', 'CONTROL: LMS\'s playlist edited since (index 0 is another track): no jump');
+    # a STOPPED push as HQPlayer switches arms the end-of-track (hand-over pending);
+    # the follow is then declined - that end must not fire on a PLAYING HQPlayer
+    ( $p, $sc ) = $mk->(14, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $p->hqNext({ mode => 'queue', url => $L->(3), acked => 1, serial => 1 }); $p->hqTrackSerial(1);
+    $p->_onStatus( { state => 0, position => 0, track => 2, tracks_total => 3, track_serial => 2 },
+        '<Status state="0" track="2" tracks_total="3" track_serial="2"></Status>' );
+    my $armed = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Player::_endOfStream } @{ Slim::Utils::Timers::_timers() };
+    $LMSPL{0} = $L->(42);
+    $push->($p, $sc, 2, 1, 3, $L->(1));
+    my $left = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Player::_endOfStream } @{ Slim::Utils::Timers::_timers() };
+    is("$armed/$left", '1/0', 'a stop on the way to the skip armed an end-of-track; the skip cancels it, even when the follow is declined');
+
+    ( $p, $sc ) = $mk->(12, 2, [ $L->(1), $L->(2), $L->(3) ], 0);
+    $p->hqForeign(1);
+    is($push->($p, $sc, 2, 1, 3, $L->(1)), '', 'CONTROL: HQPlayer detached (its own playback): nothing');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+}
+# ---------------------------------------------------------------------------
+# ONE STRIP, ONE FORGET, ONE DETACH. The detach reset was written out in four
+# places and the copies drifted (one cancelled the start deadline, one did not
+# clear hqPlayAck), and the query strip in seven - a raw `eq` beside them is
+# how the tier 5 reconcile bug happened. Review 2026-09-28 round 5, finding 8.
+# ---------------------------------------------------------------------------
+print "-- one strip, one forget, one detach --\n";
+{
+    my $sq = \&Plugins::HQPlayerBridge::Player::_stripQuery;
+    is($sq->('https://cdn/file?eid=1&hmac=x'), 'https://cdn/file', '_stripQuery drops everything from the first ?');
+    is($sq->('http://h/music/1/download.flac'), 'http://h/music/1/download.flac', 'and leaves a uri without one alone');
+    is($sq->(undef), '', 'and reads undef as empty');
+
+    my $p = Plugins::HQPlayerBridge::Player->new('02:de:00:00:00:01', 'paddr', 1.0, undef, 12, undef);
+    $p->hqStarted(1); $p->hqPlayAck(1); $p->hqNext({ mode => 'queue' }); $p->hqArmNext(1);
+    Slim::Utils::Timers::_reset();
+    Slim::Utils::Timers::setTimer( $p, Time::HiRes::time() + 3,  \&Plugins::HQPlayerBridge::Player::_endOfStream );
+    Slim::Utils::Timers::setTimer( $p, Time::HiRes::time() + 10, \&Plugins::HQPlayerBridge::Player::_startDeadline, 0 );
+    $p->_detach;
+    is(join(',', map { $_ // 'undef' } $p->hqForeign, $p->hqStarted, $p->hqPlayAck, $p->hqNext, $p->hqArmNext),
+       '1,0,0,undef,0', '_detach: foreign, and nothing started, acked or queued');
+    is(Slim::Utils::Timers::_pending(), '0', 'and neither the end-of-track nor the start deadline is left armed');
+
+    my $n = () = $src =~ m{s/\\\?\.\*\\z//s}g;    # $src: Player.pm, read at the top of this file
+    is($n, '1', 'the query strip is written ONCE (_stripQuery) - no inline copy to drift');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+}
+# ---------------------------------------------------------------------------
+# A DROP WHILE LMS'S <Stop/> IS STILL QUEUED. stop() and _startTrack reset
+# every flag linkDropped read when the <Stop/> was QUEUED - behind a slow
+# hand-over PlaylistAdd it waits seconds - so a drop there kept nothing, and
+# the old track played on under a stopped LMS. Review 2026-09-28 round 6,
+# finding 1. hqUnstopped holds it until HQPlayer answers.
+# ---------------------------------------------------------------------------
+print "-- a drop while LMS's <Stop/> is still queued keeps the link-back stop --\n";
+{
+    my $A = 'http://h/music/7/download.flac';     # playing
+    my $B = 'http://h/music/8/download.flac';     # pre-queued, its append in flight
+    my $C = 'http://h/music/9/download.flac';     # the track Next loads
+
+    my $fireDue = sub {
+        while ( my ($t) = grep { $_->{when} <= Time::HiRes::time() + 1 } @{ Slim::Utils::Timers::_timers() } ) {
+            Slim::Utils::Timers::killTimers( $t->{obj}, $t->{cb} );
+            $t->{cb}->( $t->{obj}, @{ $t->{args} } );
+        }
+    };
+    my $mk = sub {   # A playing, B's hand-over PlaylistAdd sent and unanswered
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:a6:00:00:00:0' . shift, 'paddr', 1.0, undef, 12, undef);
+        my $rc = RCtl->new;
+        $p->controller($rc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqURL($A); $p->hqWanted('play'); $p->hqPlayAck(1); $p->hqStarted(1); $p->hqStartedAt(0);
+        $p->hqNext({ mode => 'queue', url => $B, acked => 0 });
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+        return ( $p, $rc );
+    };
+    my $drop = sub {   # a PROVEN drop: the listener first, then _dropLink fails what was queued
+        my ( $p, $rc, @cbs ) = @_;
+        $p->hqControl( bless {}, 'DownCtl' );
+        $p->linkDropped;
+        { local $linkUp = 0; $_->( undef, undef ) for @cbs; }
+        $fireDue->();
+        my $e = join(',', @ex); @ex = ();
+        if ( $e eq 'stop' ) { local $linkUp = 0; $rc->{st} = 'stop'; $p->stop; }
+        return $e;
+    };
+    my $push = sub {
+        my ( $p, $rc, $state, $uri ) = @_;
+        $p->hqControl( bless {}, 'FakeCtl' );
+        @sent = (); @ex = (); $rc->{calls} = [];
+        $p->_onStatus( { state => $state, position => 30 },
+            '<Status state="' . $state . '">' . ( $uri ? '<metadata uri="' . $uri . '"/>' : '' ) . '</Status>' );
+        Slim::Utils::Timers::_fireAll();
+    };
+
+    # 1. Stop pressed in LMS: the <Stop/> queues behind B's append, then the drop
+    my ( $p, $rc ) = $mk->(1);
+    $rc->{st} = 'stop';
+    $p->stop;
+    is(join(',', @sent), '<Stop/>', 'LMS stop: the <Stop/> is queued');
+    $drop->($p, $rc, @sentCb);
+    ok(ref $p->hqReconcile && grep( { $_ eq $A } @{ $p->hqReconcile } ),
+       'a drop before HQPlayer answered the <Stop/>: the playing track is KEPT for the link-back stop');
+    $push->($p, $rc, 2, $A);
+    is(join(',', @sent), '<Stop/>', 'link back, HQPlayer still playing it: it is stopped to match LMS');
+    is(join(',', @{$rc->{calls}}), '', 'and LMS is not moved or started');
+
+    # 2. Next pressed: the real _startTrack moves hqURL to C before the drop
+    ( $p, $rc ) = $mk->(2);
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $C };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+    }
+    is($p->hqURL, $C, 'LMS Next: hqURL already names the new track');
+    is($drop->($p, $rc, @sentCb), 'stop', 'the drop fails the new load, and LMS stops');
+    ok(ref $p->hqReconcile && grep( { $_ eq $A } @{ $p->hqReconcile } ),
+       'and the OLD track HQPlayer is still playing is kept, though it is only hqPrevURL now');
+    $push->($p, $rc, 2, $A);
+    is(join(',', @sent), '<Stop/>', 'link back, HQPlayer still on the old track: it is stopped on the first push');
+
+    # CONTROLS
+    ( $p, $rc ) = $mk->(3);
+    $rc->{st} = 'stop';
+    $p->stop;
+    $sentCb[-1]->( { result => 'OK' }, '<Stop result="OK"/>' ) if @sentCb;   # HQPlayer answers the <Stop/>
+    is($p->hqUnstopped ? 1 : 0, 0, 'CONTROL: HQPlayer ANSWERED the <Stop/>: nothing is kept any more');
+    $drop->($p, $rc);
+    is($p->hqReconcile ? 1 : 0, 0, 'CONTROL: and a later drop of a stopped LMS keeps nothing');
+
+    ( $p, $rc ) = $mk->(4);
+    {
+        no warnings 'redefine';
+        local *Plugins::HQPlayerBridge::Player::_resolveURL = sub { $C };
+        local *Plugins::HQPlayerBridge::Player::_metadata   = sub { '' };
+        $p->_startTrack( bless( {}, 'RSong' ), undef );
+    }
+    $sentCb[-1]->( { result => 'OK' }, '<PlaylistAdd result="OK"/>' );
+    is($p->hqUnstopped ? 1 : 0, 0, 'CONTROL: the new load\'s PlaylistAdd reply clears it - its own <Stop/> went first');
+
+    ( $p, $rc ) = $mk->(5);
+    $p->hqStarted(0); $p->hqPlayAck(0); $rc->{st} = 'stop';
+    $p->stop;
+    is($p->hqUnstopped ? 1 : 0, 0, 'CONTROL: a stop when HQPlayer had nothing of LMS\'s keeps nothing');
+    $drop->($p, $rc, @sentCb);
+    $push->($p, $rc, 2, $A);
+    is(join(',', @sent), '', 'CONTROL: and link-back stops nothing');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
+}
+# ---------------------------------------------------------------------------
+# THE PUSHES BEHIND A SKIP FOLLOW. _readable dispatches a whole read's pushes
+# synchronously, so the second push of a skip arrives before the one-turn-later
+# jump. _skippedBack disarmed only hqItems, and that push went through the
+# resume / position / foreign paths. Review 2026-09-28 round 6, finding 2.
+# And an append still waiting for its reply made tracks_total one more than
+# the list, the follow declined, and the pick read as foreign. Finding 3.
+# ---------------------------------------------------------------------------
+print "-- the pushes behind a skip follow, and a skip during an append --\n";
+{
+    our %LMSPL2;
+    no warnings 'redefine';
+    local *Slim::Player::Playlist::track = sub { $LMSPL2{ $_[1] } };
+    use warnings 'redefine';
+
+    my $L = sub { "http://h/music/$_[0]/download.flac" };
+    my $Q = sub { "https://streaming-qobuz-std.akamaized.net/file?eid=$_[0]&hmac=x$_[0]" };
+    my $QR = 'https://streaming-qobuz-std.akamaized.net/file';
+
+    my $mk = sub {   # LMS PAUSED on HQPlayer item $at
+        my ( $n, $at, $urls ) = @_;
+        my $p  = Plugins::HQPlayerBridge::Player->new('02:5c:00:00:00:' . sprintf('%02d', $n), 'paddr', 1.0, undef, 12, undef);
+        my $sc = SkCtl->new;
+        $p->controller($sc);
+        $p->hqControl( bless {}, 'FakeCtl' );
+        $p->hqItems([ map { $p->_itemFor( $urls->[$_], SkSong->new( $_, $urls->[$_] ) ) } 0 .. $#$urls ]);
+        %LMSPL2 = map { $_ => $urls->[$_] } 0 .. $#$urls;
+        $p->hqTrackNo($at); $p->hqURL( $urls->[ $at - 1 ] ); $p->hqPrevURL( $at > 1 ? $urls->[ $at - 2 ] : undef );
+        $p->hqWanted('pause'); $sc->{st} = 'pause';
+        $p->hqStarted(1); $p->hqPlayAck(1); $p->hqStartedAt(0);
+        Slim::Utils::Timers::_reset(); @ex = (); @sent = ();
+        return ( $p, $sc );
+    };
+    my $one = sub {   # one push, NO timers fired - as in one read
+        my ( $p, $state, $track, $total, $uri ) = @_;
+        $p->_onStatus( { state => $state, position => 42, track => $track, tracks_total => $total },
+            qq{<Status state="$state" track="$track" tracks_total="$total">}
+          . ( $uri ? qq{<metadata uri="$uri"/>} : '' ) . '</Status>' );
+    };
+    my $turn = sub {   # the next event-loop turn: the follow runs
+        for my $t ( grep { $_->{cb} == \&Plugins::HQPlayerBridge::Player::_jumpTo } @{ Slim::Utils::Timers::_timers() } ) {
+            Slim::Utils::Timers::killTimers( $t->{obj}, $t->{cb} );
+            $t->{cb}->( $t->{obj}, @{ $t->{args} } );
+        }
+        return join(',', @ex);
+    };
+
+    # Qobuz, LMS paused on item 2, two PLAYING pushes of the skip in one read
+    my ( $p, $sc ) = $mk->(1, 2, [ $Q->(1), $Q->(2), $Q->(3) ]);
+    $one->($p, 2, 1, 3, $QR);
+    $one->($p, 2, 1, 3, $QR);
+    is(join(',', @{$sc->{calls}}), '', 'Qobuz: the SECOND push of the skip does not resume LMS\'s old track');
+    is($p->hqTrackNo, 2, 'and does not write HQPlayer\'s new position into the old track');
+    is($turn->(), 'playlist jump 0', 'and the follow still jumps to the track HQPlayer went back to');
+    is($p->hqSkipPending ? 1 : 0, 0, 'and once it has run, pushes are read again');
+
+    # local album, LMS on item 3 (item 1 is not hqPrevURL, so it is not stale)
+    ( $p, $sc ) = $mk->(2, 3, [ $L->(1), $L->(2), $L->(3) ]);
+    $one->($p, 2, 1, 3, $L->(1));
+    $one->($p, 2, 1, 3, $L->(1));
+    is($p->hqForeign ? 1 : 0, 0, 'local album: the second push does not detach HQPlayer as foreign');
+    is($turn->(), 'playlist jump 0', 'and LMS follows');
+
+    # a STOPPED push behind it (HQPlayer switching) arms no end-of-track
+    ( $p, $sc ) = $mk->(3, 2, [ $L->(1), $L->(2), $L->(3) ]);
+    $p->hqWanted('play'); $sc->{st} = 'play';
+    $one->($p, 2, 1, 3, $L->(1));
+    $one->($p, 0, 0, 3, undef);
+    my $eos = grep { $_->{cb} == \&Plugins::HQPlayerBridge::Player::_endOfStream } @{ Slim::Utils::Timers::_timers() };
+    is($eos . join(',', @{$sc->{calls}}), '0', 'a STOPPED push behind the skip arms no end-of-track and stops nothing');
+
+    # CONTROLS: the marker cannot outlive the follow
+    ( $p, $sc ) = $mk->(4, 2, [ $L->(1), $L->(2), $L->(3) ]);
+    $LMSPL2{0} = $L->(42);
+    $one->($p, 2, 1, 3, $L->(1));
+    is($turn->(), '', 'CONTROL: a follow declined (LMS\'s playlist edited) does not jump');
+    is($p->hqSkipPending ? 1 : 0, 0, 'CONTROL: and still lets pushes through again');
+    ( $p, $sc ) = $mk->(5, 2, [ $L->(1), $L->(2), $L->(3) ]);
+    $one->($p, 2, 1, 3, $L->(1));
+    { local $linkUp = 0; $p->stop; }
+    is($p->hqSkipPending ? 1 : 0, 0, 'CONTROL: a stop before the follow runs clears it (new generation)');
+    is($turn->(), '', 'CONTROL: and the superseded follow does not jump');
+
+    # FINDING 3: skip back while the next track's append is still unanswered
+    ( $p, $sc ) = $mk->(6, 3, [ $L->(1), $L->(2), $L->(3) ]);   # item 1 is not hqPrevURL: not stale
+    $p->hqNext({ mode => 'queue', url => $L->(4), acked => 0 });
+    $one->($p, 2, 1, 4, $L->(1));
+    is($turn->(), 'playlist jump 0', 'an append in flight (HQPlayer counts 4, the list 3): LMS still follows');
+    is($p->hqForeign ? 1 : 0, 0, 'and HQPlayer is not detached as foreign');
+    ( $p, $sc ) = $mk->(7, 2, [ $L->(1), $L->(2) ]);
+    $p->hqNext({ mode => 'queue', url => $L->(3), acked => 0 });
+    $one->($p, 2, 1, 2, $L->(1));
+    is($turn->(), 'playlist jump 0', 'and before HQPlayer counts it (total still 2) too');
+    ( $p, $sc ) = $mk->(8, 2, [ $L->(1), $L->(2) ]);
+    $p->hqNext({ mode => 'queue', url => $L->(3), acked => 1 });
+    $one->($p, 2, 1, 3, $L->(1));
+    is($turn->(), '', 'CONTROL: one extra with NO append in flight (edited behind us): nothing');
+    ( $p, $sc ) = $mk->(9, 2, [ $L->(1), $L->(2) ]);
+    $p->hqNext({ mode => 'queue', url => $L->(3), acked => 0 });
+    $one->($p, 2, 1, 4, $L->(1));
+    is($turn->(), '', 'CONTROL: TWO extra with an append in flight: nothing');
+    Slim::Utils::Timers::_reset(); @ex = (); @sent = (); @sentCb = ();
 }
 printf "\n%d passed, %d failed\n",$pass,$fail;
 exit($fail?1:0);

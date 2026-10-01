@@ -42,6 +42,8 @@ package Plugins::HQPlayerBridge::Live;
 use strict;
 use warnings;
 
+use Encode ();
+
 use Slim::Utils::Strings qw(cstring);
 use Slim::Web::Pages;
 use Slim::Web::HTTP;
@@ -73,7 +75,14 @@ sub _handler {
 
     return unless $httpClient && $httpClient->connected;
 
+    # OCTETS on the wire, because the Content-Type promises UTF-8 and the
+    # length below has to count what actually goes out.  Encoded only when the
+    # page holds CHARACTERS: cstring() labels that arrive as octets are already
+    # right, and encoding those twice would send mojibake.  strings.txt is all
+    # ASCII today, so this changes nothing yet - it is here so that the first
+    # translated label does not silently truncate the page at the byte count.
     my $body = _page();
+    $body = Encode::encode_utf8($body) if utf8::is_utf8($body);
 
     # The code, FIRST and explicitly - see the trap at the top of this file.
     $response->code(200);
@@ -84,6 +93,17 @@ sub _handler {
     # ruled out while diagnosing it.
     $response->header( 'Cache-Control' => 'no-cache, no-store, must-revalidate' );
     $response->header( Pragma          => 'no-cache' );
+
+    # A RAW HANDLER OWNS ITS FRAMING TOO, not just its status code.  LMS keeps
+    # the connection alive and adds no Content-Length of its own, so without
+    # this the browser is never told where the body ends: the page renders and
+    # its script runs, but the request never completes and the spinner stays
+    # until LMS closes the socket 75s later.  Measured live 2026-09-29 against
+    # the installed build - 53,691 bytes served, no Content-Length, curl timing
+    # out - while a templated LMS page on the same server sends one, and so
+    # does LMS's own raw handler (Web/JSONRPC.pm:349).  Found in
+    # LMS-Eversolo-Screen-Control, whose page was copied from this one.
+    $response->content_length( length $body );
 
     Slim::Web::HTTP::addHTTPResponse( $httpClient, $response, \$body );
 
@@ -116,7 +136,16 @@ sub _page {
         voldn      => cstring( $c, 'PLUGIN_HQPLAYER_CTL_VOLDN' ),
         volup      => cstring( $c, 'PLUGIN_HQPLAYER_CTL_VOLUP' ),
         waiting    => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_WAITING' ),
+        auto       => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_AUTO' ),
+        controls   => cstring( $c, 'PLUGIN_HQPLAYER_LIVE_CONTROLS' ),
     );
+
+    # The waiting line is the mode's own (Plugin::waitingText), so the page is
+    # right from its first paint; the poll keeps it right after that. Reached
+    # at call time: a sibling `use` would die at BEGIN in a checkout.
+    my $wait = Plugins::HQPlayerBridge::Plugin->can('waitingText');
+    my $line = $wait ? $wait->($c) : '';
+    $L{waiting} = $line if length $line;
 
     $_ = _esc($_) for values %L;
 
@@ -256,6 +285,26 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
 .k { color: var(--dim); flex: 0 0 clamp(120px, 12vw, 168px); }
 .v { flex: 1 1 auto; word-break: break-word; }
 .name { font-weight: 600; font-size: 1.08em; margin-bottom: 6px; }
+
+/* WHICH HQPLAYER THE PANEL BELOW IS DRIVING. Drawn only when more than one
+   instance has a player - one instance has nothing to choose between, and a
+   single chip reading its own name is noise. The chips wrap, so three long
+   names do not push the row off a phone. */
+.pick { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.pick.hidden { display: none; }
+.pick .lbl { color: var(--dim); font-size: 0.86em; }
+.chip { padding: 4px 10px; border: 1px solid var(--line); border-radius: 14px;
+        background: var(--card); color: var(--fg); font: inherit; font-size: 0.92em;
+        cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip.on { border-color: var(--accent); color: var(--accent); }
+/* A dot on the chip of an instance that is PLAYING, so the one you are not
+   watching can still be seen to be busy. */
+.chip .pdot { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+              background: var(--ok); margin-left: 6px; vertical-align: middle; }
+/* The selected instance's own card, so the panel and the card below agree. */
+.card.sel { border-color: var(--accent); }
 .ok { color: var(--ok); } .bad { color: var(--bad); }
 .foot { color: var(--dim); font-size: 0.86em; display: flex; gap: 10px; align-items: center; }
 .top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
@@ -273,8 +322,26 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
 /* NOW PLAYING - laid out like Material's: cover left, title/artist/album and
    the controls right. */
 .np { display: flex; gap: var(--gap); align-items: center; }
-.np-art { flex: 0 0 var(--art); width: var(--art); height: var(--art); border-radius: 6px;
-          object-fit: cover; background: var(--line); }
+.np-cover { position: relative; flex: 0 0 var(--art); width: var(--art); height: var(--art); }
+.np-art { width: 100%; height: 100%; border-radius: 6px;
+          object-fit: cover; background: var(--line); display: block; }
+
+/* THE SERVICE BADGE, over the cover's top-right corner - Material's own
+   placement for it (.np-image .np-emblem), its own circle, and its own
+   colours, which are fetched from Material rather than copied here; see
+   loadEmblems(). Hidden unless a service was recognised AND its logo loaded,
+   so a Material-less server draws a plain cover rather than a broken image.
+
+   THE NUMBERS ARE MATERIAL'S, read from its style.css, because the badge is
+   judged side by side with the one on an LMS-Listen-to-Later or
+   LMS-Pitchfork-Reviews row: --small-icon-size 18px inside a circle 8px wider,
+   at --sub-opacity 0.7. A solid badge was the first draft and Simon called it
+   at once - "not as transparent" as the row badge it is meant to match. */
+.np-badge { position: absolute; top: 5px; right: 5px; width: 26px; height: 26px;
+            border-radius: 50%; box-sizing: border-box; opacity: 0.7;
+            display: none; align-items: center; justify-content: center; }
+.np-badge.on { display: flex; }
+.np-badge img { width: 18px; height: 18px; display: block; }
 .np-txt { min-width: 0; flex: 1 1 auto; }
 .np-title { font-size: clamp(17px, 1.5vw, 25px); font-weight: 600; }
 .np-sub { color: var(--dim); margin-top: 2px; font-size: clamp(13px, 1.05vw, 17px); }
@@ -291,7 +358,7 @@ h1 { font-size: clamp(16px, 1.3vw, 21px); margin: 0 0 2px; font-weight: 600; }
    queue is stopped, and a mute button you cannot reach unless music is already
    playing is not a control. So the card keeps its control row and drops
    everything else. */
-.np.idle > .np-art { display: none; }
+.np.idle > .np-cover { display: none; }
 .np.idle .np-title, .np.idle .np-sub,
 .np.idle .np-bar, .np.idle .np-time { display: none; }
 .np.idle .np-ctl { margin-top: 0; }
@@ -401,6 +468,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
   <button id="back" type="button">$L{back}</button>
 </div>
 
+<div id="pick" class="pick hidden"></div>
 <div id="np" class="hidden"></div>
 <div id="cards"><div class="card"><div class="v">$L{waiting}</div></div></div>
 
@@ -433,7 +501,9 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         volume:     "$L{volume}",
         voldn:      "$L{voldn}",
         volup:      "$L{volup}",
-        waiting:    "$L{waiting}"
+        waiting:    "$L{waiting}",
+        auto:       "$L{auto}",
+        controls:   "$L{controls}"
     };
     var cards = document.getElementById('cards');
     var npEl  = document.getElementById('np');
@@ -516,11 +586,82 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     // ---------------------------------------------------------------------
     var el   = null;   // the panel's elements, once built
     var CUR  = null;   // the bridge the controls are addressed to
+    var WAIT = L.waiting;   // what it is waiting for - the poll's `waiting`, true to the mode
+
+    // WHICH INSTANCE THE PANEL DRIVES, when there is more than one.
+    //
+    // Until 1.0.15 there was no choice: pick() took the first bridge that was
+    // playing, so with three instances the other two could only be watched in
+    // the cards below - reported by a user running three. SEL is a playerid,
+    // or null for AUTO, which is that original behaviour and stays the default.
+    //
+    // It is kept in localStorage: a per-viewer convenience, NOT state the
+    // server owns. Both directions are wrapped - the accessor THROWS in some
+    // privacy modes, and a page that cannot remember a choice must still work.
+    var SELKEY = 'hqplive::player';
+    var SEL    = null;
+    var LAST   = [];   // the newest loop, so a chip can switch without waiting for the next poll
+
+    try { SEL = window.localStorage.getItem(SELKEY) || null; } catch (e) { SEL = null; }
+
+    function remember(id) {
+        SEL = id || null;
+        try {
+            if (SEL) { window.localStorage.setItem(SELKEY, SEL); }
+            else     { window.localStorage.removeItem(SELKEY); }
+        } catch (e) { /* private mode: the choice lasts this page load */ }
+    }
+
+    // MATERIAL'S EMBLEM TABLE, FETCHED RATHER THAN COPIED.
+    //
+    // The server sends the same `extid` key LMS-Listen-to-Later and
+    // LMS-Pitchfork-Reviews put on their rows (see Plugin::_extid); what
+    // Material does with one is look up the part before the first ':' in
+    // html/misc/emblems.json, which gives the logo's name and the two colours
+    // it is drawn in. Reading that file at source keeps this badge identical
+    // to the one on every other row in Material - including when Material
+    // changes a colour or adds a service - where a copy of the table here
+    // would quietly drift out of date.
+    //
+    // IT IS ALSO THE TEST FOR MATERIAL ITSELF. This page is reachable
+    // standalone and on a server with no Material installed, where the fetch
+    // 404s, EMBLEMS stays null and no badge is ever drawn; everything else on
+    // the page is untouched. Nothing is retried: a skin does not appear
+    // halfway through a session, and a failed badge is not worth a second
+    // request per page load.
+    var EMBLEMS = null;
+
+    // THE BADGE IS SHOWN ONLY ONCE ITS OWN LOGO HAS LOADED - see build() and
+    // the updater. Its circle is coloured from the emblems TABLE, not from the
+    // image, so colouring it the instant the service changes paints the
+    // PREVIOUS service's logo on the NEW service's disc until the new svg
+    // arrives - a black Qobuz glyph on Tidal's black circle, over artwork the
+    // user is looking at.
+    var badgeWant = null;    // the src THIS track wants, null for no badge
+    var badgeSrc  = null;    // the src actually handed to the img
+    var badgeOk   = false;   // and whether that src has LOADED
+
+    function loadEmblems() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/material/html/misc/emblems.json', true);
+        xhr.timeout = 5000;
+        xhr.onload = function () {
+            if (xhr.status !== 200) { return; }
+            try { EMBLEMS = JSON.parse(xhr.responseText); }
+            catch (e) { EMBLEMS = null; }
+        };
+        xhr.send();
+    }
 
     function build() {
         npEl.innerHTML =
             '<div class="card np" id="npcard">' +
-              '<img class="np-art" id="np-art" alt="">' +
+              '<div class="np-cover" id="np-cover">' +
+                '<img class="np-art" id="np-art" alt="">' +
+                '<span class="np-badge" id="np-badge">' +
+                  '<img id="np-badge-img" alt="">' +
+                '</span>' +
+              '</div>' +
               '<div class="np-txt">' +
                 '<div class="np-title" id="np-title"></div>' +
                 '<div class="np-sub" id="np-sub"></div>' +
@@ -578,7 +719,52 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         // one silent assumption about the markup away from a TypeError that
         // aborts the whole update - and it did, when the page was executed
         // against a real payload.
-        el = { card: g('npcard'), art: g('np-art'), title: g('np-title'),
+        // A LOGO THAT DOES NOT LOAD TAKES THE BADGE WITH IT. The emblems table
+        // can be fetched and an individual svg still fail - a name the table
+        // lists but Material does not ship, or a request that simply fails -
+        // and the circle is drawn from the TABLE, not from the image, so left
+        // alone it would stay: a coloured disc with a broken-image glyph in
+        // it. That is the one thing this badge must never be, because it is
+        // drawn over artwork the user is looking at.
+        //
+        // NOTHING IS REMEMBERED AS BAD. The badge only turns on for a logo
+        // that loaded, so a file that 404s simply never shows one; and the
+        // updater writes src only when it CHANGES, so the missing file is
+        // asked for once per service change rather than once a second. It
+        // recovers on a page reload - which is when a missing file could have
+        // appeared. Blacklisting the src instead would have to guess WHICH
+        // request failed, and an img only ever reports its current one.
+        npEl.addEventListener('error', function (e) {
+            if (e.target === el.badgeImg) {
+                badgeOk = false;
+                el.badge.className = 'np-badge';
+            }
+        }, true);   // CAPTURING: an img error does not bubble
+
+        // The other half. The badge appears the moment its logo lands rather
+        // than up to a poll later.
+        //
+        // THE TWO CHECKS ARE DELIBERATELY DIFFERENT. Whether the logo LOADED
+        // is recorded against badgeSrc, the src actually asked for, because
+        // that fact outlives the track: the updater writes src only when it
+        // CHANGES, so a load discarded here is never asked for again and that
+        // service would stay unbadged for the whole page session. Whether to
+        // show it NOW is gated on badgeWant, what the last updater pass asked
+        // for, so a logo arriving after the track moved to a service-less one
+        // cannot switch the badge back on. The updater shows it on its own the
+        // moment that service returns.
+        npEl.addEventListener('load', function (e) {
+            if (e.target === el.badgeImg &&
+                el.badgeImg.getAttribute('src') === badgeSrc) {
+                badgeOk = true;
+                if (badgeSrc === badgeWant) {
+                    el.badge.className = 'np-badge on';
+                }
+            }
+        }, true);   // CAPTURING: an img load does not bubble either
+
+        el = { card: g('npcard'), cover: g('np-cover'), art: g('np-art'),
+               badge: g('np-badge'), badgeImg: g('np-badge-img'), title: g('np-title'),
                sub: g('np-sub'), bar: g('np-bar'), time: g('np-time'),
                pp: g('c-pp'), ipp: g('i-pp'),
                ivdn: g('i-vdn'), ivup: g('i-vup'), mute: g('c-mute'),
@@ -648,17 +834,83 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         cmd(['mixer', 'volume', (dir > 0 ? '+' : '-') + VOLSTEP]);
     }
 
-    // WHO THE CONTROLS TALK TO. The playing bridge if there is one, otherwise
-    // the first bridge that has a player at all - which is what keeps the
-    // volume reachable while the queue is stopped.
+    // WHO THE CONTROLS TALK TO. A chosen instance if it is still here, else
+    // AUTO: the playing bridge if there is one, otherwise the first bridge that
+    // has a player at all - which is what keeps the volume reachable while the
+    // queue is stopped.
+    //
+    // A CHOICE THAT IS NO LONGER THERE FALLS BACK, IT DOES NOT BLANK THE PAGE.
+    // An instance can leave discovery (switched off, moved, renamed), and a
+    // panel showing nothing would look like the page had broken. SEL is kept
+    // rather than cleared, so the same instance coming back is selected again.
     function pick(loop) {
         var i, idle = null;
+        if (SEL) {
+            for (i = 0; i < loop.length; i++) {
+                if (loop[i].playerid === SEL) { return loop[i]; }
+            }
+        }
         for (i = 0; i < loop.length; i++) {
             if (loop[i].np_title && loop[i].playerid) { return loop[i]; }
             if (!idle && loop[i].playerid) { idle = loop[i]; }
         }
         return idle;
     }
+
+    // THE CHOOSER. Rebuilt only when it would differ, for the same reason the
+    // cards are: an innerHTML rewrite once a second drops focus and any
+    // selection inside it.
+    var pickEl   = document.getElementById('pick');
+    var lastPick = null;
+
+    function renderPick(loop) {
+        var i, b, html = '', n = 0;
+
+        for (i = 0; i < loop.length; i++) { if (loop[i].playerid) { n++; } }
+
+        // One instance is not a choice, and no instance has nothing to choose.
+        if (n < 2) {
+            if (lastPick !== '') { lastPick = ''; pickEl.innerHTML = ''; pickEl.className = 'pick hidden'; }
+            return;
+        }
+
+        html += '<span class="lbl">' + esc(L.controls) + '</span>';
+        html += '<button type="button" class="chip' + (SEL ? '' : ' on') +
+                '" data-id="">' + esc(L.auto) + '</button>';
+        for (i = 0; i < loop.length; i++) {
+            b = loop[i];
+            if (!b.playerid) { continue; }
+            html += '<button type="button" class="chip' +
+                    (SEL === b.playerid ? ' on' : '') + '" data-id="' + esc(b.playerid) + '">' +
+                    esc(b.name || b.id || '') +
+                    (b.np_state === 'playing' ? '<span class="pdot"></span>' : '') +
+                    '</button>';
+        }
+
+        if (html !== lastPick) {
+            lastPick = html;
+            pickEl.innerHTML = html;
+            pickEl.className = 'pick';
+        }
+    }
+
+    // ONE LISTENER ON THE ROW, not one per chip: the row is rewritten whenever
+    // it changes, and a listener bound to a chip would go with it.
+    pickEl.addEventListener('click', function (ev) {
+        var t = ev.target;
+        while (t && t !== pickEl && !(t.className && String(t.className).indexOf('chip') >= 0)) {
+            t = t.parentNode;
+        }
+        if (!t || t === pickEl) { return; }
+
+        remember(t.getAttribute('data-id'));
+        // Switch NOW rather than at the next poll: a second of the old
+        // instance's track under a chip that has already moved reads as a
+        // control that did not take.
+        update(pick(LAST));
+        renderPick(LAST);
+        render(LAST);
+    });
 
     // A COMMAND MUST NOT BE UNDONE BY THE NEXT POLL. The server takes a moment
     // to apply a volume change, so a reply that is already in flight still
@@ -718,10 +970,39 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             if (el.art.getAttribute('src') !== b.np_artwork) {
                 el.art.setAttribute('src', b.np_artwork);
             }
-            el.art.style.display = '';
+            el.cover.style.display = '';
         } else {
             el.art.removeAttribute('src');
-            el.art.style.display = 'none';
+            el.cover.style.display = 'none';
+        }
+
+        // THE SERVICE BADGE. The lookup is Material's own, on Material's own
+        // table: the key before the first ':' of `extid`, the logo from
+        // /material/svg/<name> recoloured through its `c` parameter, and the
+        // circle filled with the service's brand colour.
+        var em = (EMBLEMS && b.np_extid) ? EMBLEMS[b.np_extid.split(':')[0]] : null;
+
+        if (em && em.name) {
+            var src = '/material/svg/' + encodeURIComponent(em.name) +
+                      '?c=' + encodeURIComponent(String(em.color || '#fff').split('#').join(''));
+            badgeWant = src;
+
+            // Written only when it CHANGES, like the artwork above - an img
+            // whose src is reassigned reloads and flickers even when the bytes
+            // are identical. The colour moves in the same breath as the src,
+            // and the badge stays hidden until that src loads, so the disc and
+            // the logo on it can never be from two different services.
+            if (src !== badgeSrc) {
+                badgeSrc = src;
+                badgeOk  = false;
+                el.badge.style.background = em.bgnd || 'transparent';
+                el.badgeImg.setAttribute('src', src);
+            }
+
+            el.badge.className = badgeOk ? 'np-badge on' : 'np-badge';
+        } else {
+            badgeWant = null;
+            el.badge.className = 'np-badge';
         }
 
         var sub = [ b.np_artist, b.np_album ].filter(function (x) { return x; })
@@ -770,13 +1051,16 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
         var html;
 
         if (!loop || !loop.length) {
-            html = '<div class="card"><div class="v">' + esc(L.waiting) + '</div></div>';
+            html = '<div class="card"><div class="v">' + esc(WAIT || L.waiting) + '</div></div>';
         } else {
             html = '';
             for (var i = 0; i < loop.length; i++) {
                 var b = loop[i];
-                var connected = b.connected && b.connected.indexOf('-') > 0;
-                html += '<div class="card">';
+                // the FLAG, never the display string: both "Connected - ip"
+                // and "Not connected - ip" contain a '-'
+                var connected = b.up == 1;
+                html += '<div class="card' +
+                        ((CUR && b.playerid && b.playerid === CUR.playerid) ? ' sel' : '') + '">';
                 html += '<div class="name">' + esc(b.name || b.id || '') + '</div>';
                 html += row(L.status,     b.connected, connected ? 'ok' : 'bad');
                 html += row(L.source,     b.source);
@@ -794,6 +1078,11 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
             html += row(L.processing, b.speed);
                 html += row('', b.tier);
                 html += '</div>';
+            }
+            // A typed address still waiting, BELOW the connected ones - the
+            // server sends '' when nothing is.
+            if (WAIT) {
+                html += '<div class="card"><div class="v">' + esc(WAIT) + '</div></div>';
             }
         }
 
@@ -879,7 +1168,16 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
                 // Nothing is wrong there: the poll answered, and the answer is
                 // that the player has not turned up yet. Say exactly that.
                 var loop = r.bridges_loop || [];
+                // The mode can change under the page (a save in Settings),
+                // so what it is waiting for is re-read on every poll.
+                // '' means waiting for nothing - the line goes; a reply with
+                // no field at all keeps the last one.
+                if (typeof r.waiting === 'string') { WAIT = r.waiting; }
+                LAST = loop;
+                // update() FIRST: it sets CUR, and render() marks that bridge's
+                // card as the selected one.
                 update(pick(loop));
+                renderPick(loop);
                 render(loop);
                 done(true);
             } catch (e) {
@@ -921,6 +1219,7 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border: 0;
     }
 
     iconCheck();
+    loadEmblems();
     poll();
 }());
 </script>

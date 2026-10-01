@@ -4,6 +4,69 @@ All notable changes to **HQPlayer Bridge** are recorded here. This file records
 what users receive: one entry per release published to `main`. Per-version
 development notes live in `CLAUDE.md`.
 
+## 1.0.40 — 2026-10-01
+
+A settings page for connecting to HQPlayer by IP address, a one-tap HQPlayer
+restart from Lyrion, and a bridge that stays in step when HQPlayer restarts or
+is driven from its own screen.
+
+### Improvements
+
+- **Connect to HQPlayer by IP address.** A new settings page (Settings →
+  Plugins → HQPlayer Bridge, or the **Settings** row in Apps) chooses how
+  HQPlayer is found: **Automatically**, the default, or **Only at the
+  addresses below**, for an HQPlayer on another subnet or VLAN, or on a
+  network that blocks multicast. An address is saved only if HQPlayer answers
+  there, and the page says what each save did. A player is identified by
+  HQPlayer's name, so changing its address brings back the same player with
+  its settings and playlist. Updates never change your choice.
+- **Restart HQPlayer from Lyrion.** A **Restart** row under HQPlayer Live View
+  in Apps restarts HQPlayer with its saved settings. That is what you need
+  after power-cycling an NAA endpoint, and unlike HQPlayer's *Refresh devices*
+  it keeps your output mode. It needs the small optional `hqrestart` helper
+  (Python 3.7+) on the HQPlayer machine. It runs on macOS and Linux, and has
+  been tested on macOS so far.
+- **Live view: choose which HQPlayer you control.** With more than one
+  instance, a row of names above the panel picks the one you see and drive.
+  **Auto** follows whichever is playing, and the choice is remembered in that
+  browser.
+- **Live view: the service badge on the cover.** A streamed track's cover
+  carries the service's badge, as Material shows it on its own lists.
+- **Skip back in HQPlayer is followed.** Skipping back to an earlier track in
+  HQPlayer's own playlist while it plays moves LMS to that track too.
+- **New HQPlayers appear sooner.** A second HQPlayer switched on while another
+  is connected used to take up to 10 minutes to show up. It now takes about
+  15 seconds.
+- **Connected means connected.** A player shows as connected only while
+  HQPlayer is actually answering, as Lyrion's own players do, so an HQPlayer
+  that is switched off no longer looks available. Its player is forgotten after
+  5 minutes, as Lyrion does, instead of 15.
+
+### Fixes
+
+- **HQPlayer no longer plays on under a stopped LMS.** If the Bridge loses
+  touch with HQPlayer mid-track (HQPlayer restarted, or a network drop), LMS
+  stops and nothing is sent until the link is back. HQPlayer is then stopped
+  too if it is still playing LMS's track. Nothing starts again by itself.
+- **Play pressed while HQPlayer is unreachable stops cleanly.** It used to skip
+  through the playlist, two tracks on, before giving up.
+- **HQPlayer's own playback is left alone.** Music started from HQPlayer's own
+  screen no longer resumes a paused LMS or plays LMS's track over it. Press
+  play in LMS and it loads its own track again.
+- **An address change no longer splits one HQPlayer into two players.** When
+  HQPlayer's machine moved to a new address, the old address could count as a
+  second HQPlayer, and the player carrying your settings was replaced.
+- **The live view finishes loading.** It used to keep the browser's loading
+  spinner going for over a minute after the page had appeared.
+- **A quieter log.** A lost link is reported once per outage instead of on
+  every retry, and the plugin's log now defaults to warnings only.
+
+### Behaviour change
+
+- **Sync groups are not supported.** An HQPlayer player can't be synced with
+  other players, and a sync group that includes one won't play. Play HQPlayer
+  on its own.
+
 ## 1.0.2 — 2026-09-17
 
 Streamed cover art now reaches the endpoint from Lyrion on your own network,

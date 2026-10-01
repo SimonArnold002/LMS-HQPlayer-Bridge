@@ -2,7 +2,7 @@ PLUGIN_HQPLAYER_BRIDGE
 	EN	HQPlayer Bridge
 
 PLUGIN_HQPLAYER_BRIDGE_DESC
-	EN	Presents each HQPlayer instance on your network as an ordinary Lyrion player, driven directly over HQPlayer's own control API. No UPnP bridge and no external helper binary: HQPlayer fetches the stream straight from Lyrion, so the plugin adds no audio stage of its own. Most of your library is handed over untouched, but Lyrion does still convert formats HQPlayer cannot decode, such as ALAC and AAC. There is nothing to configure - instances are discovered automatically.
+	EN	Presents each HQPlayer instance on your network as an ordinary Lyrion player, driven directly over HQPlayer's own control API. No UPnP bridge and no helper in the playback path: HQPlayer fetches the stream straight from Lyrion, so the plugin adds no audio stage of its own. Most of your library is handed over untouched, but Lyrion does still convert formats HQPlayer cannot decode, such as ALAC and AAC. Instances are discovered automatically - or, with discovery switched off in the settings, taken from IP addresses you enter.
 
 
 PLUGIN_HQPLAYER_STATUS
@@ -55,7 +55,19 @@ PLUGIN_HQPLAYER_TIER5
 
 
 PLUGIN_HQPLAYER_NONE_DESC
-	EN	Nothing answered the discovery probe on 239.192.0.199:4321. Check that HQPlayer is running, that it is on the same network segment as this server, and that its control API is enabled.
+	EN	Nothing answered the discovery probe on 239.192.0.199:4321. Check that HQPlayer is running and that its control API is enabled. An HQPlayer on another network segment, or on a network that blocks multicast, can be used by switching automatic discovery off in this plugin's settings and entering its IP address.
+
+PLUGIN_HQPLAYER_WAIT_AUTO
+	EN	Looking for HQPlayer on this network - it appears here as soon as it answers.
+
+PLUGIN_HQPLAYER_WAIT_ADDR
+	EN	Waiting for HQPlayer at %s - it appears here as soon as it connects.
+
+PLUGIN_HQPLAYER_NONE_DESC_EMPTY
+	EN	Automatic discovery is switched off and no HQPlayer address has been entered, so there are no players. Open Settings and enter the IP address of each HQPlayer, or switch automatic discovery back on.
+
+PLUGIN_HQPLAYER_NONE_DESC_OFF
+	EN	Automatic discovery is switched off, and no HQPlayer at the addresses in this plugin's settings has answered yet. Check that HQPlayer is running at those addresses and that its control API is enabled, or switch automatic discovery back on in the settings.
 
 PLUGIN_HQPLAYER_TRANSPORT_ID
 	EN	id
@@ -97,5 +109,78 @@ PLUGIN_HQPLAYER_CTL_VOLDN
 PLUGIN_HQPLAYER_CTL_VOLUP
 	EN	Increase volume
 
+PLUGIN_HQPLAYER_LIVE_AUTO
+	EN	Auto
+
+PLUGIN_HQPLAYER_LIVE_CONTROLS
+	EN	Controls
+
 PLUGIN_HQPLAYER_LIVE_WAITING
 	EN	Waiting for the player to connect
+
+PLUGIN_HQPLAYER_RESTART
+	EN	Restart %s
+
+PLUGIN_HQPLAYER_RESTART_NOW
+	EN	Restart %s now
+
+PLUGIN_HQPLAYER_RESTART_DESC
+	EN	Playback stops. HQPlayer restarts with its saved settings, which also makes it find a network audio adapter that was switched off and on again.
+
+PLUGIN_HQPLAYER_RESTART_OK
+	EN	HQPlayer restarted (%s s)
+
+PLUGIN_HQPLAYER_RESTART_FAIL
+	EN	Restart failed: %s
+
+PLUGIN_HQPLAYER_RESTART_GONE
+	EN	This HQPlayer is no longer connected
+
+PLUGIN_HQPLAYER_SETTINGS
+	EN	Settings
+
+
+PLUGIN_HQPLAYER_ADDR_TITLE
+	EN	HQPlayer addresses
+
+PLUGIN_HQPLAYER_ADDR_DESC
+	EN	The IP address of each HQPlayer to use, separated by commas, spaces or new lines. IP addresses only, not host names. HQPlayer must be running at a new address when you save - the Bridge connects to it and will not save an address nothing answers at. A player is identified by the name set in HQPlayer, not by its address: delete an address and save to remove its player, and add it back - or replace it with HQPlayer's new address - to get the same player back with its settings and playlist.
+
+PLUGIN_HQPLAYER_AUTO_TITLE
+	EN	Automatically
+
+PLUGIN_HQPLAYER_AUTO_DESC
+	EN	Automatically: the Bridge looks for HQPlayer on this network and follows an HQPlayer whose address changes. Only the addresses below: for an HQPlayer on another subnet, or on a network that blocks multicast - the Bridge then sends no discovery traffic at all, so HQPlayer's log gets no discovery lines, and any player not in the list is removed when you save. The two never run together: going back to automatic clears the list and removes those players, and discovery finds again whichever it can reach, with their settings. With only the addresses, an HQPlayer whose address changes is not followed: update the address, or give that machine a fixed address.
+
+PLUGIN_HQPLAYER_ADDR_BAD
+	EN	Not saved: %s is not an IP address (host names cannot be used). Nothing was changed.
+
+PLUGIN_HQPLAYER_MODE_TITLE
+	EN	Find HQPlayer
+
+PLUGIN_HQPLAYER_MANUAL_TITLE
+	EN	Only at the addresses below
+
+PLUGIN_HQPLAYER_ADDR_DEAD
+	EN	Not saved: nothing answered at %s. HQPlayer must be running at this address. Nothing was changed.
+
+PLUGIN_HQPLAYER_ADDR_CHECKING
+	EN	Checking that HQPlayer answers at %s - this can take a few seconds.
+
+PLUGIN_HQPLAYER_SAVED
+	EN	Saved.
+
+PLUGIN_HQPLAYER_SAVED_AUTO
+	EN	Saved: HQPlayer is now found automatically.
+
+PLUGIN_HQPLAYER_SAVED_CLEARED
+	EN	The addresses were cleared and their players removed.
+
+PLUGIN_HQPLAYER_ADDR_REMOVED
+	EN	Saved: removed %s.
+
+PLUGIN_HQPLAYER_ADDR_EMPTY
+	EN	Saved: no HQPlayer address entered, so there are no players until you add one.
+
+PLUGIN_HQPLAYER_ADDR_FOUND
+	EN	Saved: HQPlayer '%s' answered at %s.

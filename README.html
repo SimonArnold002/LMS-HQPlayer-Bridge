@@ -116,7 +116,7 @@
   <h1>HQPlayer Bridge — LMS Plugin</h1>
   <p class="tagline">A plugin for <strong>Lyrion Music Server</strong> that presents each <strong>HQPlayer</strong> instance on your network as a native LMS player. Play to it, pause, seek, set its volume and see its artwork from Material or any control point, while HQPlayer does the upsampling, filtering and modulation exactly as it always has.</p>
   <div class="badges">
-    <span class="badge accent">v1.0.2</span>
+    <span class="badge accent">v1.0.40</span>
     <span class="badge">LMS 8.0.0+</span>
     <span class="badge">HQPlayer Embedded 6</span>
     <span class="badge">No extra audio hop</span>
@@ -132,7 +132,7 @@
 <h2>Features</h2>
 <div class="feature-cards">
 <div class="card"><h4>Appears as a real player</h4><p>Each instance shows up in LMS's player list, ready to select</p><span class="needs">Needs: nothing</span></div>
-<div class="card"><h4>Found automatically</h4><p>Discovered on the network; nothing to type in</p><span class="needs">Needs: HQPlayer reachable from the server</span></div>
+<div class="card"><h4>Found automatically</h4><p>Discovered on the network; nothing to configure for most setups. If discovery can't reach it, connect by its IP address instead</p><span class="needs">Needs: HQPlayer reachable from the server</span></div>
 <div class="card"><h4>No extra audio hop</h4><p>HQPlayer fetches the music itself — no buffer, helper or UPnP hop in between</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Your library, bit-perfect</h4><p>FLAC, WAV, AIFF, DSF/DFF, WavPack, MP3 and Ogg go over as the original file, including native DSD</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Everything else plays too</h4><p>ALAC, AAC and M4A are converted by LMS on the way out</p><span class="needs">Needs: nothing</span></div>
@@ -142,8 +142,10 @@
 <div class="card"><h4>Artwork on the endpoint</h4><p>Cover art reaches HQPlayer and its display, from your library or a service, served by LMS on your network at up to 600x600, and stays with its own track across a gapless hand-over</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Volume, both ways</h4><p>The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Pause from either end</h4><p>Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second</p><span class="needs">Needs: nothing</span></div>
-<div class="card"><h4>Stable player identity</h4><p>Prefs, playlist and sync group survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Skip back from HQPlayer</h4><p>Skipping back to an earlier track in HQPlayer's own playlist while it plays moves LMS to that track too</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Stable player identity</h4><p>Prefs and playlist survive HQPlayer changing IP address</p><span class="needs">Needs: nothing</span></div>
 <div class="card"><h4>Live view</h4><p>A page of its own: what's playing, transport, volume and the signal path, updating every second in your Material theme</p><span class="needs">Needs: nothing</span></div>
+<div class="card"><h4>Restart HQPlayer from LMS</h4><p>One tap in Apps restarts HQPlayer, with your saved settings, e.g. after power-cycling your NAA endpoint</p><span class="needs">Needs: The optional restart helper on the HQPlayer machine, which needs <strong>Python 3.7+</strong> there</span></div>
 </div>
 </section>
 <section id="requirements">
@@ -151,7 +153,7 @@
 <ul>
 <li><strong>Lyrion Music Server 8.0.0+</strong>.
 </li>
-<li><strong>HQPlayer</strong> with its control API enabled. Verified against HQPlayer Embedded 6; HQPlayer Desktop has the same API but is untested here.
+<li><strong>HQPlayer</strong> with its control API enabled. Verified against HQPlayer Embedded 6; HQPlayer Desktop 6 has also been used, on a Mac.
 </li>
 <li><strong>HQPlayer must reach the LMS server over HTTP</strong>, because it fetches the audio itself. Both on the same LAN is the normal case.
 </li>
@@ -169,6 +171,87 @@
 sudo unzip HQPlayerBridge.zip -d /var/lib/squeezeboxserver/Plugins/
 sudo chown -R squeezeboxserver:nogroup /var/lib/squeezeboxserver/Plugins/HQPlayerBridge
 sudo systemctl restart lyrionmusicserver</code></pre>
+</section>
+<section id="settings">
+<h2>Settings</h2>
+<p><strong>Nothing to configure for most setups.</strong> Out of the box the Bridge finds every HQPlayer on your network by itself, and a new one appears within about 15 seconds of being switched on.</p>
+<p><strong>If automatic discovery can't find HQPlayer</strong>, connect to it by IP address instead. That is usually because HQPlayer is on a different subnet or VLAN from the server, or on a network that blocks multicast. Open <strong>Settings → Plugins → HQPlayer Bridge</strong> (or the <strong>Settings</strong> row under HQPlayer Bridge in Apps) and set <strong>Find HQPlayer</strong> to <strong>Only at the addresses below</strong>, then type each HQPlayer's IP address into the box — separated by commas, spaces or new lines. Host names can't be used.</p>
+<ul>
+<li><strong>HQPlayer must be running at a new address when you save.</strong> The Bridge connects to it first, and won't save an address nothing answers at — the page says <em>Checking…</em> while it does, which can take a few seconds.
+</li>
+<li><strong>The two modes are never mixed.</strong> With addresses only, the Bridge sends no discovery traffic at all, and only the HQPlayers you listed are players. Switching back to <strong>Automatically</strong> clears the list, and discovery finds again whatever it can reach.
+</li>
+<li><strong>A player is identified by the name set in HQPlayer, not by its address.</strong> Delete an address and save to remove its player; add it back, or replace it with HQPlayer's new address, and you get the same player back with its settings and playlist.
+</li>
+<li><strong>With addresses only, an HQPlayer whose address changes isn't followed.</strong> Update its address in the box, or give that machine a fixed address.
+</li>
+<li><strong>Your choice is kept when the plugin updates.</strong> An update never switches you back to automatic or clears your list.
+</li></ul>
+</section>
+<section id="restarting-hqplayer-from-lms-optional">
+<h2>Restarting HQPlayer from LMS (optional)</h2>
+<p><strong>What it's for.</strong> If you switch your NAA endpoint off and on again, HQPlayer often won't use it again until HQPlayer itself is restarted. Signalyst's advice is to start the NAA first, then HQPlayer. HQPlayer's <strong>Refresh devices</strong> button reconnects the endpoint but drops your saved output mode (SDM comes back as PCM). A restart reloads your saved settings. HQPlayer's control API has no restart command, so doing this from LMS needs a small helper on the HQPlayer machine.</p>
+<p><strong>What it is.</strong> <code>hqrestart</code> is one Python script (standard library only) in <a href="tools/hqrestart/"><code>tools/hqrestart/</code></a> of this repository. It is <strong>not part of the plugin</strong>, and playback works exactly the same without it. It listens on port <strong>8090</strong>. When asked, it restarts HQPlayer the same way it was started, as an app or as a service, on macOS or Linux (Windows is not supported). It never restarts anything by itself.</p>
+<p><strong>Only tested on macOS so far.</strong> It has been run end to end on a Mac, with HQPlayer Embedded running as an app. macOS with HQPlayer as a service, and Linux, are written and covered by automated tests, but have not yet been run on a real machine, so treat them as untried. The installer's question for your LMS server's address is new and is covered by those tests, but has not yet been run on a real install either.</p>
+<p><strong>Using it.</strong> Once the helper is running, <strong>Apps → HQPlayer Bridge</strong> shows a **Restart <em>name</em><strong> row under HQPlayer Live View. Tap it, then </strong>Restart <em>name</em> now**. It answers once HQPlayer is back, which takes about 7 seconds on a Mac.</p>
+<h3>What the helper needs</h3>
+<p><strong>Python 3.7 or later, on the HQPlayer machine.</strong> The helper is a single Python script and uses only the standard library — nothing to <code>pip install</code>. <strong>The installer never installs Python for you</strong>; if it can't find <code>python3</code> it stops and says so, leaving your system untouched.</p>
+<p><strong>On macOS, expect a prompt from Apple — not from this installer.</strong> macOS ships no Python of its own. <code>/usr/bin/python3</code> is a stub, so the first time anything runs it, macOS itself offers to install the <strong>Command Line Tools</strong>:</p>
+<blockquote><p>The "python3" command requires the command line developer tools. Would you like to install the tools now?</p></blockquote>
+<p>That dialog is Apple's. Accepting it installs the Command Line Tools (a developer package of a few hundred MB, which includes Python 3.9) and the helper then installs normally. <strong>If you would rather not have that</strong>, click <em>Not Now</em> and install Python another way first — the <a href="https://www.python.org/downloads/macos/">python.org installer</a> or <code>brew install python</code> — then run <code>./install.sh</code> again. Either is fine; the helper only needs <em>a</em> <code>python3</code> of 3.7 or later on your <code>PATH</code>.</p>
+<p><strong>On Linux, nothing is offered and nothing is installed.</strong> Practically every distribution ships Python 3 already, so there is usually nothing to do. If it is genuinely missing the installer stops with <code>python3 not found - install Python 3.7 or newer first</code>, and you install it with your package manager (<code>sudo apt install python3</code>, <code>sudo dnf install python3</code>, and so on). No equivalent of Apple's prompt exists, so a Linux install will never pull in a toolchain behind your back.</p>
+<h3>Install the helper</h3>
+<p>On the <strong>HQPlayer machine</strong>, with <strong>Python 3.7 or later</strong> (see above):</p>
+<p><strong>Step 1.</strong> Download this repository (<strong>Code → Download ZIP</strong> on GitHub) and open the <code>tools/hqrestart/</code> folder in a terminal.</p>
+<p><strong>Step 2.</strong> Run the installer that matches how HQPlayer runs there:</p>
+<table>
+<thead><tr>
+<th>HQPlayer runs as…</th>
+<th>macOS / Linux</th>
+</tr></thead>
+<tbody>
+<tr><td>an app, or a Linux user service</td><td><code>./install.sh</code></td></tr>
+<tr><td>a system service</td><td><code>sudo ./install.sh --system</code></td></tr>
+</tbody></table>
+<p><strong>Step 3.</strong> It asks for your <strong>LMS server's IP address</strong>:</p>
+<pre><code>Lyrion server IP address (press return to skip):</code></pre>
+<p>Type it in. The plugin sends no token, so a restart is only accepted from an address the helper has been told to trust — without this the Restart row appears but every restart is refused. You can also give it up front, or change it later, by re-running the installer with <code>./install.sh --allow 192.168.1.234</code>; pressing return at the prompt keeps whatever is already set, so re-installing to pick up a new version never loses it.</p>
+<p>It must be an IP address rather than a name, because it is matched against the address the request arrives from.</p>
+<p>If a restart later says <strong>Restart failed: bad or missing token</strong>, the address LMS called from isn't in the list. The helper's log (below) names that address and the exact command to add it.</p>
+<p>The helper then starts at once, and again at every login (app) or boot (service). The installer prints where it put the config file, <code>hqrestart.json</code>, the access token, and whether LMS is allowed to restart HQPlayer.</p>
+<p><strong>Step 4.</strong> Check it from the LMS machine: <code>curl http://&lt;hqplayer-ip&gt;:8090/ping</code> should answer with <code>"service": "hqrestart"</code>. The Restart row appears the next time you open the Bridge in Apps. An HQPlayer that has no helper yet is re-checked at most once a minute.</p>
+<table>
+<thead><tr>
+<th></th>
+<th>macOS</th>
+<th>Linux</th>
+</tr></thead>
+<tbody>
+<tr><td>config (app)</td><td><code>~/Library/Application Support/hqrestart/</code></td><td><code>~/.config/hqrestart/</code></td></tr>
+<tr><td>config (service)</td><td><code>/Library/Application Support/hqrestart/</code></td><td><code>/etc/hqrestart/</code></td></tr>
+<tr><td>log</td><td><code>~/Library/Logs/hqrestart.log</code> (<code>/Library/Logs/</code> for a service)</td><td><code>journalctl --user -u hqrestart</code> (no <code>--user</code> for a service)</td></tr>
+<tr><td>runs as</td><td>a LaunchAgent (LaunchDaemon for a service)</td><td>a systemd unit</td></tr>
+<tr><td>listed in</td><td>System Settings → General → Login Items &amp; Extensions → <em>Allow in the Background</em>, as <strong>python3</strong></td><td><code>systemctl --user status hqrestart</code> (no <code>--user</code> for a service)</td></tr>
+<tr><td>process</td><td><strong>Python</strong> in Activity Monitor</td><td><code>python3 …/hqrestart.py</code> in <code>ps</code> or <code>top</code></td></tr>
+</tbody></table>
+<p><strong>It doesn't appear under its own name everywhere.</strong> macOS names the background item after the Python it runs, so it shows as <em>python3</em>, not <em>hqrestart</em>, and macOS tells you with a "Background Items Added" notice when you install it. If you switch that item off, the helper stops and the Restart row goes with it; use the uninstaller rather than the switch. The macOS column was checked on a real Mac; the Linux column describes what the installer sets up, and has not been seen on a real machine.</p>
+<ul>
+<li><strong>Linux, app mode:</strong> the helper runs only while you're logged in, unless you run <code>sudo loginctl enable-linger &lt;your user&gt;</code> (the installer reminds you). If you run a firewall, open TCP 8090 to the LMS server.
+</li>
+<li>The helper can also be called without LMS, with the token, e.g. from a phone shortcut. See <a href="tools/hqrestart/README.md"><code>tools/hqrestart/README.md</code></a> for that and for every config option.
+</li></ul>
+<h3>Uninstall the helper</h3>
+<p>Run the installer from the same folder with the uninstall option, matching how you installed it:</p>
+<table>
+<thead><tr>
+<th></th>
+<th>macOS / Linux</th>
+</tr></thead>
+<tbody>
+<tr><td>app</td><td><code>./install.sh --uninstall</code></td></tr>
+<tr><td>service</td><td><code>sudo ./install.sh --system --uninstall</code></td></tr>
+</tbody></table>
+<p>This stops the helper and removes it from startup. Your config folder (above) is left in place; delete it if you won't reinstall. The Restart row disappears from Apps when LMS next restarts.</p>
 </section>
 <section id="how-your-music-reaches-hqplayer">
 <h2>How your music reaches HQPlayer</h2>
@@ -204,19 +287,28 @@ Output format      96000 Hz / 24 bit PCM
 Filter             poly-sinc-gauss-long
 Shaper             TPDF
 Processing speed   30.3x realtime</code></pre>
-<p>HQPlayer reports the filter <em>really</em> in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.</p>
+<p><strong>With more than one HQPlayer,</strong> a row of names appears above the panel and you tap the one you want to see and control. <strong>Auto</strong>, the default, follows whichever instance is playing. Your choice is remembered in that browser, and a dot marks any instance that is playing but not currently shown. Every instance's signal path is listed below either way.</p>
+<p>HQPlayer reports the filter <em>really</em> in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation, and a streamed track's cover carries the service's badge, as Material shows it on its own lists (only where Material is installed). Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.</p>
 <p><strong>The Apps entry</strong> behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's <strong>settings</strong> — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport <strong>id</strong>, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.</p>
 </section>
 <section id="known-limitations">
 <h2>Known limitations</h2>
 <ul>
-<li><strong>The player shows as present even when HQPlayer isn't reachable.</strong> A discovered instance that is currently off is a normal state; tying the player's presence to the control link would churn prefs and sync groups every time it went away.
+<li><strong>A switched-off HQPlayer's player stays listed for about 5 minutes.</strong> That is Lyrion's own grace for a player that disconnects, so a restart or a network blip doesn't cost you the player's playlist. A player whose HQPlayer is still connected is never removed. The Bridge looks for new HQPlayers every 15 seconds (more often while it has found none), so one you switch on appears within about 15 seconds; one that is already a player reconnects by itself within 10.
 </li>
 <li><strong>A silent output-format mismatch is HQPlayer's to report.</strong> If its output format is something your endpoint can't accept, it reports itself as playing and answers every command while rendering nothing. That can't be detected over the control API — the evidence is in HQPlayer's own log (<code>NAA output requested format not available!</code>). If a track looks like it's playing but you hear nothing, check the output format there first.
 </li>
 <li><strong>A sample-rate change between tracks is audible</strong>, on every route. HQPlayer needs a couple of seconds to retune its output.
 </li>
 <li><strong>Radio track names are right when the stream starts, then stop updating.</strong> HQPlayer's control API can't change the metadata on an item already playing, and re-sending it would restart the stream. LMS itself keeps up to date as usual.
+</li>
+<li><strong>HQPlayer Desktop switches its network control off when the computer's IP address changes.</strong> It then can't be found or controlled until you switch it back on — the network button on HQPlayer's toolbar.
+</li>
+<li><strong>If the Bridge loses touch with HQPlayer mid-track, LMS stops.</strong> That happens when HQPlayer restarts, or after a network drop. Nothing is sent while the link is down. When it comes back, HQPlayer is stopped too if it is still playing the track LMS gave it. Nothing starts again by itself: press play, and the track loads from its start. HQPlayer has to be sent the whole stream, so playback can't pick up part way through.
+</li>
+<li><strong>Music started from HQPlayer's own screen is left alone.</strong> LMS doesn't follow it or try to take it over. Press play in LMS and it loads its own track again.
+</li>
+<li><strong>A skip back made in HQPlayer while it is paused isn't followed.</strong> HQPlayer moves to the earlier track, but LMS stays on the one it was paused on. Skip back while it is playing, or skip in LMS.
 </li>
 <li><strong>HQPlayer's repeat setting is turned off</strong> whenever the control link comes up. LMS owns the queue and needs to see HQPlayer's playlist end; with repeat on it never does. Set repeat and shuffle in LMS.
 </li></ul>
@@ -230,9 +322,9 @@ Processing speed   30.3x realtime</code></pre>
 </li>
 <li><strong>HTTP authentication.</strong> If your LMS server is password-protected, HQPlayer can't fetch the audio URLs it's given.
 </li>
-<li><strong>Multi-room sync with hardware players.</strong> Nothing blocks it, but it is unverified, and a bridged player can't be sample-accurate with a Squeezebox.
+<li><strong>Sync groups.</strong> An HQPlayer player can't be synced with other players, and a sync group that includes one won't play. Play HQPlayer on its own.
 </li>
-<li><strong>A settings page.</strong> There is nothing to configure: instances find themselves, and everything shown is read from HQPlayer.
+<li><strong>One HQPlayer on two network interfaces at once</strong> (for example wired and Wi-Fi together). HQPlayer itself supports one interface, and so does the Bridge: an HQPlayer reachable at two addresses can show up as two players.
 </li></ul>
 </section>
 <section id="licence-and-attribution">

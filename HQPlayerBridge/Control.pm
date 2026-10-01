@@ -56,7 +56,12 @@ use constant CONNECT_TIMEOUT => 5;
 # the reply window has to cover a slow origin, not just a round trip.
 use constant REPLY_TIMEOUT   => 30;
 use constant BACKOFF_MIN     => 2;
-use constant BACKOFF_MAX     => 60;
+# The link keeps ITSELF alive, and this is how far apart its attempts get.
+# 10s, not the 60s it was: until 2026-09-27 discovery poked a down link every
+# 10s round (reconnectNow), and that poke was the real return time after a
+# long outage. The link now owns it, on its own ladder, and discovery is out
+# of the loop - docs/discovery-simplification-plan.md.
+use constant BACKOFF_MAX     => 10;
 use constant SLOW_COMMAND    => 1;
 
 # The complete verified command vocabulary, extracted from the hqplayerd
@@ -136,9 +141,16 @@ sub new {
     my $self = bless {
         ip        => $args{ip},
         name      => $args{name} || $args{ip},
-        onState   => $args{onState},      # called as $cb->($self, $connected)
+        onState   => $args{onState},      # called as $cb->($self, 1) at the
+                                          # accept, and $cb->($self, 0, $wasProven)
+                                          # when a link that was up drops
         onStatus  => $args{onStatus},     # called as $cb->($attrs, $raw) for
                                           # EVERY Status message, pushed or not
+        onProven  => $args{onProven},     # called as $cb->($self) ONCE per link,
+                                          # at HQPlayer's first reply - see proven
+        # One command and done: never reconnects, and logs only at debug -
+        # the caller reports. See identify.
+        oneShot   => $args{oneShot} ? 1 : 0,
         queue     => [],
         wbuf      => '',
         rbuf      => '',
@@ -152,6 +164,8 @@ sub new {
         proven    => 0,
         backoff   => BACKOFF_MIN,
         closing   => 0,
+        # This outage has been reported - see _outage.
+        quiet     => 0,
     }, $class;
 
     return $self;
@@ -161,13 +175,30 @@ sub ip        { $_[0]->{ip} }
 sub name      { $_[0]->{name} }
 sub connected { $_[0]->{connected} }
 
+# The link has carried a reply - the first real evidence HQPlayer is serving.
+# `connected` is only the TCP accept, which hqplayerd also gives when it is
+# about to drop the socket (no endpoint, expired trial). LMS's view of the
+# player - Player::connected - is this, not that.
+sub proven    { $_[0]->{proven} }
+
+# Will send() accept a command?  The SAME sock-or-connecting test send() makes,
+# so the two cannot drift: a link that is still connecting queues, a link that
+# is down fails on the next event-loop turn.  Callers that must not begin work
+# send() would reject - Player::_queueTrack - ask this, not `connected`, which
+# is false for the whole of a reconnect that will nevertheless carry the load.
+sub up        { ( $_[0]->{sock} || $_[0]->{connecting} ) ? 1 : 0 }
+
 # ---------------------------------------------------------------------------
 # Public: queue a command.
 #   $cmd is the bare element, e.g. '<Play/>' or '<Seek position="30"/>'
 #   $cb  is called as $cb->($attrs_hashref, $raw_xml) on success,
-#        or $cb->(undef, undef) if the command failed or the link dropped.
+#        or $cb->(undef, undef) if the command failed, the link dropped, or
+#        the link was already down when it was sent.
 #   $opts->{scope} groups commands which may be cancelled before they reach
 #        the wire; the player uses 'track' for generation-bound load work.
+#
+# Returns nothing: every caller is driven by its $cb, which is failed on a
+# refusal as well as on a drop.
 # ---------------------------------------------------------------------------
 sub send {
     my ($self, $cmd, $cb, $opts) = @_;
@@ -181,6 +212,26 @@ sub send {
         return;
     }
 
+    # THE LINK IS DOWN: fail the command, and do NOT connect. A reconnect is
+    # already on its way - _create opens the first link, and every drop or
+    # failed connect schedules the next one with backoff - or the link is
+    # being closed for good. This used to connect at once, which skipped the
+    # backoff for every command LMS sends a disconnected player (a sync
+    # group's _JumpToTime, unsync's _stopClient, playerInactive's Stop), did
+    # it from inside _dropLink when a link-down listener sent something, and
+    # left the command queued for whatever link came next. Two call sites had
+    # grown workarounds for it (Plugin::_onLinkState, Player::forgetClient).
+    #
+    # Failed on the NEXT event-loop turn, not inside this call: a caller's
+    # failure path (a refused load -> playerStreamingFailed -> LMS loading the
+    # next track) must not re-enter code that is still in the middle of
+    # sending.
+    if ( !$self->{sock} && !$self->{connecting} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: link down, not sending <$verb>");
+        Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_failLater, $cb ) if $cb;
+        return;
+    }
+
     push @{ $self->{queue} }, {
         cmd      => $cmd,
         cb       => $cb,
@@ -189,14 +240,14 @@ sub send {
         queuedAt => Time::HiRes::time(),
     };
 
-    if ( !$self->{sock} && !$self->{connecting} ) {
-        $self->connect;
-    }
-    else {
-        $self->_pump;
-    }
+    $self->_pump;
 
     return;
+}
+
+sub _failLater {
+    my ( $self, $cb ) = @_;
+    $cb->( undef, undef );
 }
 
 # Drop work which is still WAITING behind the command on the wire. An
@@ -247,7 +298,7 @@ sub connect {
     );
 
     if ( !$sock ) {
-        $log->warn("$self->{name}: cannot create socket: $!");
+        $self->_outage("cannot create socket: $!");
         return $self->_scheduleReconnect;
     }
 
@@ -260,7 +311,7 @@ sub connect {
     if ( !CORE::connect( $sock, $addr ) ) {
         my $err = $!;
         if ( $err != EINPROGRESS && $err != EWOULDBLOCK ) {
-            $log->warn("$self->{name}: connect failed immediately: $err");
+            $self->_outage("connect failed immediately: $err");
             return $self->_dropLink("connect: $err");
         }
     }
@@ -289,7 +340,7 @@ sub _connectResolved {
 
     if ($err) {
         $! = $err;
-        $log->warn("$self->{name}: connect refused: $!");
+        $self->_outage("connect refused: $!");
         return $self->_dropLink("connect: $!");
     }
 
@@ -310,7 +361,12 @@ sub _connectResolved {
     # _dispatch, which only runs when HQPlayer has actually said something.
     $self->{proven} = 0;
 
-    main::INFOLOG && $log->is_info && $log->info("$self->{name}: control link up ($self->{ip})");
+    if ( $self->{oneShot} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: connected to identify it");
+    }
+    else {
+        main::INFOLOG && $log->is_info && $log->info("$self->{name}: control link up ($self->{ip})");
+    }
 
     Slim::Networking::Select::addRead( $sock, sub { $self->_readable } );
 
@@ -323,14 +379,21 @@ sub _connectResolved {
 
 sub _connectTimeout {
     my $self = shift;
-    $log->warn("$self->{name}: connect timed out after " . CONNECT_TIMEOUT . 's');
+    $self->_outage( 'connect timed out after ' . CONNECT_TIMEOUT . 's' );
     $self->_dropLink('connect timeout');
 }
 
 sub _replyTimeout {
     my $self = shift;
     my $verb = $self->{inflight} ? $self->{inflight}->{verb} : '(none)';
-    $log->warn("$self->{name}: no reply to <$verb> after " . REPLY_TIMEOUT . 's');
+    my $msg  = "no reply to <$verb> after " . REPLY_TIMEOUT . 's';
+    # A link that had been answering going silent is news - and _dropLink
+    # already WARNs for a proven link, so it carries the reason as its own
+    # line ("control link down - no reply to <X> after 30s") rather than a
+    # second WARN for the same event.  An accept that never answered is one
+    # more failed attempt of an outage.
+    return $self->_dropLink($msg) if $self->{proven};
+    $self->_outage($msg);
     $self->_dropLink('reply timeout');
 }
 
@@ -465,6 +528,12 @@ sub _dispatch {
     if ( !$self->{proven} ) {
         $self->{proven}  = 1;
         $self->{backoff} = BACKOFF_MIN;
+        $self->{quiet}   = 0;      # the outage is over; the next one is news
+
+        if ( $self->{onProven} ) {
+            eval { $self->{onProven}->($self) };
+            $log->error("$self->{name}: onProven handler died: $@") if $@;
+        }
     }
 
     my $attrs = parseAttrs($raw);
@@ -511,7 +580,14 @@ sub _dispatch {
     Slim::Utils::Timers::killTimers( $self, \&_replyTimeout );
 
     if ($isErr) {
-        my ($msg) = $raw =~ />([^<]*)</;
+        # `+`, NOT `*`. Every reply carries the XML declaration, so `*` matched
+        # the EMPTY string between `?>` and `<Verb` and $msg came back "" for
+        # every error on the wire - which silently disabled %BENIGN below and
+        # printed the raw frame instead of the message. Measured live
+        # 2026-09-26 on `<Volume>` against an empty playlist, the one case
+        # %BENIGN exists for. `>` inside the text is fine: `[^<]` spans it, so
+        # `trackn > last` survives whole.
+        my ($msg) = $raw =~ />([^<]+)</;
 
         my $benign = $BENIGN{ $req->{verb} };
         my $lvl    = ( $benign && defined $msg && $msg =~ $benign ) ? 'debug' : 'warn';
@@ -564,7 +640,8 @@ sub _extractMessage {
 sub _dropLink {
     my ( $self, $why ) = @_;
 
-    my $wasUp = $self->{connected};
+    my $wasUp     = $self->{connected};
+    my $wasProven = $self->{proven};
 
     Slim::Utils::Timers::killTimers( $self, \&_connectTimeout );
     Slim::Utils::Timers::killTimers( $self, \&_replyTimeout );
@@ -582,6 +659,33 @@ sub _dropLink {
     $self->{wbuf}       = '';
     $self->{rbuf}       = '';
 
+    # A link that had been ANSWERING going down is always worth a line. A
+    # failed attempt during an outage is not - see _outage.
+    if ( $wasProven && !$self->{oneShot} ) {
+        $log->warn("$self->{name}: control link down - $why");
+        $self->{quiet} = 1;
+    }
+    elsif ($wasUp) {
+        $self->_outage("control link down - $why");
+    }
+    elsif ( $log->is_debug ) {
+        $log->debug("$self->{name}: control link down - $why");
+    }
+
+    # $wasProven: whether this link had carried a reply, i.e. whether LMS was
+    # told it was connected (Player::connected is `proven`). Passed because
+    # `proven` is already cleared above, so the listener cannot ask.
+    #
+    # THE LISTENER HEARS FIRST, BEFORE ANY STRANDED COMMAND IS FAILED. A synced
+    # player leaves its group here (Plugin::_onLinkState -> playerInactive ->
+    # Player::stop), and stop() retires the load it had in flight by bumping the
+    # generation. Failed the other way round, that load's callback would report
+    # a failed load to LMS first, and LMS fails a track for the WHOLE group when
+    # one member cannot open it - every other room skipping for one lost link.
+    # The socket is already gone, so anything the listener sends is failed on
+    # the next turn (see send) rather than queued behind the commands below.
+    $self->{onState}->( $self, 0, $wasProven ) if $wasUp && $self->{onState};
+
     # Fail the outstanding command and everything queued behind it, so callers
     # are never left waiting on a callback that can no longer arrive.
     my $req = delete $self->{inflight};
@@ -591,11 +695,32 @@ sub _dropLink {
         $q->{cb}->( undef, undef ) if $q->{cb};
     }
 
-    $log->warn("$self->{name}: control link down - $why") if $wasUp || $log->is_debug;
-
-    $self->{onState}->( $self, 0 ) if $wasUp && $self->{onState};
-
     $self->_scheduleReconnect unless $self->{closing};
+
+    return;
+}
+
+# ONE warning per outage, not one per retry. While HQPlayer is off, restarting,
+# or accepting and then resetting the socket, every retry fails the same way,
+# and the link retries every BACKOFF_MAX (10s) at most: at WARN that was a line
+# every ~11s for as long as it lasted - 401 of the bridge's 414 lines in a
+# 6.5-hour log (2026-09-25, one instance that accepts and resets).
+#
+# A one-shot identify logs nothing above debug: it is a new object each round,
+# so its own `quiet` could never hold, and its caller reports once per outage.
+# The first failure is reported; the rest go to debug until HQPlayer answers
+# again (_dispatch clears `quiet`), and a working link that drops is always
+# reported (_dropLink).
+sub _outage {
+    my ( $self, $msg ) = @_;
+
+    if ( $self->{quiet} || $self->{oneShot} ) {
+        main::DEBUGLOG && $log->is_debug && $log->debug("$self->{name}: $msg");
+        return;
+    }
+
+    $self->{quiet} = 1;
+    $log->warn("$self->{name}: $msg - further attempts are logged at debug until it answers");
 
     return;
 }
@@ -603,7 +728,7 @@ sub _dropLink {
 sub _scheduleReconnect {
     my $self = shift;
 
-    return if $self->{closing};
+    return if $self->{closing} || $self->{oneShot};
 
     my $delay = $self->{backoff};
     $self->{backoff} = $self->{backoff} * 2 > BACKOFF_MAX ? BACKOFF_MAX : $self->{backoff} * 2;
@@ -630,6 +755,42 @@ sub close {
 
     return;
 }
+
+# ---------------------------------------------------------------------------
+# Who is at this address? One connection, one <GetInfo/>, closed again.
+#
+# For an address typed into the settings, which has no discovery reply to
+# name it. <GetInfo/>'s `name` IS the name discovery reports - measured on
+# Embedded across a rename (HQPlayerEmbedded, then ManCave) and on Desktop
+# 6.2.3 (`name="Mac"` both ways), 2026-09-20 and 2026-09-27 - so an instance
+# reached this way gets the SAME player id discovery would have given it, and
+# no player is ever re-keyed.
+#
+# $cb->($attrs) with GetInfo's attributes, or $cb->(undef) when nothing
+# answered: refused, timed out, closed, or an error reply. A oneShot link
+# never reconnects, so a dead host costs exactly this one attempt.
+# ---------------------------------------------------------------------------
+sub identify {
+    my ( $class, $ip, $cb ) = @_;
+
+    my $self = $class->new( ip => $ip, name => "HQPlayer at $ip", oneShot => 1 );
+
+    $self->connect;
+
+    $self->send( '<GetInfo/>', sub {
+        my ($attrs) = @_;
+
+        # Closed on the NEXT turn: this runs inside _dispatch or _dropLink,
+        # and closing from in there would tear the link down under them.
+        Slim::Utils::Timers::setTimer( $self, Time::HiRes::time(), \&_closeOneShot );
+
+        $cb->($attrs) if $cb;
+    } );
+
+    return $self;
+}
+
+sub _closeOneShot { $_[0]->close }
 
 # ---------------------------------------------------------------------------
 # Tiny XML helpers.  These payloads are small, flat and machine-generated, so
