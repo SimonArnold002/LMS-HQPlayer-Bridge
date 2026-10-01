@@ -3,7 +3,7 @@
     <title lang="EN">HQPlayer Bridge For Lyrion Music Server</title>
   </details>
   <plugins>
-    <plugin name="HQPlayerBridge" version="1.0.39" minTarget="8.0.0" maxTarget="*">
+    <plugin name="HQPlayerBridge" version="1.0.40" minTarget="8.0.0" maxTarget="*">
       <title lang="EN">HQPlayer Bridge</title>
       <desc lang="EN">Presents each HQPlayer instance as a native Lyrion player over HQPlayer's own control API - no UPnP bridge and no helper in the playback path; HQPlayer fetches the stream straight from Lyrion, which still converts the formats HQPlayer cannot decode</desc>
       <category>hardware</category>
@@ -11,7 +11,7 @@
       <icon>https://raw.githubusercontent.com/SimonArnold002/LMS-HQPlayer-Bridge/main/HQPlayerBridge/HTML/EN/plugins/HQPlayerBridge/html/images/HQPlayerBridgeIcon.png</icon>
       <creator>CrystalGipsy</creator>
       <email></email>
-      <sha>afe3f96adb2e1fd672b82110f7c7e8d740a5de19</sha>
+      <sha>6867f3ae7a85e5d43deba3d46b54420a376e4cb0</sha>
     </plugin>
   </plugins>
 </extensions>

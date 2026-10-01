@@ -25,6 +25,7 @@ Tested on LMS 9.x against **HQPlayer Embedded 6** feeding an NAA endpoint.
 | **Artwork on the endpoint** | Cover art reaches HQPlayer and its display, from your library or a service, served by LMS on your network at up to 600x600, and stays with its own track across a gapless hand-over | Nothing |
 | **Volume, both ways** | The LMS slider moves HQPlayer, and HQPlayer's own volume moves the slider | Nothing |
 | **Pause from either end** | Pausing at HQPlayer or on the endpoint's remote pauses LMS too, within a second | Nothing |
+| **Skip back from HQPlayer** | Skipping back to an earlier track in HQPlayer's own playlist while it plays moves LMS to that track too | Nothing |
 | **Stable player identity** | Prefs and playlist survive HQPlayer changing IP address | Nothing |
 | **Live view** | A page of its own: what's playing, transport, volume and the signal path, updating every second in your Material theme | Nothing |
 | **Restart HQPlayer from LMS** | One tap in Apps restarts HQPlayer, with your saved settings, e.g. after power-cycling your NAA endpoint | The optional restart helper on the HQPlayer machine, which needs **Python 3.7+** there |
@@ -214,7 +215,7 @@ Processing speed   30.3x realtime
 
 **With more than one HQPlayer,** a row of names appears above the panel and you tap the one you want to see and control. **Auto**, the default, follows whichever instance is playing. Your choice is remembered in that browser, and a dot marks any instance that is playing but not currently shown. Every instance's signal path is listed below either way.
 
-HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation. Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.
+HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x filter and a 96 kHz one your Nx filter. Source and output always describe the track actually playing — resolving what comes next never overwrites them early. The page follows Material's theme and icons and works on a phone in either orientation, and a streamed track's cover carries the service's badge, as Material shows it on its own lists (only where Material is installed). Until HQPlayer is found it says it is waiting for the player to connect. It costs HQPlayer nothing — the values are already in memory from the status stream the plugin subscribes to.
 
 **The Apps entry** behind it is a browse list, which Material draws once and never refreshes, so it shows HQPlayer's **settings** — output mode, filter, shaper, transport id — rather than moving numbers that would go stale. It reports the transport **id**, not your endpoint's name: HQPlayer doesn't expose the NAA name over any control command.
 
@@ -227,6 +228,9 @@ HQPlayer reports the filter *really* in use, so a 44.1 kHz album shows your 1x f
 - **A sample-rate change between tracks is audible**, on every route. HQPlayer needs a couple of seconds to retune its output.
 - **Radio track names are right when the stream starts, then stop updating.** HQPlayer's control API can't change the metadata on an item already playing, and re-sending it would restart the stream. LMS itself keeps up to date as usual.
 - **HQPlayer Desktop switches its network control off when the computer's IP address changes.** It then can't be found or controlled until you switch it back on — the network button on HQPlayer's toolbar.
+- **If the Bridge loses touch with HQPlayer mid-track, LMS stops.** That happens when HQPlayer restarts, or after a network drop. Nothing is sent while the link is down. When it comes back, HQPlayer is stopped too if it is still playing the track LMS gave it. Nothing starts again by itself: press play, and the track loads from its start. HQPlayer has to be sent the whole stream, so playback can't pick up part way through.
+- **Music started from HQPlayer's own screen is left alone.** LMS doesn't follow it or try to take it over. Press play in LMS and it loads its own track again.
+- **A skip back made in HQPlayer while it is paused isn't followed.** HQPlayer moves to the earlier track, but LMS stays on the one it was paused on. Skip back while it is playing, or skip in LMS.
 - **HQPlayer's repeat setting is turned off** whenever the control link comes up. LMS owns the queue and needs to see HQPlayer's playlist end; with repeat on it never does. Set repeat and shuffle in LMS.
 
 ---

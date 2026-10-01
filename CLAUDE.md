@@ -28,7 +28,7 @@ CHANGELOG/README behind `install.xml`) are NOT repeated here — they live in Ga
 
 | symbol / subject | verdict | find it with |
 |---|---|---|
-| `/hqplive`, `Content-Length`, raw handler framing, hanging spinner | FIXED 2026-09-29 — a raw handler owns its FRAMING as well as its status code | `A RAW HANDLER OWNS ITS FRAMING` |
+| `/hqplive`, `Content-Length`, raw handler framing, hanging spinner | FIXED 2026-09-29 — a raw handler owns its FRAMING as well as its status code; BUILT 1.0.40, VERIFIED LIVE 2026-10-01 | `A RAW HANDLER OWNS ITS FRAMING` |
 | `volume`, `_onStatus`, echo guard, `_lmsToDb` round trip | SUPERSEDED — now compares in dB via `_volTol` | `_lmsToDb(_dbToLms($db)) == $db` |
 | `_followVolume`, endpoint re-register jumping the level | REVERSED — we follow it anyway | `An endpoint re-registering can jump the output` |
 | volume curve, taper, knee, sqrt | DECLINED — linear in dB, deliberately | `The volume curve should be tapered` |
@@ -192,6 +192,11 @@ character count, which would be worse than the hang.
 
 `t_live.pl` pins both: that a length is set, and that it equals the octet length actually sent.
 Anti-tested — removing the call fails exactly those two.
+
+**BUILT 1.0.40 and VERIFIED LIVE 2026-10-01.** The fix was committed and pushed on 2026-09-29
+but never built, so the installed 1.0.39 still hung (re-measured that day: no `Content-Length`,
+53,691 bytes, curl timed out at 10s). On 1.0.40, `curl -D - http://plex:9000/hqplive` answers
+`Content-Length: 53691` and completes in 0.11s.
 
 ### HOW TO LOG A VERDICT so the next round finds it
 
@@ -7766,8 +7771,25 @@ drawn editable), and a DHCP move with discovery on.
 
 **VERIFIED LIVE 2026-09-27 (Simon: "its always worked"):** in MATERIAL, from Automatically, clicking "Only at the addresses below" makes the greyed box editable before saving - the radio's inline `onclick` runs in Material's settings iframe.
 
-**Owed:** the README (merge-to-main artifact) still says "nothing to configure" and
-"every 5 seconds".
+~~**Owed:** the README (merge-to-main artifact) still says "nothing to configure" and
+"every 5 seconds".~~ **DONE** - refreshed on dev the same day (`Settings` section, the 15s pace),
+and checked again at the 1.0.40 merge.
+
+## 1.0.40 (2026-10-01): the /hqplive framing fix, built - RELEASED to main 2026-10-01
+
+Version bump and rebuild so 82b962e (`A RAW HANDLER OWNS ITS FRAMING`) reaches a zip: the
+1.0.39 zip was built at 284cb5d, the day before the fix. No other code change. `run_checks.sh`
+clean before the build. Installed and VERIFIED LIVE (the `/hqplive` curl, above). Then released:
+merged to `main`, tagged `v1.0.40`.
+
+**The CHANGELOG entry covers everything since 1.0.2** (66 dev commits, 1.0.4-1.0.40), grouped
+by what a user notices. Behaviour and limitations added to `README.md` at the merge: the
+**Skip back from HQPlayer** feature row, the live page's service badge, and three Known
+limitations (`NO LINK STOPS LMS`, `HQPLAYER'S OWN PLAYBACK NEVER DRIVES LMS`,
+`A SKIP BACK MADE WHILE PAUSED IS NOT FOLLOWED`). **Shipped but not recorded as verified
+live:** the skip-back follow while PLAYING (`HQPLAYER'S SKIP BACK IS FOLLOWED BY LMS` still
+asks for its TEST RECIPE), the live page's instance chooser (1.0.15, offline-tested under
+osascript), and the restart helper on Linux and as a macOS service.
 
 ## Not in v1
 
